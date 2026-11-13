@@ -1,0 +1,39 @@
+{
+  "name": "strategy-finder",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Discover, backtest and optimize algorithmic trading strategies for stocks, crypto and weighted baskets. Runs entirely in the browser with a Netlify serverless market-data proxy.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "netlify:dev": "netlify dev"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "chart.js": "^4.6.1",
+    "lucide-react": "^1.72.0",
+    "react": "^18.3.1",
+    "react-chartjs-2": "^5.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^6.1.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/node": "^22.19.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^6.3.0",
+    "netlify-cli": "^27.17.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}
