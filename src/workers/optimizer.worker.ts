@@ -11,7 +11,7 @@
  *   • recombination– block crossover between two leaderboard members
  *   • exploration  – fresh random immigrants, more often while stagnating
  *
- * The loop runs until the UI sends `stop` or `MAX_STAGNATION` consecutive
+ * The loop runs until the UI sends `stop` or the configured number of consecutive
  * iterations fail to improve the top fitness score.
  */
 
@@ -39,7 +39,9 @@ import { IndicatorCache } from '../engine/indicators';
 import {
   IN_SAMPLE_FRACTION,
   LEADERBOARD_SIZE,
-  MAX_STAGNATION,
+  DEFAULT_MAX_STAGNATION,
+  MAX_MAX_STAGNATION,
+  MIN_MAX_STAGNATION,
   PROGRESS_EVERY,
   type ChartAxis,
   type OHLCV,
@@ -351,6 +353,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const axis = buildAxis(data.t, splitIndex);
   const limits = deriveLimits(ind, splitIndex);
   const mode = settings.tradeMode;
+  const requested = Math.round(payload.maxStagnation ?? DEFAULT_MAX_STAGNATION);
+  const maxStagnation = Number.isFinite(requested)
+    ? Math.max(MIN_MAX_STAGNATION, Math.min(MAX_MAX_STAGNATION, requested))
+    : DEFAULT_MAX_STAGNATION;
   const rng = mulberry32(payload.seed ?? (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0);
 
   scope.postMessage({
@@ -397,7 +403,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const propose = (): StrategyGenome => {
     if (seeds.length > 0) return seeds.shift() as StrategyGenome;
     if (board.length < SEED_POPULATION) return randomGenome(rng, mode, limits);
-    const progress = stagnation / MAX_STAGNATION;
+    const progress = stagnation / maxStagnation;
     const r = rng();
     // Exploration grows from 10% to 25% of proposals as the search stagnates.
     const explore = 0.1 + 0.15 * progress;
@@ -496,7 +502,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   };
 
   for (;;) {
-    for (let k = 0; k < PROGRESS_EVERY && stagnation < MAX_STAGNATION; k++) step();
+    for (let k = 0; k < PROGRESS_EVERY && stagnation < maxStagnation; k++) step();
 
     const now = performance.now();
     const batchMs = now - lastBatchAt;
@@ -510,7 +516,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     scope.postMessage({ type: 'progress', ...snapshot() });
     if (boardDirty && now - lastBoardPost >= LEADERBOARD_INTERVAL_MS) postBoard();
 
-    if (stagnation >= MAX_STAGNATION) {
+    if (stagnation >= maxStagnation) {
       finish('converged');
       return;
     }

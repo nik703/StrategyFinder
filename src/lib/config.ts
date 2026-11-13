@@ -1,6 +1,7 @@
 /** UI-level run configuration and the immutable context captured when a run starts. */
 
 import { normalizeWeights, TICKER_PATTERN } from '../data/basket';
+import { DEFAULT_MAX_STAGNATION } from '../types/trading';
 import type {
   BacktestSettings,
   BasketComponent,
@@ -29,6 +30,8 @@ export interface RunConfig {
   feePct: number;
   slippagePct: number;
   tradeMode: TradeMode;
+  /** Stop after this many consecutive iterations without improvement. */
+  maxStagnation: number;
 }
 
 export const DEFAULT_CONFIG: RunConfig = {
@@ -45,6 +48,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   feePct: 0.1,
   slippagePct: 0.05,
   tradeMode: 'long-only',
+  maxStagnation: DEFAULT_MAX_STAGNATION,
 };
 
 export type ResolvedAssets = { ok: true; components: BasketComponent[] } | { ok: false; error: string };
@@ -79,6 +83,8 @@ export interface RunContext {
   interval: Interval;
   range: HistoryRange;
   settings: BacktestSettings;
+  /** Stagnation limit this run was started with. */
+  maxStagnation: number;
   components: BasketComponent[];
   units: number[];
   isBasket: boolean;

@@ -103,7 +103,7 @@ requests longer than that are truncated (the response carries a `note`).
 Evolutionary hill-climbing with mutation: textbook seed strategies and random genomes start the population;
 each iteration mutates the champion or a rank-biased parent, recombines two leaderboard members, or injects a
 fresh random genome. Progress is posted every 25 iterations. The run ends when you press **Stop** or after
-2,000 consecutive iterations without a better top score.
+a configurable number of consecutive iterations without a better top score (default 5,000, set in the control bar).
 
 Fitness (higher is better):
 

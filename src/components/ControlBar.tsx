@@ -7,7 +7,7 @@ import { Loader2, Play, Plus, Square, X } from 'lucide-react';
 import { useId } from 'react';
 import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import { MAX_BASKET_ASSETS, PRESET_TICKERS, type BasketRow, type RunConfig } from '../lib/config';
-import { HISTORY_RANGES, INTERVALS, type EngineStatus, type HistoryRange, type Interval, type TradeMode } from '../types/trading';
+import { HISTORY_RANGES, INTERVALS, MAX_MAX_STAGNATION, MIN_MAX_STAGNATION, type EngineStatus, type HistoryRange, type Interval, type TradeMode } from '../types/trading';
 import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
 
 interface ControlBarProps {
@@ -309,6 +309,16 @@ export default function ControlBar({ config, onChange, status, onStart, onStop }
           onChange={(slippagePct) => onChange({ slippagePct })}
           disabled={busy}
           className="w-[92px]"
+        />
+        <NumberField
+          label="Stop after stagnant iterations"
+          value={config.maxStagnation}
+          min={MIN_MAX_STAGNATION}
+          max={MAX_MAX_STAGNATION}
+          step={500}
+          onChange={(maxStagnation) => onChange({ maxStagnation: Math.round(maxStagnation) })}
+          disabled={busy}
+          className="w-[210px]"
         />
         <div>
           <FieldLabel>Mode</FieldLabel>

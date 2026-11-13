@@ -258,8 +258,11 @@ export interface ChartAxis {
 /*  Optimiser worker protocol                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** Consecutive non-improving iterations after which the optimiser declares convergence. */
-export const MAX_STAGNATION = 2000;
+/** Default number of consecutive non-improving iterations after which the optimiser declares convergence. */
+export const DEFAULT_MAX_STAGNATION = 5000;
+/** Bounds for the user-configurable stagnation limit. */
+export const MIN_MAX_STAGNATION = 100;
+export const MAX_MAX_STAGNATION = 1_000_000;
 /** Size of the live leaderboard. */
 export const LEADERBOARD_SIZE = 25;
 /** The worker posts a progress message every N iterations. */
@@ -270,6 +273,8 @@ export const IN_SAMPLE_FRACTION = 0.7;
 export interface OptimizerStartPayload {
   data: OHLCV;
   settings: BacktestSettings;
+  /** Stop after this many consecutive iterations without improvement (default 5,000). */
+  maxStagnation?: number;
   /** Optional seed for reproducible runs. */
   seed?: number;
 }

@@ -170,6 +170,7 @@ export default function App(): JSX.Element {
         interval: config.interval,
         range: config.range,
         settings,
+        maxStagnation: config.maxStagnation,
         components: dataset.components,
         units: dataset.units,
         isBasket: dataset.isBasket,
@@ -191,7 +192,7 @@ export default function App(): JSX.Element {
         setStatus('error');
         disposeWorker();
       };
-      const request: WorkerRequest = { type: 'start', payload: { data: dataset.data, settings } };
+      const request: WorkerRequest = { type: 'start', payload: { data: dataset.data, settings, maxStagnation: config.maxStagnation } };
       worker.postMessage(request);
       setStatus('optimizing');
     } catch (cause) {
@@ -264,7 +265,9 @@ export default function App(): JSX.Element {
         onStop={stop}
       />
 
-      <TelemetryStrip status={status} telemetry={telemetry} benchmarkRoi={benchmark?.full.roi ?? null} context={context} />
+      <TelemetryStrip
+        maxStagnation={context?.maxStagnation ?? config.maxStagnation}
+        status={status} telemetry={telemetry} benchmarkRoi={benchmark?.full.roi ?? null} context={context} />
 
       {error && (
         <div role="alert" className="flex items-start gap-2 rounded-lg border border-down/40 bg-down/10 px-3 py-2.5 text-sm text-down">

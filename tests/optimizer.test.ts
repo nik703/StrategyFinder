@@ -3,7 +3,7 @@ import { buildDataset } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
 import {
   LEADERBOARD_SIZE,
-  MAX_STAGNATION,
+  DEFAULT_MAX_STAGNATION,
   PROGRESS_EVERY,
   type BacktestSettings,
   type OHLCV,
@@ -27,7 +27,7 @@ function dataset(symbol: string, interval: '1h' | '4h' | '1d', range: '1y' | '2y
 function runOptimizer(
   data: OHLCV,
   settings: BacktestSettings,
-  options: { seed: number; stopAfterIterations?: number },
+  options: { seed: number; stopAfterIterations?: number; maxStagnation?: number },
 ): Promise<WorkerResponse[]> {
   return new Promise((resolve) => {
     const messages: WorkerResponse[] = [];
@@ -47,7 +47,7 @@ function runOptimizer(
       }
       if (message.type === 'done' || message.type === 'error') resolve(messages);
     };
-    scope.onmessage?.({ data: { type: 'start', payload: { data, settings, seed: options.seed } } });
+    scope.onmessage?.({ data: { type: 'start', payload: { data, settings, seed: options.seed, maxStagnation: options.maxStagnation } } });
   });
 }
 
@@ -57,7 +57,7 @@ beforeAll(async () => {
 });
 
 describe('optimizer worker', () => {
-  it('streams progress every 25 iterations and converges after 2,000 stagnant iterations', async () => {
+  it('streams progress every 25 iterations and converges after the default 5,000 stagnant iterations', async () => {
     const settings: BacktestSettings = { initialCapital: 10_000, feePct: 0.1, slippagePct: 0.05, tradeMode: 'long-short' };
     const messages = await runOptimizer(dataset('BTC-USD', '1d', '5y'), settings, { seed: 12345 });
 
@@ -72,13 +72,13 @@ describe('optimizer worker', () => {
     const progress = messages.filter((m): m is Extract<WorkerResponse, { type: 'progress' }> => m.type === 'progress');
     expect(progress.length).toBeGreaterThan(80);
     progress.slice(0, -1).forEach((p, index) => expect(p.iteration).toBe((index + 1) * PROGRESS_EVERY));
-    for (const p of progress) expect(p.stagnation).toBeLessThanOrEqual(MAX_STAGNATION);
+    for (const p of progress) expect(p.stagnation).toBeLessThanOrEqual(DEFAULT_MAX_STAGNATION);
 
     const done = messages[messages.length - 1] as Extract<WorkerResponse, { type: 'done' }>;
     expect(done.type).toBe('done');
     expect(done.reason).toBe('converged');
-    expect(done.stagnation).toBe(MAX_STAGNATION);
-    expect(done.iteration).toBeGreaterThanOrEqual(MAX_STAGNATION);
+    expect(done.stagnation).toBe(DEFAULT_MAX_STAGNATION);
+    expect(done.iteration).toBeGreaterThanOrEqual(DEFAULT_MAX_STAGNATION);
 
     const boards = messages.filter((m): m is Extract<WorkerResponse, { type: 'leaderboard' }> => m.type === 'leaderboard');
     const final = boards[boards.length - 1].strategies;
@@ -119,7 +119,7 @@ describe('optimizer worker', () => {
     expect(done.reason).toBe('stopped');
     expect(done.iteration).toBeGreaterThanOrEqual(300);
     expect(done.iteration).toBeLessThan(300 + 4 * PROGRESS_EVERY);
-    expect(done.stagnation).toBeLessThan(MAX_STAGNATION);
+    expect(done.stagnation).toBeLessThan(DEFAULT_MAX_STAGNATION);
     const boards = messages.filter((m): m is Extract<WorkerResponse, { type: 'leaderboard' }> => m.type === 'leaderboard');
     const final = boards[boards.length - 1].strategies;
     expect(final.length).toBeGreaterThan(0);
@@ -127,6 +127,14 @@ describe('optimizer worker', () => {
       expect(s.genome.shortEntry).toBeNull();
       if (s.genome.exit.mode === 'dynamic') expect(s.genome.exit.shortExit).toBeNull();
     }
+  }, 120_000);
+
+  it('honours a custom stagnation limit', async () => {
+    const settings: BacktestSettings = { initialCapital: 10_000, feePct: 0.1, slippagePct: 0.05, tradeMode: 'long-only' };
+    const messages = await runOptimizer(dataset('SPY', '1d', '2y'), settings, { seed: 3, maxStagnation: 300 });
+    const done = messages[messages.length - 1] as Extract<WorkerResponse, { type: 'done' }>;
+    expect(done.reason).toBe('converged');
+    expect(done.stagnation).toBe(300);
   }, 120_000);
 
   it('reports an error instead of crashing on unusable data', async () => {

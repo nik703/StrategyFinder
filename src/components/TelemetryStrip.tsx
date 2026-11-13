@@ -1,6 +1,6 @@
 /**
  * Live telemetry: engine status, iteration counter, stagnation progress
- * (X / 2,000 iterations without improvement), best strategy vs. Buy & Hold
+ * (X / N iterations without improvement), best strategy vs. Buy & Hold
  * and the market-data source.
  */
 
@@ -8,7 +8,7 @@ import { CircleCheck, CircleDot, Database, Loader2, OctagonX, TriangleAlert } fr
 import type { ReactNode } from 'react';
 import { SOURCE_LABEL, type RunContext } from '../lib/config';
 import { fmtDate, fmtDuration, fmtInt, fmtPct, toneClass } from '../lib/format';
-import { MAX_STAGNATION, type EngineStatus, type ProgressSnapshot } from '../types/trading';
+import { type EngineStatus, type ProgressSnapshot } from '../types/trading';
 import { cx, Panel } from './ui';
 
 interface TelemetryStripProps {
@@ -16,6 +16,8 @@ interface TelemetryStripProps {
   telemetry: ProgressSnapshot;
   benchmarkRoi: number | null;
   context: RunContext | null;
+  /** Stagnation limit of the current (or next) run. */
+  maxStagnation: number;
 }
 
 const STATUS: Record<EngineStatus, { label: string; className: string; icon: ReactNode }> = {
@@ -45,7 +47,7 @@ const STATUS: Record<EngineStatus, { label: string; className: string; icon: Rea
     icon: <OctagonX size={13} />,
   },
   converged: {
-    label: `Converged at ${fmtInt(MAX_STAGNATION)}`,
+    label: 'Converged',
     className: 'border-up/40 bg-up/10 text-up',
     icon: <CircleCheck size={13} />,
   },
@@ -65,10 +67,11 @@ function Tile({ label, children, className }: { label: string; children: ReactNo
   );
 }
 
-export default function TelemetryStrip({ status, telemetry, benchmarkRoi, context }: TelemetryStripProps): JSX.Element {
+export default function TelemetryStrip({ status, telemetry, benchmarkRoi, context, maxStagnation }: TelemetryStripProps): JSX.Element {
   const badge = STATUS[status];
-  const stagnation = Math.min(telemetry.stagnation, MAX_STAGNATION);
-  const stagnationPct = (stagnation / MAX_STAGNATION) * 100;
+  const badgeLabel = status === 'converged' ? `Converged at ${fmtInt(maxStagnation)}` : badge.label;
+  const stagnation = Math.min(telemetry.stagnation, maxStagnation);
+  const stagnationPct = (stagnation / maxStagnation) * 100;
   const hasRun = telemetry.iteration > 0;
   const alpha = telemetry.bestRoi !== null && benchmarkRoi !== null ? telemetry.bestRoi - benchmarkRoi : null;
 
@@ -81,7 +84,7 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
           className={cx('inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-semibold', badge.className)}
         >
           {badge.icon}
-          {badge.label}
+          {badgeLabel}
         </div>
         <div className="num mt-1.5 text-xs text-ink-3">
           {hasRun ? (
@@ -103,7 +106,7 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
       <Tile label="Stagnation progress">
         <div className="flex items-baseline gap-1.5 whitespace-nowrap">
           <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(stagnation)}</span>
-          <span className="num text-sm text-ink-3">/ {fmtInt(MAX_STAGNATION)}</span>
+          <span className="num text-sm text-ink-3">/ {fmtInt(maxStagnation)}</span>
         </div>
         <div className="mt-1 truncate text-xs text-ink-3">iterations without improvement</div>
         <div
@@ -111,7 +114,7 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
           role="progressbar"
           aria-label="Stagnation progress"
           aria-valuemin={0}
-          aria-valuemax={MAX_STAGNATION}
+          aria-valuemax={maxStagnation}
           aria-valuenow={stagnation}
         >
           <div
