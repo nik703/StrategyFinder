@@ -1,7 +1,8 @@
 /**
  * Interactive equity-curve chart: selected strategy vs. the Buy & Hold
- * benchmark, with a dashed vertical divider at the 70% in-sample / 30%
- * out-of-sample boundary, a crosshair and a shared tooltip.
+ * benchmark, with dashed vertical dividers between the train, validation and
+ * holdout segments, a crosshair and a shared tooltip. The holdout part of the
+ * curves only exists once the run has ended.
  */
 
 import {
@@ -44,50 +45,69 @@ interface EquityChartProps {
   strategyName: string | null;
   initialCapital: number;
   interval: Interval;
+  /** True once the run has ended and the holdout part of the curves is available. */
+  revealed: boolean;
   /** Shown instead of the chart before the first run. */
   placeholder: string;
 }
 
 interface SplitOptions {
-  splitPos: number;
+  validationPos: number;
+  holdoutPos: number;
+  /** False while the run is live: the holdout region is sealed and holds no data. */
+  revealed: boolean;
 }
 
-/** Shades the out-of-sample region and draws the dashed in-sample / out-of-sample divider. */
+/** Shades the validation and holdout regions and draws the two dashed segment dividers with their labels. */
 const splitDividerPlugin: Plugin<'line', SplitOptions> = {
   id: 'splitDivider',
   beforeDatasetsDraw(chart, _args, options) {
     const { ctx, chartArea, scales } = chart;
-    if (!chartArea || !scales.x || !(options.splitPos > 0)) return;
-    const x = scales.x.getPixelForValue(options.splitPos);
-    if (x <= chartArea.left || x >= chartArea.right) return;
+    if (!chartArea || !scales.x || !(options.validationPos > 0) || !(options.holdoutPos > options.validationPos)) return;
+    const xValidation = scales.x.getPixelForValue(options.validationPos);
+    const xHoldout = scales.x.getPixelForValue(options.holdoutPos);
+    if (xValidation <= chartArea.left || xHoldout >= chartArea.right) return;
+    const height = chartArea.bottom - chartArea.top;
 
     ctx.save();
-    // Out-of-sample region: a barely-there wash so the boundary reads at a glance.
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.045)';
-    ctx.fillRect(x, chartArea.top, chartArea.right - x, chartArea.bottom - chartArea.top);
+    // Barely-there washes so the three segments read at a glance.
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.035)';
+    ctx.fillRect(xValidation, chartArea.top, xHoldout - xValidation, height);
+    ctx.fillStyle = options.revealed ? 'rgba(148, 163, 184, 0.075)' : 'rgba(148, 163, 184, 0.11)';
+    ctx.fillRect(xHoldout, chartArea.top, chartArea.right - xHoldout, height);
 
     ctx.setLineDash([5, 5]);
     ctx.lineWidth = 1.25;
     ctx.strokeStyle = 'rgba(232, 235, 243, 0.55)';
-    ctx.beginPath();
-    ctx.moveTo(x, chartArea.top);
-    ctx.lineTo(x, chartArea.bottom);
-    ctx.stroke();
+    for (const x of [xValidation, xHoldout]) {
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.stroke();
+    }
     ctx.setLineDash([]);
 
     ctx.font = `600 10px ${FONT}`;
     ctx.textBaseline = 'top';
+    ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(170, 179, 200, 0.95)';
     const y = chartArea.top + 6;
-    const left = 'IN-SAMPLE · 70%';
-    const right = 'OUT-OF-SAMPLE · 30%';
-    if (x - chartArea.left > ctx.measureText(left).width + 16) {
-      ctx.textAlign = 'right';
-      ctx.fillText(left, x - 8, y);
-    }
-    if (chartArea.right - x > ctx.measureText(right).width + 16) {
-      ctx.textAlign = 'left';
-      ctx.fillText(right, x + 8, y);
+    const label = (text: string, short: string, from: number, to: number): void => {
+      const room = to - from - 12;
+      const fits = ctx.measureText(text).width <= room ? text : ctx.measureText(short).width <= room ? short : '';
+      if (fits) ctx.fillText(fits, (from + to) / 2, y);
+    };
+    label('TRAIN · 60%', 'TRAIN', chartArea.left, xValidation);
+    label('VALIDATION · 20%', 'VALID.', xValidation, xHoldout);
+    label('HOLDOUT · 20%', 'HOLDOUT', xHoldout, chartArea.right);
+    if (!options.revealed) {
+      ctx.font = `500 10px ${FONT}`;
+      ctx.fillStyle = 'rgba(127, 138, 165, 0.95)';
+      const room = chartArea.right - xHoldout - 12;
+      const lines = ['Sealed until', 'the run ends'];
+      if (lines.every((line) => ctx.measureText(line).width <= room)) {
+        lines.forEach((line, index) => ctx.fillText(line, (xHoldout + chartArea.right) / 2, chartArea.top + height / 2 - 8 + index * 14));
+      }
     }
     ctx.restore();
   },
@@ -124,6 +144,7 @@ export default function EquityChart({
   strategyName,
   initialCapital,
   interval,
+  revealed,
   placeholder,
 }: EquityChartProps): JSX.Element {
   const [scale, setScale] = useState<'linear' | 'log'>('linear');
@@ -136,7 +157,8 @@ export default function EquityChart({
       return points;
     };
     const datasets: ChartData<'line', { x: number; y: number }[]>['datasets'] = [];
-    if (strategy && strategy.length === axis.time.length) {
+    // Curves stop at the holdout boundary while the run is live.
+    if (strategy && strategy.length > 0) {
       datasets.push({
         label: strategyName ?? 'Strategy',
         data: toPoints(strategy),
@@ -163,7 +185,8 @@ export default function EquityChart({
     const time = axis?.time ?? new Float64Array(0);
     const last = Math.max(1, time.length - 1);
     const span = time.length > 1 ? time[time.length - 1] - time[0] : 0;
-    const splitPos = axis?.splitPos ?? 0;
+    const validationPos = axis?.validationPos ?? 0;
+    const holdoutPos = axis?.holdoutPos ?? 0;
     const at = (value: number): number => time[Math.min(time.length - 1, Math.max(0, Math.round(value)))];
     return {
       responsive: true,
@@ -209,7 +232,7 @@ export default function EquityChart({
       },
       plugins: {
         legend: { display: false },
-        splitDivider: { splitPos },
+        splitDivider: { validationPos, holdoutPos, revealed },
         tooltip: {
           backgroundColor: '#151c2f',
           borderColor: AXIS,
@@ -247,13 +270,16 @@ export default function EquityChart({
               const color = String(item.dataset.borderColor);
               return { borderColor: color, backgroundColor: color, borderWidth: 2 };
             },
-            footer: (items) =>
-              items.length > 0 && (items[0].parsed.x ?? 0) >= splitPos ? 'Out-of-sample segment' : 'In-sample segment',
+            footer: (items) => {
+              if (items.length === 0) return '';
+              const x = items[0].parsed.x ?? 0;
+              return x >= holdoutPos ? 'Holdout segment' : x >= validationPos ? 'Validation segment' : 'Train segment';
+            },
           },
         },
       },
     } as ChartOptions<'line'>;
-  }, [axis, scale, interval, initialCapital]);
+  }, [axis, scale, interval, initialCapital, revealed]);
 
   const lastOf = (curve: Float32Array | null): number | null => (curve && curve.length > 0 ? curve[curve.length - 1] : null);
   const strategyEnd = lastOf(strategy);
@@ -276,7 +302,7 @@ export default function EquityChart({
           </span>
           <span className="inline-flex items-center gap-2 text-ink-3">
             <LineKey color="rgba(232, 235, 243, 0.55)" dashed />
-            70% in-sample / 30% out-of-sample
+            60% train / 20% validation / 20% holdout
           </span>
         </div>
         <Segmented ariaLabel="Y-axis scale" size="sm" options={SCALE_OPTIONS} value={scale} onChange={setScale} />

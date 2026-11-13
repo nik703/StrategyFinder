@@ -7,7 +7,7 @@ import { ChevronDown, ChevronsUpDown, ChevronUp, Trophy } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
 import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
-import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult } from '../types/trading';
+import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type Verdict } from '../types/trading';
 import { cx, Panel, Pill } from './ui';
 
 interface LeaderboardProps {
@@ -19,6 +19,10 @@ interface LeaderboardProps {
 
 type SortKey =
   | 'rank'
+  | 'params'
+  | 'dsr'
+  | 'holdout'
+  | 'verdict'
   | 'netPnl'
   | 'roi'
   | 'alpha'
@@ -52,6 +56,11 @@ interface Column {
   render: (row: Row) => ReactNode;
 }
 
+export function VerdictPill({ verdict }: { verdict: Verdict | null }): JSX.Element {
+  if (verdict === null) return <span className="text-[11px] text-ink-3">pending</span>;
+  return <Pill tone={verdict === 'Robust' ? 'up' : verdict === 'Fragile' ? 'warn' : 'down'}>{verdict}</Pill>;
+}
+
 const COLUMNS: Column[] = [
   {
     key: 'rank',
@@ -74,6 +83,7 @@ const COLUMNS: Column[] = [
           {indicatorBadges(strategy.genome).map((badge) => (
             <Pill key={badge}>{badge}</Pill>
           ))}
+          <Pill tone="bench">{strategy.genome.archetype === 'TREND' ? 'Trend' : 'Mean rev.'}</Pill>
           {strategy.genome.shortEntry !== null && <Pill tone="accent">L/S</Pill>}
         </div>
         <div className="num mt-1 truncate text-[11px] text-ink-3" title={groupFormula(strategy.genome.longEntry)}>
@@ -85,21 +95,21 @@ const COLUMNS: Column[] = [
   {
     key: 'netPnl',
     label: 'Net PnL ($)',
-    title: 'Net profit after fees and slippage',
+    title: 'Net profit after fees and slippage over train + validation',
     align: 'right',
-    value: ({ strategy }) => strategy.full.netPnl,
+    value: ({ strategy }) => strategy.search.netPnl,
     render: ({ strategy }) => (
-      <span className={cx('font-medium', toneClass(strategy.full.netPnl))}>{fmtUsd(strategy.full.netPnl, true)}</span>
+      <span className={cx('font-medium', toneClass(strategy.search.netPnl))}>{fmtUsd(strategy.search.netPnl, true)}</span>
     ),
   },
   {
     key: 'roi',
     label: 'ROI (%)',
-    title: 'Return on starting capital over the full period',
+    title: 'Return on starting capital over train + validation',
     align: 'right',
-    value: ({ strategy }) => strategy.full.roi,
+    value: ({ strategy }) => strategy.search.roi,
     render: ({ strategy }) => (
-      <span className={cx('font-medium', toneClass(strategy.full.roi))}>{fmtPct(strategy.full.roi, true)}</span>
+      <span className={cx('font-medium', toneClass(strategy.search.roi))}>{fmtPct(strategy.search.roi, true)}</span>
     ),
   },
   {
@@ -113,41 +123,41 @@ const COLUMNS: Column[] = [
   {
     key: 'maxDrawdown',
     label: 'Max Drawdown (%)',
-    title: 'Largest peak-to-trough equity decline',
+    title: 'Largest peak-to-trough equity decline, measured to intrabar lows',
     align: 'right',
-    value: ({ strategy }) => strategy.full.maxDrawdown,
+    value: ({ strategy }) => strategy.search.maxDrawdown,
     firstDir: 'asc',
-    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.full.maxDrawdown)}</span>,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.search.maxDrawdown)}</span>,
   },
   {
     key: 'winRate',
     label: 'Win Rate (%)',
     align: 'right',
-    value: ({ strategy }) => strategy.full.winRate,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.full.winRate)}</span>,
+    value: ({ strategy }) => strategy.search.winRate,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.search.winRate)}</span>,
   },
   {
     key: 'profitFactor',
     label: 'Profit Factor',
     title: 'Gross profit ÷ gross loss',
     align: 'right',
-    value: ({ strategy }) => strategy.full.profitFactor,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.full.profitFactor)}</span>,
+    value: ({ strategy }) => strategy.search.profitFactor,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.profitFactor)}</span>,
   },
   {
     key: 'sharpe',
     label: 'Sharpe Ratio',
     title: 'Annualised Sharpe ratio (risk-free rate 0)',
     align: 'right',
-    value: ({ strategy }) => strategy.full.sharpe,
-    render: ({ strategy }) => <span className="text-ink">{fmtNum(strategy.full.sharpe)}</span>,
+    value: ({ strategy }) => strategy.search.sharpe,
+    render: ({ strategy }) => <span className="text-ink">{fmtNum(strategy.search.sharpe)}</span>,
   },
   {
     key: 'trades',
     label: 'Trades',
     align: 'right',
-    value: ({ strategy }) => strategy.full.trades,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtInt(strategy.full.trades)}</span>,
+    value: ({ strategy }) => strategy.search.trades,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtInt(strategy.search.trades)}</span>,
   },
   {
     key: 'mode',
@@ -166,9 +176,54 @@ const COLUMNS: Column[] = [
     ),
   },
   {
+    key: 'params',
+    label: 'Params',
+    title: 'Number of tunable parameters (hard cap 8, fitness penalty above 4)',
+    align: 'right',
+    value: ({ strategy }) => strategy.params,
+    firstDir: 'asc',
+    render: ({ strategy }) => <span className={strategy.params > 4 ? 'text-warn' : 'text-ink-2'}>{strategy.params}</span>,
+  },
+  {
+    key: 'dsr',
+    label: 'DSR',
+    title: 'Deflated Sharpe Ratio of the validation segment: probability the Sharpe is real given every strategy tried so far',
+    align: 'right',
+    value: ({ strategy }) => strategy.dsr,
+    render: ({ strategy }) => (
+      <span className={strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink-2'}>
+        {fmtPct(strategy.dsr * 100, false, 0)}
+      </span>
+    ),
+  },
+  {
+    key: 'holdout',
+    label: 'Holdout ROI',
+    title: 'Return on the 20% holdout – hidden until the run ends, never used for ranking',
+    align: 'right',
+    value: ({ strategy }) => strategy.holdout?.roi ?? -Infinity,
+    render: ({ strategy }) =>
+      strategy.holdout ? (
+        <span className={toneClass(strategy.holdout.roi)}>{fmtPct(strategy.holdout.roi, true)}</span>
+      ) : (
+        <span className="text-ink-3" title="Sealed until the run ends">
+          sealed
+        </span>
+      ),
+  },
+  {
+    key: 'verdict',
+    label: 'Verdict',
+    title: 'Robust / Fragile / Overfit – combines the holdout, the deflated Sharpe and the robustness tests',
+    align: 'left',
+    value: ({ strategy }) => (strategy.verdict === 'Robust' ? 0 : strategy.verdict === 'Fragile' ? 1 : strategy.verdict === 'Overfit' ? 2 : 3),
+    firstDir: 'asc',
+    render: ({ strategy }) => <VerdictPill verdict={strategy.verdict} />,
+  },
+  {
     key: 'fitness',
     label: 'Score',
-    title: 'Composite fitness: out-of-sample risk-adjusted return and excess return, minus penalties',
+    title: 'Composite fitness: deflated validation Sharpe and excess return, minus penalties for few trades, complexity and drawdown',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
     render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,
@@ -190,6 +245,7 @@ export default function Leaderboard({ strategies, selectedId, onSelect, status }
       const vb = value(b);
       if (va === vb) return a.rank - b.rank;
       if (typeof va === 'string' || typeof vb === 'string') return String(va).localeCompare(String(vb)) * direction;
+      if (!Number.isFinite(va as number) && !Number.isFinite(vb as number)) return a.rank - b.rank;
       return (va < vb ? -1 : 1) * direction;
     });
   }, [strategies, sort]);

@@ -5,29 +5,51 @@
  * every indicator, backtest and optimisation step runs in `optimizer.worker.ts`.
  */
 
-import { Activity, Pin, TriangleAlert, X } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, Info, Pin, TriangleAlert, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ControlBar from './components/ControlBar';
 import EquityChart, { BENCHMARK_COLOR, STRATEGY_COLOR } from './components/EquityChart';
 import Leaderboard from './components/Leaderboard';
 import StrategyModal from './components/StrategyModal';
 import TelemetryStrip from './components/TelemetryStrip';
+import { VerdictPill } from './components/Leaderboard';
 import { cx, LineKey, Panel, Pill } from './components/ui';
 import { buildDataset } from './data/basket';
 import { loadMarketData } from './data/marketData';
 import { exitModeLabel, indicatorBadges } from './engine/describe';
-import { DEFAULT_CONFIG, resolveAssets, settingsFrom, type RunConfig, type RunContext } from './lib/config';
+import {
+  DEFAULT_CONFIG,
+  defaultUniverse,
+  isCrypto,
+  parseUniverse,
+  resolveAssets,
+  resolveUniverse,
+  settingsFrom,
+  venueLabel,
+  type RunConfig,
+  type RunContext,
+} from './lib/config';
 import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
-import type {
-  BenchmarkResult,
-  ChartAxis,
-  EngineStatus,
-  PerformanceMetrics,
-  ProgressSnapshot,
-  StrategyResult,
-  WorkerRequest,
-  WorkerResponse,
+import { datasetFingerprint, holdoutViews, recordHoldoutView } from './lib/holdoutLog';
+import {
+  DEFAULT_CRYPTO_UNIVERSE,
+  DEFAULT_STOCK_UNIVERSE,
+  type BenchmarkResult,
+  type ChartAxis,
+  type EngineStatus,
+  type NamedDataset,
+  type PerformanceMetrics,
+  type ProgressSnapshot,
+  type RobustnessReport,
+  type StrategyResult,
+  type Verdict,
+  type WorkerRequest,
+  type WorkerResponse,
 } from './types/trading';
+
+type Analysis = { report: RobustnessReport; verdict: Verdict | null };
+
+const DEFAULT_UNIVERSES = [DEFAULT_CRYPTO_UNIVERSE.join(', '), DEFAULT_STOCK_UNIVERSE.join(', ')];
 
 const EMPTY_TELEMETRY: ProgressSnapshot = {
   iteration: 0,
@@ -72,11 +94,21 @@ export default function App(): JSX.Element {
   /** Strategy pinned by clicking a leaderboard row; null = follow the current #1. */
   const [pinned, setPinned] = useState<StrategyResult | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  /** On-demand robustness reports, by strategy id. */
+  const [analyses, setAnalyses] = useState<Record<string, Analysis>>({});
+  const [pendingAnalyses, setPendingAnalyses] = useState<Record<string, boolean>>({});
 
   const workerRef = useRef<Worker | null>(null);
   const runIdRef = useRef(0);
   const pendingProgress = useRef<ProgressSnapshot | null>(null);
   const frameRef = useRef<number | null>(null);
+  const contextRef = useRef<RunContext | null>(null);
+  const finishedRef = useRef(false);
+  /** Analysis requests already sent, keyed by strategy id and run phase. */
+  const requestedRef = useRef(new Set<string>());
+  /** Extra assets for the cross-asset test of single-asset runs: loaded once per run. */
+  const extraUniverseRef = useRef<Promise<NamedDataset[]> | null>(null);
+  const extraUniverseSentRef = useRef(false);
 
   const disposeWorker = useCallback(() => {
     workerRef.current?.terminate();
@@ -87,6 +119,18 @@ export default function App(): JSX.Element {
   }, []);
 
   useEffect(() => disposeWorker, [disposeWorker]);
+
+  /** Changing the ticker's asset class switches the Robust universe to that class's default. */
+  const updateConfig = useCallback((patch: Partial<RunConfig>) => {
+    setConfig((current) => {
+      const next = { ...current, ...patch };
+      if (patch.symbol !== undefined && isCrypto(patch.symbol) !== isCrypto(current.symbol)) {
+        next.robustUniverse = isCrypto(patch.symbol); // on by default for crypto, off for stocks
+        if (DEFAULT_UNIVERSES.includes(current.universe.trim())) next.universe = defaultUniverse(patch.symbol);
+      }
+      return next;
+    });
+  }, []);
 
   /** Progress arrives every 25 iterations (hundreds of times per second on fast data) – paint at most once per frame. */
   const queueProgress = useCallback((snapshot: ProgressSnapshot) => {
@@ -117,20 +161,34 @@ export default function App(): JSX.Element {
           setLeaderboard(message.strategies);
           break;
         case 'done': {
-          const { type: _type, reason, ...snapshot } = message;
+          const { type: _type, reason, strategies, benchmark: finalBenchmark, ...snapshot } = message;
           if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
           frameRef.current = null;
           pendingProgress.current = null;
+          finishedRef.current = true;
           setTelemetry(snapshot);
+          // The search is over: the final leaderboard and benchmark now include the holdout.
+          setLeaderboard(strategies);
+          setBenchmark(finalBenchmark);
+          setPinned((current) => (current ? (strategies.find((s) => s.id === current.id) ?? null) : null));
+          setAnalyses({});
+          setPendingAnalyses({});
+          if (contextRef.current) recordHoldoutView(contextRef.current.fingerprint);
           setStatus(reason === 'converged' ? 'converged' : 'stopped');
-          workerRef.current?.terminate();
-          workerRef.current = null;
+          // The worker stays alive to answer robustness-analysis requests.
           break;
         }
+        case 'analysis':
+          setAnalyses((current) => ({ ...current, [message.strategyId]: { report: message.report, verdict: message.verdict } }));
+          setPendingAnalyses((current) => ({ ...current, [message.strategyId]: false }));
+          break;
         case 'error':
           setError(message.message);
-          setStatus('error');
-          disposeWorker();
+          setPendingAnalyses({});
+          if (!finishedRef.current) {
+            setStatus('error');
+            disposeWorker();
+          }
           break;
       }
     },
@@ -143,8 +201,18 @@ export default function App(): JSX.Element {
       setError(assets.error);
       return;
     }
+    const universe = resolveUniverse(config, assets.components[0].symbol);
+    if (!universe.ok) {
+      setError(universe.error);
+      return;
+    }
     disposeWorker();
     const runId = ++runIdRef.current;
+    finishedRef.current = false;
+    requestedRef.current = new Set();
+    extraUniverseRef.current = null;
+    extraUniverseSentRef.current = false;
+    contextRef.current = null;
     setError(null);
     setStatus('loading');
     setTelemetry(EMPTY_TELEMETRY);
@@ -154,23 +222,33 @@ export default function App(): JSX.Element {
     setContext(null);
     setPinned(null);
     setModalOpen(false);
+    setAnalyses({});
+    setPendingAnalyses({});
 
     try {
-      const loaded = await loadMarketData(
-        assets.components.map((component) => component.symbol),
-        config.interval,
-        config.range,
-      );
+      const tradedSymbols = assets.components.map((component) => component.symbol);
+      const symbols = [...new Set([...tradedSymbols, ...universe.symbols])];
+      const loaded = await loadMarketData(symbols, config.interval, config.range);
       if (runId !== runIdRef.current) return; // cancelled while downloading
       const dataset = buildDataset(loaded.series, assets.components);
       const settings = settingsFrom(config);
       const bars = dataset.data.t.length;
-      setContext({
+      // The primary asset first; every other universe asset is backtested separately with the same rules.
+      const datasets: NamedDataset[] = [{ symbol: dataset.isBasket ? 'Basket' : tradedSymbols[0], data: dataset.data }];
+      for (const symbol of universe.symbols.slice(1)) {
+        datasets.push({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data });
+      }
+      const fingerprint = datasetFingerprint(symbols, config.interval, config.range, dataset.data.t[bars - 1]);
+      const runContext: RunContext = {
         label: dataset.label,
         interval: config.interval,
         range: config.range,
         settings,
         maxStagnation: config.maxStagnation,
+        universe: datasets.map((entry) => entry.symbol),
+        venue: venueLabel(tradedSymbols.map((symbol) => loaded.series[symbol])),
+        fingerprint,
+        priorHoldoutViews: holdoutViews(fingerprint),
         components: dataset.components,
         units: dataset.units,
         isBasket: dataset.isBasket,
@@ -181,7 +259,9 @@ export default function App(): JSX.Element {
         simulated: loaded.usedFallback,
         fallbackReason: loaded.fallbackReason,
         notes: loaded.notes,
-      });
+      };
+      contextRef.current = runContext;
+      setContext(runContext);
 
       const worker = new Worker(new URL('./workers/optimizer.worker.ts', import.meta.url), { type: 'module' });
       workerRef.current = worker;
@@ -192,7 +272,7 @@ export default function App(): JSX.Element {
         setStatus('error');
         disposeWorker();
       };
-      const request: WorkerRequest = { type: 'start', payload: { data: dataset.data, settings, maxStagnation: config.maxStagnation } };
+      const request: WorkerRequest = { type: 'start', payload: { datasets, settings, maxStagnation: config.maxStagnation } };
       worker.postMessage(request);
       setStatus('optimizing');
     } catch (cause) {
@@ -204,7 +284,7 @@ export default function App(): JSX.Element {
 
   const stop = useCallback(() => {
     if (status === 'optimizing' && workerRef.current) {
-      // Cooperative stop: the worker finishes its current batch, posts the final leaderboard and exits.
+      // Cooperative stop: the worker finishes its current batch, reveals the holdout for the final leaderboard and idles.
       const request: WorkerRequest = { type: 'stop' };
       workerRef.current.postMessage(request);
     } else if (status === 'loading') {
@@ -212,6 +292,42 @@ export default function App(): JSX.Element {
       setStatus('stopped');
     }
   }, [status]);
+
+  /**
+   * Ask the worker for a robustness report. Single-asset runs have no other assets
+   * loaded, so the default universe for the asset class is fetched once and sent along
+   * for the cross-asset test.
+   */
+  const requestAnalysis = useCallback(async (strategy: StrategyResult) => {
+    const worker = workerRef.current;
+    const runContext = contextRef.current;
+    const runId = runIdRef.current;
+    if (!worker || !runContext) return;
+    setPendingAnalyses((current) => ({ ...current, [strategy.id]: true }));
+
+    let universe: NamedDataset[] | undefined;
+    const needsUniverse = !runContext.isBasket && runContext.universe.length <= 1 && !extraUniverseSentRef.current;
+    if (needsUniverse) {
+      const primary = runContext.components[0].symbol;
+      extraUniverseRef.current ??= (async () => {
+        const symbols = parseUniverse(defaultUniverse(primary)).filter((symbol) => symbol !== primary);
+        const loaded = await loadMarketData(symbols, runContext.interval, runContext.range);
+        // Never mix live and simulated candles in one comparison.
+        if (loaded.usedFallback !== runContext.simulated) return [];
+        return symbols.map((symbol) => ({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data }));
+      })().catch(() => []);
+      universe = await extraUniverseRef.current;
+      if (runId !== runIdRef.current || workerRef.current !== worker) return;
+      extraUniverseSentRef.current = true;
+    }
+    const request: WorkerRequest = {
+      type: 'analyze',
+      strategyId: strategy.id,
+      genome: strategy.genome,
+      universe: universe && universe.length > 0 ? universe : undefined,
+    };
+    worker.postMessage(request);
+  }, []);
 
   const selectStrategy = useCallback((strategy: StrategyResult) => {
     setPinned(strategy);
@@ -230,10 +346,21 @@ export default function App(): JSX.Element {
     [leaderboard],
   );
   const displayedRank = rankOf(displayed);
-  const oosYears = useMemo(
-    () => (axis ? (axis.bars - axis.splitIndex) / Math.max(1, barsPerYear) : 0),
-    [axis, barsPerYear],
-  );
+  const revealed = benchmark?.holdout != null;
+  const finished = status === 'converged' || status === 'stopped';
+
+  // Opening the breakdown requests a robustness report: once while the run is live
+  // (no verdict yet) and once after it has ended (with the holdout and other assets).
+  useEffect(() => {
+    if (!modalOpen || !displayed || !workerRef.current) return;
+    if (status !== 'optimizing' && !finished) return;
+    const crossAssetMissing = !context?.isBasket && displayed.robustness?.crossAsset == null;
+    if (displayed.robustness !== null && !crossAssetMissing) return;
+    const key = `${displayed.id}|${finished ? 'final' : 'live'}`;
+    if (requestedRef.current.has(key)) return;
+    requestedRef.current.add(key);
+    void requestAnalysis(displayed);
+  }, [modalOpen, displayed, status, finished, context, requestAnalysis]);
 
   const strategyName = displayed
     ? `Strategy ${displayed.id}${displayedRank !== null ? ` · #${displayedRank}` : ''}`
@@ -253,13 +380,13 @@ export default function App(): JSX.Element {
           </div>
         </div>
         <p className="text-xs text-ink-3">
-          Signals on candle close · fills at next open · fees &amp; slippage included · 70 / 30 in-sample / out-of-sample
+          Signals on candle close · fills at next open · fees &amp; slippage included · 60 / 20 / 20 train / validation / holdout
         </p>
       </header>
 
       <ControlBar
         config={config}
-        onChange={(patch) => setConfig((current) => ({ ...current, ...patch }))}
+        onChange={updateConfig}
         status={status}
         onStart={() => void start()}
         onStop={stop}
@@ -267,7 +394,11 @@ export default function App(): JSX.Element {
 
       <TelemetryStrip
         maxStagnation={context?.maxStagnation ?? config.maxStagnation}
-        status={status} telemetry={telemetry} benchmarkRoi={benchmark?.full.roi ?? null} context={context} />
+        status={status}
+        telemetry={telemetry}
+        benchmarkRoi={benchmark?.search.roi ?? null}
+        context={context}
+      />
 
       {error && (
         <div role="alert" className="flex items-start gap-2 rounded-lg border border-down/40 bg-down/10 px-3 py-2.5 text-sm text-down">
@@ -286,6 +417,19 @@ export default function App(): JSX.Element {
             <span className="font-semibold">Simulated market data.</span> The market-data function could not supply live candles, so the
             built-in generator produced realistic placeholder prices. Results are illustrative only.
             {context.fallbackReason && <span className="num mt-0.5 block truncate text-xs opacity-80">Reason: {context.fallbackReason}</span>}
+          </div>
+        </div>
+      )}
+
+      {context && context.priorHoldoutViews > 0 && (
+        <div role="status" className="flex items-start gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2.5 text-sm text-warn">
+          <Info size={16} className="mt-0.5 shrink-0" />
+          <div className="min-w-0">
+            <span className="font-semibold">
+              Holdout already viewed {context.priorHoldoutViews} time{context.priorHoldoutViews === 1 ? '' : 's'}. It is no longer unseen
+              data.
+            </span>{' '}
+            Every run on the same symbols, timeframe, range and end date reveals the same holdout, so each look makes it a weaker test.
           </div>
         </div>
       )}
@@ -334,6 +478,7 @@ export default function App(): JSX.Element {
               benchmark={benchmark?.equity ?? null}
               strategy={displayed?.equity ?? null}
               strategyName={strategyName}
+              revealed={revealed}
               initialCapital={capital}
               interval={context?.interval ?? config.interval}
               placeholder={
@@ -349,7 +494,7 @@ export default function App(): JSX.Element {
         <Panel className="flex flex-col">
           <div className="border-b border-line px-4 py-3">
             <h2 className="text-sm font-semibold text-ink">Strategy vs. Buy &amp; Hold</h2>
-            <p className="text-xs text-ink-3">Same candles, same starting capital, same costs</p>
+            <p className="text-xs text-ink-3">Train + validation · same candles, capital and costs</p>
           </div>
           {benchmark ? (
             <div className="flex min-h-0 flex-1 flex-col">
@@ -373,11 +518,11 @@ export default function App(): JSX.Element {
                   {COMPARISON_ROWS.map((row) => (
                     <tr key={row.label} className="border-b border-line/60 last:border-b-0">
                       <th scope="row" className="whitespace-nowrap px-4 py-[7px] text-left font-normal text-ink-2">{row.label}</th>
-                      <td className={cx('px-2 py-[7px] text-right font-medium', displayed ? (row.tone?.(displayed.full) ?? 'text-ink') : 'text-ink-3')}>
-                        {displayed ? row.format(displayed.full) : '–'}
+                      <td className={cx('px-2 py-[7px] text-right font-medium', displayed ? (row.tone?.(displayed.search) ?? 'text-ink') : 'text-ink-3')}>
+                        {displayed ? row.format(displayed.search) : '–'}
                       </td>
-                      <td className={cx('px-4 py-[7px] text-right', row.benchmark === false ? 'text-ink-3' : (row.tone?.(benchmark.full) ?? 'text-ink-2'))}>
-                        {row.benchmark === false ? '–' : row.format(benchmark.full)}
+                      <td className={cx('px-4 py-[7px] text-right', row.benchmark === false ? 'text-ink-3' : (row.tone?.(benchmark.search) ?? 'text-ink-2'))}>
+                        {row.benchmark === false ? '–' : row.format(benchmark.search)}
                       </td>
                     </tr>
                   ))}
@@ -393,11 +538,26 @@ export default function App(): JSX.Element {
                       <Pill tone={displayed.genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exitModeLabel(displayed.genome)}</Pill>
                     </div>
                     <p className="num mt-2 text-xs text-ink-3">
-                      Alpha vs. Buy &amp; Hold{' '}
-                      <span className={cx('font-semibold', toneClass(displayed.alpha))}>{fmtPct(displayed.alpha, true)}</span> · out-of-sample
-                      ROI <span className={cx('font-semibold', toneClass(displayed.outOfSample.roi))}>{fmtPct(displayed.outOfSample.roi, true)}</span>{' '}
-                      vs {fmtPct(benchmark.outOfSample.roi, true)}
+                      Deflated Sharpe{' '}
+                      <span className={cx('font-semibold', displayed.dsr >= 0.95 ? 'text-up' : 'text-ink-2')}>
+                        {fmtPct(displayed.dsr * 100, false, 0)}
+                      </span>{' '}
+                      · {displayed.params} params ·{' '}
+                      {displayed.holdout ? (
+                        <>
+                          holdout ROI{' '}
+                          <span className={cx('font-semibold', toneClass(displayed.holdout.roi))}>{fmtPct(displayed.holdout.roi, true)}</span> vs{' '}
+                          {fmtPct(benchmark.holdout?.roi ?? null, true)}
+                        </>
+                      ) : (
+                        'holdout sealed until the run ends'
+                      )}
                     </p>
+                    {(analyses[displayed.id]?.verdict ?? displayed.verdict) !== null && (
+                      <div className="mt-2">
+                        <VerdictPill verdict={analyses[displayed.id]?.verdict ?? displayed.verdict} />
+                      </div>
+                    )}
                   </>
                 ) : (
                   <p className="text-xs text-ink-3">The Buy &amp; Hold baseline is ready. Strategy figures appear as soon as one is found.</p>
@@ -428,7 +588,9 @@ export default function App(): JSX.Element {
           benchmark={benchmark}
           context={context}
           testedCount={telemetry.iteration}
-          oosYears={oosYears}
+          barsPerYear={barsPerYear}
+          analysis={analyses[displayed.id] ?? null}
+          analysisPending={pendingAnalyses[displayed.id] === true}
           onClose={closeModal}
         />
       )}

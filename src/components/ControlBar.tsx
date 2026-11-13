@@ -1,12 +1,21 @@
 /**
  * Top control bar: asset / basket builder, timeframe, history range, capital,
- * costs, trade mode and the Start / Stop buttons.
+ * costs, trade mode, position sizing, funding, the Robust universe and the
+ * Start / Stop buttons.
  */
 
 import { Loader2, Play, Plus, Square, X } from 'lucide-react';
 import { useId } from 'react';
 import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
-import { MAX_BASKET_ASSETS, PRESET_TICKERS, type BasketRow, type RunConfig } from '../lib/config';
+import {
+  DEFAULT_FUNDING_PCT_8H,
+  MAX_BASKET_ASSETS,
+  MAX_UNIVERSE_ASSETS,
+  parseUniverse,
+  PRESET_TICKERS,
+  type BasketRow,
+  type RunConfig,
+} from '../lib/config';
 import { HISTORY_RANGES, INTERVALS, MAX_MAX_STAGNATION, MIN_MAX_STAGNATION, type EngineStatus, type HistoryRange, type Interval, type TradeMode } from '../types/trading';
 import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
 
@@ -26,6 +35,11 @@ const RANGE_OPTIONS: { value: HistoryRange; label: string }[] = HISTORY_RANGES.m
 const MODE_OPTIONS: { value: TradeMode; label: string }[] = [
   { value: 'long-only', label: 'Long-Only' },
   { value: 'long-short', label: 'Long/Short' },
+];
+const SIZING_OPTIONS: { value: RunConfig['sizingMode']; label: string }[] = [
+  { value: 'fixed', label: 'Risk % · fixed' },
+  { value: 'compound', label: 'Risk % · compounding' },
+  { value: 'full', label: '100% of equity' },
 ];
 const ASSET_MODE_OPTIONS: { value: RunConfig['assetMode']; label: string }[] = [
   { value: 'single', label: 'Single asset' },
@@ -189,10 +203,47 @@ function BasketBuilder({
   );
 }
 
+/** Compact numeric input used next to a toggle. */
+function NumberFieldInline({
+  ariaLabel,
+  value,
+  onChange,
+  disabled,
+}: {
+  ariaLabel: string;
+  value: number;
+  onChange: (value: number) => void;
+  disabled: boolean;
+}): JSX.Element {
+  return (
+    <div className="flex h-9 items-center rounded-lg border border-line bg-base px-2.5 text-sm focus-within:border-accent">
+      <input
+        type="number"
+        min={0.001}
+        max={1}
+        step={0.005}
+        value={value}
+        disabled={disabled}
+        aria-label={ariaLabel}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          if (event.target.value !== '' && Number.isFinite(next) && next > 0 && next <= 1) onChange(next);
+        }}
+        className="num w-14 bg-transparent text-ink outline-none disabled:cursor-not-allowed disabled:opacity-60"
+      />
+      <span className="ml-1 whitespace-nowrap text-ink-3">% / 8h</span>
+    </div>
+  );
+}
+
 export default function ControlBar({ config, onChange, status, onStart, onStop }: ControlBarProps): JSX.Element {
   const listId = useId();
   const busy = status === 'loading' || status === 'optimizing';
   const isPreset = (PRESET_TICKERS as readonly string[]).includes(config.symbol);
+  const universeOn = config.robustUniverse && config.assetMode === 'single';
+  const universeList = parseUniverse(config.universe);
+  const universeInvalid =
+    universeOn && (universeList.some((symbol) => !TICKER_PATTERN.test(symbol)) || universeList.length > MAX_UNIVERSE_ASSETS);
 
   return (
     <Panel className="p-4">
@@ -354,6 +405,89 @@ export default function ControlBar({ config, onChange, status, onStart, onStop }
             <Square size={13} fill="currentColor" />
             Stop
           </button>
+        </div>
+      </div>
+      {/* Row 3 – risk and robustness (run settings the optimiser cannot tune) */}
+      <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
+        <div>
+          <FieldLabel>Position sizing</FieldLabel>
+          <Segmented
+            ariaLabel="Position sizing"
+            options={SIZING_OPTIONS}
+            value={config.sizingMode}
+            onChange={(sizingMode) => onChange({ sizingMode })}
+            disabled={busy}
+          />
+        </div>
+        <NumberField
+          label="Risk / trade"
+          suffix="%"
+          value={config.riskPct}
+          min={0.1}
+          max={10}
+          step={0.25}
+          onChange={(riskPct) => onChange({ riskPct })}
+          disabled={busy || config.sizingMode === 'full'}
+          className="w-[100px]"
+        />
+        <div>
+          <FieldLabel>Perp funding</FieldLabel>
+          <div className="flex items-center gap-2">
+            <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
+              <input
+                type="checkbox"
+                checked={config.fundingPct8h > 0}
+                disabled={busy}
+                onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
+                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              Charge funding
+            </label>
+            {config.fundingPct8h > 0 && (
+              <NumberFieldInline
+                ariaLabel="Funding rate per 8 hours"
+                value={config.fundingPct8h}
+                onChange={(fundingPct8h) => onChange({ fundingPct8h })}
+                disabled={busy}
+              />
+            )}
+          </div>
+        </div>
+        <div className="min-w-[260px] flex-1">
+          <FieldLabel>Robust universe</FieldLabel>
+          <div className="flex items-center gap-2">
+            <label
+              className={cx(
+                'inline-flex h-9 shrink-0 cursor-pointer items-center gap-2 rounded-lg border bg-base px-2.5 text-sm',
+                universeOn ? 'border-accent text-ink' : 'border-line text-ink-2',
+                config.assetMode !== 'single' && 'cursor-not-allowed opacity-60',
+              )}
+              title="Score every strategy on all of these assets, untuned, and rank by the median. Not available for baskets."
+            >
+              <input
+                type="checkbox"
+                checked={universeOn}
+                disabled={busy || config.assetMode !== 'single'}
+                onChange={(event) => onChange({ robustUniverse: event.target.checked })}
+                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              Same rules on every asset
+            </label>
+            <input
+              type="text"
+              value={config.universe}
+              disabled={busy || !universeOn}
+              aria-label="Robust universe tickers"
+              aria-invalid={universeInvalid}
+              spellCheck={false}
+              placeholder="BTC-USD, ETH-USD, …"
+              onChange={(event) => onChange({ universe: event.target.value.toUpperCase() })}
+              className={cx(
+                'num h-9 min-w-0 flex-1 rounded-lg border bg-base px-2.5 text-sm text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-accent disabled:cursor-not-allowed disabled:opacity-50',
+                universeInvalid ? 'border-down/70' : 'border-line',
+              )}
+            />
+          </div>
         </div>
       </div>
     </Panel>

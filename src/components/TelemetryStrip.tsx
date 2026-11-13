@@ -6,7 +6,7 @@
 
 import { CircleCheck, CircleDot, Database, Loader2, OctagonX, TriangleAlert } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { SOURCE_LABEL, type RunContext } from '../lib/config';
+import type { RunContext } from '../lib/config';
 import { fmtDate, fmtDuration, fmtInt, fmtPct, toneClass } from '../lib/format';
 import { type EngineStatus, type ProgressSnapshot } from '../types/trading';
 import { cx, Panel } from './ui';
@@ -164,7 +164,7 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
               <span className="truncate">
                 {context.simulated
                   ? 'Simulated · offline fallback'
-                  : `Live · ${context.sources.map((source) => SOURCE_LABEL[source]).join(' + ')}`}
+                  : `Live · ${context.venue}`}
               </span>
             </div>
             <div
@@ -173,6 +173,11 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
             >
               {fmtInt(context.bars)} × {context.interval} candles · {fmtDate(context.windowStart)} → {fmtDate(context.windowEnd)}
             </div>
+            {context.universe.length > 1 && (
+              <div className="num mt-0.5 truncate text-xs text-ink-3" title={context.universe.join(', ')}>
+                Robust universe: {context.universe.length} assets
+              </div>
+            )}
           </>
         ) : (
           <>
