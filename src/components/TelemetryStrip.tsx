@@ -101,13 +101,13 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
       </Tile>
 
       <Tile label="Stagnation progress">
-        <div className="flex items-baseline gap-1.5">
+        <div className="flex items-baseline gap-1.5 whitespace-nowrap">
           <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(stagnation)}</span>
           <span className="num text-sm text-ink-3">/ {fmtInt(MAX_STAGNATION)}</span>
-          <span className="truncate text-xs text-ink-3">iterations without improvement</span>
         </div>
+        <div className="mt-1 truncate text-xs text-ink-3">iterations without improvement</div>
         <div
-          className="mt-2 h-1.5 overflow-hidden rounded-full bg-accent/15"
+          className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-accent/15"
           role="progressbar"
           aria-label="Stagnation progress"
           aria-valuemin={0}
@@ -164,7 +164,10 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
                   : `Live · ${context.sources.map((source) => SOURCE_LABEL[source]).join(' + ')}`}
               </span>
             </div>
-            <div className="num mt-1.5 truncate text-xs text-ink-3">
+            <div
+              className="num mt-1.5 truncate text-xs text-ink-3"
+              title={`${fmtInt(context.bars)} × ${context.interval} candles · ${fmtDate(context.windowStart)} → ${fmtDate(context.windowEnd)}`}
+            >
               {fmtInt(context.bars)} × {context.interval} candles · {fmtDate(context.windowStart)} → {fmtDate(context.windowEnd)}
             </div>
           </>

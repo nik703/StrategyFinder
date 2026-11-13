@@ -72,6 +72,12 @@ const MAX_CHART_POINTS = 1200;
 const LEADERBOARD_INTERVAL_MS = 150;
 /** Maximum number of leaderboard slots a single structural niche may occupy. */
 const NICHE_CAP = 3;
+/**
+ * Two strategies whose sampled equity returns correlate at least this much trade
+ * the same idea. Only the fitter twin is listed, so the Top 25 holds 25
+ * behaviourally distinct strategies instead of parameter tweaks of one.
+ */
+const CLONE_CORRELATION = 0.9;
 /** Pure random search until the leaderboard holds this many strategies. */
 const SEED_POPULATION = 10;
 
@@ -154,6 +160,37 @@ function sampleCurve(equity: Float64Array, axis: ChartAxis): Float32Array {
   const out = new Float32Array(axis.barIndex.length);
   for (let k = 0; k < out.length; k++) out[k] = equity[axis.barIndex[k]];
   return out;
+}
+
+/** Simple returns between consecutive samples of an equity curve. */
+function curveReturns(curve: Float32Array): Float32Array {
+  const out = new Float32Array(curve.length);
+  for (let k = 1; k < curve.length; k++) out[k] = curve[k - 1] > 0 ? curve[k] / curve[k - 1] - 1 : 0;
+  return out;
+}
+
+/** Pearson correlation of two equally long return series (0 when either is flat). */
+function correlation(a: Float32Array, b: Float32Array): number {
+  const n = a.length;
+  let sa = 0;
+  let sb = 0;
+  for (let k = 0; k < n; k++) {
+    sa += a[k];
+    sb += b[k];
+  }
+  const ma = sa / n;
+  const mb = sb / n;
+  let cov = 0;
+  let va = 0;
+  let vb = 0;
+  for (let k = 0; k < n; k++) {
+    const da = a[k] - ma;
+    const db = b[k] - mb;
+    cov += da * db;
+    va += da * da;
+    vb += db * db;
+  }
+  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : 0;
 }
 
 /** 5th–95th percentile of the valid in-sample values of a series. */
@@ -297,6 +334,8 @@ interface Entry {
   niche: string;
   /** Outcome fingerprint – strategies that produce identical results are treated as duplicates. */
   fingerprint: string;
+  /** Sampled equity returns, used to detect behavioural clones. */
+  returns: Float32Array;
 }
 
 async function run(payload: OptimizerStartPayload, token: number): Promise<void> {
@@ -381,6 +420,18 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const fingerprint = `${full.trades}|${full.netPnl.toFixed(2)}|${full.maxDrawdown.toFixed(4)}|${metrics.outOfSample.netPnl.toFixed(2)}`;
     if (board.some((e) => e.fingerprint === fingerprint)) return false;
 
+    // Behavioural clones: a fitter twin already on the board wins; otherwise this one replaces its twins.
+    const equity = sampleCurve(ws.equity, axis);
+    const returns = curveReturns(equity);
+    const twins: number[] = [];
+    for (let k = 0; k < board.length; k++) {
+      if (correlation(returns, board[k].returns) >= CLONE_CORRELATION) twins.push(k);
+    }
+    if (twins.length > 0) {
+      if (fitness <= board[twins[0]].result.fitness) return false;
+      for (let k = twins.length - 1; k >= 0; k--) board.splice(twins[k], 1);
+    }
+
     const niche = genomeNiche(genome);
     let nicheCount = 0;
     let nicheWorst = -1;
@@ -399,6 +450,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const entry: Entry = {
       niche,
       fingerprint,
+      returns,
       result: {
         id: `S-${iteration}`,
         genome,
@@ -408,7 +460,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         outOfSample: metrics.outOfSample,
         alpha: metrics.full.roi - benchmark.full.roi,
         alphaOos: metrics.outOfSample.roi - benchmark.outOfSample.roi,
-        equity: sampleCurve(ws.equity, axis),
+        equity,
         foundAt: iteration,
       },
     };

@@ -226,8 +226,8 @@ export default function EquityChart({
           footerColor: INK_MUTED,
           footerFont: { family: FONT, size: 10, weight: 500 },
           footerMarginTop: 6,
-          boxWidth: 14,
-          boxHeight: 2,
+          boxWidth: 12,
+          boxHeight: 12,
           boxPadding: 6,
           usePointStyle: true,
           callbacks: {

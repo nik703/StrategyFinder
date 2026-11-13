@@ -15,7 +15,7 @@ function netlifyFunctionDevServer(): Plugin {
     name: 'strategy-finder:netlify-function-dev',
     apply: 'serve',
     configureServer(server) {
-      server.middlewares.use(FUNCTION_ROUTE, (req: IncomingMessage, res: ServerResponse) => {
+      server.middlewares.use(FUNCTION_ROUTE, (req: IncomingMessage & { originalUrl?: string }, res: ServerResponse) => {
         void (async () => {
           try {
             const mod = (await server.ssrLoadModule('/netlify/functions/market-data.ts')) as {

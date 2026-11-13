@@ -47,7 +47,7 @@ export interface PineContext {
 
 const ascii = (text: string): string =>
   text
-    .replace(/·/g, ',')
+    .replace(/\s*·\s*/g, ', ')
     .replace(/[–—]/g, '-')
     .replace(/[^\x20-\x7e]/g, '');
 

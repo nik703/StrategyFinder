@@ -39,6 +39,7 @@ function TickerInput({
   listId,
   ariaLabel,
   className,
+  placeholder = 'Ticker',
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -46,6 +47,7 @@ function TickerInput({
   listId: string;
   ariaLabel: string;
   className?: string;
+  placeholder?: string;
 }): JSX.Element {
   const invalid = value.trim() !== '' && !TICKER_PATTERN.test(value.trim().toUpperCase());
   return (
@@ -58,7 +60,7 @@ function TickerInput({
       aria-invalid={invalid}
       spellCheck={false}
       autoCapitalize="characters"
-      placeholder="Ticker"
+      placeholder={placeholder}
       onChange={(event) => onChange(event.target.value.toUpperCase().replace(/\s+/g, ''))}
       className={cx(
         'num h-9 rounded-lg border bg-base px-2.5 text-sm text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-accent disabled:cursor-not-allowed disabled:opacity-60',
@@ -124,7 +126,7 @@ function BasketBuilder({
                 <span className="ml-1 text-ink-3">%</span>
               </div>
               <span
-                className="num w-[52px] text-right text-xs text-ink-2"
+                className="num w-[68px] whitespace-nowrap text-right text-xs text-ink-2"
                 title="Normalised allocation (weights are rescaled to sum to 100%)"
               >
                 {share === null ? '–' : `→ ${formatWeight(share)}`}
@@ -243,6 +245,7 @@ export default function ControlBar({ config, onChange, status, onStart, onStop }
                 disabled={busy}
                 listId={listId}
                 ariaLabel="Custom ticker"
+                placeholder="Custom…"
                 className={cx('w-[120px]', !isPreset && 'border-accent')}
               />
             </div>
