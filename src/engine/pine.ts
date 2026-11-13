@@ -22,7 +22,8 @@ import type {
   RuleGroup,
   StrategyResult,
 } from '../types/trading';
-import { groupFormula } from './describe';
+import { ARCHETYPE_LABEL, groupFormula } from './describe';
+import { countParameters } from './genome';
 
 export interface PineContext {
   /** Dataset label, e.g. "BTC-USD" or "50% BTC-USD · 30% ETH-USD · 20% NVDA". */
@@ -37,6 +38,8 @@ export interface PineContext {
   windowEnd: number;
   bars: number;
   benchmarkRoi: number;
+  /** Instrument and venue the strategy was tested on, e.g. "XRPUSDT on Binance". */
+  venue: string;
   /** True when the optimisation ran on simulated fallback data. */
   simulatedData: boolean;
 }
@@ -206,7 +209,7 @@ function emitGroup(
     out.push(`${variable} = ${compare(condition.op, left, right)}`);
     parts.push(variable);
   });
-  out.push(`${name} = ${parts.join(group.logic === 'AND' ? ' and ' : ' or ')}`);
+  out.push(`${name} = ${parts.join(' and ')}`);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -218,7 +221,9 @@ const TV_INTERVAL: Record<Interval, string> = { '1h': '1 hour', '4h': '4 hours',
 /** Generate a complete Pine Script v5 strategy for `result`. */
 export function generatePineScript(result: StrategyResult, ctx: PineContext): string {
   const { genome } = result;
-  const { exit, sizing } = genome;
+  const { exit } = genome;
+  const { sizing } = ctx.settings;
+  const timeStop = genome.maxBarsInTrade;
   const { settings } = ctx;
   const hasShorts = genome.shortEntry !== null && settings.tradeMode === 'long-short';
   const dynamic = exit.mode === 'dynamic';
@@ -240,11 +245,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
   if (exit.mode === 'dynamic' && exit.longExit) {
     rules.push('');
-    emitGroup(exit.longExit, 'longExitSignal', 'longExit', 'Long indicator-reversal exit', decl, rules);
+    emitGroup(exit.longExit, 'longExitSignal', 'longExit', 'Long trigger-reversal exit', decl, rules);
   }
   if (exit.mode === 'dynamic' && hasShorts && exit.shortExit) {
     rules.push('');
-    emitGroup(exit.shortExit, 'shortExitSignal', 'shortExit', 'Short indicator-reversal exit', decl, rules);
+    emitGroup(exit.shortExit, 'shortExitSignal', 'shortExit', 'Short trigger-reversal exit', decl, rules);
   }
 
   const lines: string[] = [];
@@ -259,17 +264,23 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     `//  StrategyFinder export - Strategy ${result.id}`,
     `//  Market       : ${label}`,
     `//  Timeframe    : ${TV_INTERVAL[ctx.interval]} candles (apply this script to a ${ctx.interval} chart)`,
-    `//  Mode         : ${hasShorts ? 'Long/Short' : 'Long-Only'}`,
-    `//  Tested on    : ${isoDate(ctx.windowStart)} to ${isoDate(ctx.windowEnd)} (${ctx.bars} candles, last 30% out-of-sample)`,
+    `//  Mode         : ${hasShorts ? 'Long/Short (shorts mirror the long rules)' : 'Long-Only'}`,
+    `//  Archetype    : ${ARCHETYPE_LABEL[genome.archetype]}`,
+    `//  Parameters   : ${countParameters(genome)} tunable values`,
+    `//  Tested on    : ${ascii(ctx.venue)}`,
+    `//  Period       : ${isoDate(ctx.windowStart)} to ${isoDate(ctx.windowEnd)} (${ctx.bars} candles: 60% train, 20% validation, 20% holdout)`,
     `//  Costs        : ${settings.feePct}% fee + ${settings.slippagePct}% slippage per side`,
     '//',
     `//  StrategyFinder results${ctx.simulatedData ? ' (SIMULATED fallback data - re-validate on real data)' : ''}:`,
-    `//    Full period   : ${metricsLine(result.full)}`,
-    `//    In-sample     : ${metricsLine(result.inSample)}`,
-    `//    Out-of-sample : ${metricsLine(result.outOfSample)}`,
-    `//    Buy & Hold    : ROI ${signed(ctx.benchmarkRoi)}%`,
+    `//    Train        : ${metricsLine(result.train)}`,
+    `//    Validation   : ${metricsLine(result.validation)}`,
+    `//    Holdout      : ${result.holdout ? metricsLine(result.holdout) : 'not revealed yet (the run was still in progress)'}`,
+    `//    Deflated Sharpe (validation): ${(result.dsr * 100).toFixed(0)}%`,
+    `//    Buy & Hold   : ROI ${signed(ctx.benchmarkRoi)}% over train + validation`,
     '//',
     '//  Notes',
+    '//   - use_bar_magnifier=true resolves candles that touch both the stop and the target with',
+    '//     lower-timeframe data. It needs a TradingView Premium plan; remove it on other plans.',
     "//   - Orders are placed on bar close and filled at the next bar's open, exactly as in StrategyFinder.",
     '//   - Fee and slippage are both charged through commission_value (fee + slippage per side).',
     '//   - Small differences are expected: TradingView uses its own data feed and intrabar fill model.',
@@ -293,7 +304,7 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
   push(
     '// =============================================================================',
-    `strategy("${title}", overlay=true, initial_capital=${Math.round(settings.initialCapital)}, currency=currency.USD, pyramiding=0, commission_type=strategy.commission.percent, commission_value=${costPct}, slippage=0, calc_on_every_tick=false, process_orders_on_close=false, margin_long=0, margin_short=0)`,
+    `strategy("${title}", overlay=true, initial_capital=${Math.round(settings.initialCapital)}, currency=currency.USD, pyramiding=0, commission_type=strategy.commission.percent, commission_value=${costPct}, slippage=0, calc_on_every_tick=false, process_orders_on_close=false, use_bar_magnifier=true, margin_long=0, margin_short=0)`,
     '',
   );
 
@@ -326,7 +337,13 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
   if (sizing.mode === 'risk') {
     push(
-      `riskPct       = input.float(${float(sizing.riskPct)}, "Risk per trade (% of equity)", minval=0.05, step=0.05, group="Risk management")`,
+      `riskPct       = input.float(${float(sizing.riskPct)}, "Risk per trade (%)", minval=0.05, step=0.05, group="Risk management")`,
+      `compound      = input.bool(${sizing.compounding ? 'true' : 'false'}, "Compound (risk % of current equity instead of starting capital)", group="Risk management")`,
+    );
+  }
+  if (timeStop !== null) {
+    push(
+      `maxBarsInTrade = input.int(${timeStop}, "Time stop (bars in trade)", minval=1, group="Risk management")`,
     );
   }
   push(`costPct       = ${float(costPct)} // fee + slippage per side, in percent`, '');
@@ -335,7 +352,14 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   push('// ---- Indicators --------------------------------------------------------------', ...decl.render(), '');
   push('// ---- Entry / exit rules ------------------------------------------------------', ...rules, '');
 
-  const atrReady = dynamic ? ' and not na(atrValue)' : '';
+  const atrReady = `${dynamic ? ' and not na(atrValue)' : ''}${timeStop !== null ? ' and not timedOut' : ''}`;
+  if (timeStop !== null) {
+    push(
+      "// Time stop: a trade that has been open for maxBarsInTrade candles is closed at the next bar's open.",
+      'timedOut = strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBarsInTrade - 1',
+      '',
+    );
+  }
   push('// An entry is actionable only when the opposite side and its own exit signal are silent.');
   push(
     `goLong  = longEntry${hasShorts ? ' and not shortEntry' : ''}${hasSignalExit ? ' and not longExitSignal' : ''} and canEnter${atrReady}`,
@@ -349,16 +373,19 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
 
   /* ---- Position size ----------------------------------------------------- */
   push('// ---- Position size -----------------------------------------------------------');
+  push('// Never deploy more than the account can buy (no leverage).');
+  push('maxQty = math.max(strategy.equity, 0) / (close * (1 + costPct / 100))');
   if (sizing.mode === 'full') {
-    push('sizeFraction = 1.0 // 100% of equity per trade');
-  } else if (exit.mode === 'static') {
-    push('// Fixed-fractional risk: being stopped out costs riskPct of equity (never more than 100% invested).');
-    push('sizeFraction = math.min(1.0, riskPct / stopLossPct)');
+    push('orderQty = maxQty // 100% of equity per trade', '');
   } else {
-    push('// ATR volatility sizing: being stopped out costs riskPct of equity (never more than 100% invested).');
-    push('sizeFraction = na(atrValue) ? 0.0 : math.min(1.0, (riskPct / 100) / (stopAtrMult * atrValue / close))');
+    push(
+      '// Risk-based size: being stopped out costs riskPct of the risk capital.',
+      'riskCapital  = compound ? math.max(strategy.equity, 0) : strategy.initial_capital',
+      exit.mode === 'static' ? 'stopDistance = close * stopLossPct / 100' : 'stopDistance = stopAtrMult * atrValue',
+      'orderQty = na(stopDistance) or stopDistance <= 0 ? 0.0 : math.min(riskCapital * riskPct / 100 / stopDistance, maxQty)',
+      '',
+    );
   }
-  push('orderQty = math.max(strategy.equity, 0) * sizeFraction / (close * (1 + costPct / 100))', '');
 
   /* ---- Orders ------------------------------------------------------------ */
   push('// ---- Orders ------------------------------------------------------------------');
@@ -447,7 +474,7 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
 
   if (hasSignalExit) {
     push(
-      "// Indicator-reversal exits: close at the next bar's open.",
+      "// Trigger-reversal exits: close at the next bar's open.",
       `if longExitSignal and strategy.position_size > 0${hasShorts ? ' and not goShort' : ''}`,
       '    strategy.close("Long", comment="Signal exit")',
     );
@@ -458,6 +485,10 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
       );
     }
     push('');
+  }
+
+  if (timeStop !== null) {
+    push('if timedOut', '    strategy.close_all(comment="Time stop")', '');
   }
 
   push(

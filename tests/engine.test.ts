@@ -2,33 +2,78 @@ import { describe, expect, it } from 'vitest';
 import { buildDataset, normalizeWeights } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
 import {
+  assetBaseScore,
   BacktestWorkspace,
   barsPerYear,
-  buildBenchmark,
-  computeFitness,
-  evaluateGenome,
+  benchmarkEquity,
+  benchmarkSearch,
+  combineFitness,
+  evaluateSearch,
+  holdoutMetrics,
+  MIN_TRADES,
   runBacktest,
-  splitMetrics,
+  searchMetrics,
+  segmentMetrics,
+  splitFor,
   UNFIT,
 } from '../src/engine/backtester';
-import { describeExit, describeLongEntry, groupFormula, indicatorBadges, listIndicators } from '../src/engine/describe';
 import {
+  ARCHETYPE_LABEL,
+  describeArchetype,
+  describeExit,
+  describeLongEntry,
+  groupFormula,
+  indicatorBadges,
+  listIndicators,
+} from '../src/engine/describe';
+import {
+  conditionRole,
+  countParameters,
   crossoverGenomes,
   DEFAULT_LIMITS,
   genomeSignature,
+  GRIDS,
+  isCoherent,
+  LOOKBACK_GRID,
+  MAX_PARAMETERS,
   mirrorCondition,
+  mirrorGroup,
   mulberry32,
   mutateGenome,
+  normalizeGenome,
+  parameterVariants,
   randomGenome,
-  RANGES,
   repairGenome,
+  STATIC_PCT_GRID,
+  TIME_STOP_GRID,
 } from '../src/engine/genome';
 import { atr, bollinger, ema, IndicatorCache, rsi, sma, stochastic, supertrend } from '../src/engine/indicators';
 import { generatePineScript } from '../src/engine/pine';
-import type { BacktestSettings, Condition, OHLCV, StrategyGenome, StrategyResult } from '../src/types/trading';
+import { deflatedSharpe, expectedMaxSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
+import {
+  HOLDOUT_FRACTION,
+  TRAIN_FRACTION,
+  VALIDATION_FRACTION,
+  type BacktestSettings,
+  type Condition,
+  type ConditionRole,
+  type OHLCV,
+  type StrategyGenome,
+  type StrategyResult,
+} from '../src/types/trading';
 
 const NOW = Date.UTC(2026, 0, 15);
-const SETTINGS: BacktestSettings = { initialCapital: 10_000, feePct: 0.1, slippagePct: 0.05, tradeMode: 'long-short' };
+/** 100% of equity, compounding – the simplest sizing to reason about in fill tests. */
+const SETTINGS: BacktestSettings = {
+  initialCapital: 10_000,
+  feePct: 0.1,
+  slippagePct: 0.05,
+  tradeMode: 'long-short',
+  sizing: { mode: 'full', riskPct: 2, compounding: true },
+  fundingPctPerBar: 0,
+};
+const LONG_ONLY: BacktestSettings = { ...SETTINGS, tradeMode: 'long-only' };
+const FREE: BacktestSettings = { ...LONG_ONLY, feePct: 0, slippagePct: 0 };
 
 function dataset(symbol = 'BTC-USD', interval: '1h' | '4h' | '1d' = '1d', range: '1y' | '2y' | '5y' = '2y'): OHLCV {
   const series = generateSyntheticCandles(symbol, interval, range, NOW);
@@ -47,6 +92,19 @@ function truncate(data: OHLCV, length: number): OHLCV {
 }
 
 const f64 = (values: number[]): Float64Array => Float64Array.from(values);
+
+/** Hand-built candles on a daily grid. */
+function candles(o: number[], h: number[], l: number[], c: number[]): OHLCV {
+  const n = c.length;
+  return {
+    t: Float64Array.from({ length: n }, (_, i) => i * 86_400_000),
+    o: f64(o),
+    h: f64(h),
+    l: f64(l),
+    c: f64(c),
+    v: new Float64Array(n).fill(1000),
+  };
+}
 
 /* -------------------------------------------------------------------------- */
 
@@ -152,25 +210,57 @@ describe('indicators', () => {
 
 /* -------------------------------------------------------------------------- */
 
-const TREND: StrategyGenome = {
-  longEntry: { logic: 'AND', conditions: [{ ind: 'SUPERTREND', period: 10, mult: 3, op: 'gt' }] },
-  shortEntry: { logic: 'AND', conditions: [{ ind: 'SUPERTREND', period: 10, mult: 3, op: 'lt' }] },
-  exit: { mode: 'dynamic', atrPeriod: 14, stopAtrMult: 3, trailing: true, takeProfitAtrMult: null, longExit: null, shortExit: null },
-  sizing: { mode: 'full' },
-};
+const dynamicExit = (stop: number, target: number | null, trailing: boolean, reversalExit = false): StrategyGenome['exit'] => ({
+  mode: 'dynamic',
+  atrPeriod: 14,
+  stopAtrMult: stop,
+  trailing,
+  takeProfitAtrMult: target,
+  reversalExit,
+  longExit: null,
+  shortExit: null,
+});
 
-const DIP: StrategyGenome = {
-  longEntry: {
-    logic: 'AND',
-    conditions: [
-      { ind: 'RSI', period: 14, op: 'lt', level: 48 },
-      { ind: 'PRICE_MA', maType: 'EMA', period: 50, op: 'gt' },
-    ],
+/** Trend-following: long while price is above the Supertrend, trailing ATR stop. */
+const TREND: StrategyGenome = normalizeGenome(
+  {
+    archetype: 'TREND',
+    longEntry: { logic: 'AND', conditions: [{ ind: 'SUPERTREND', period: 10, mult: 3, op: 'gt' }] },
+    shortEntry: null,
+    exit: dynamicExit(3, null, true),
+    maxBarsInTrade: null,
   },
+  'long-short',
+  DEFAULT_LIMITS,
+);
+
+/** Mean reversion: buy a low RSI inside an uptrend, static bracket. */
+const DIP: StrategyGenome = normalizeGenome(
+  {
+    archetype: 'MEAN_REVERSION',
+    longEntry: {
+      logic: 'AND',
+      conditions: [
+        { ind: 'RSI', period: 14, op: 'lt', level: 45 },
+        { ind: 'PRICE_MA', maType: 'EMA', period: 100, op: 'gt' },
+      ],
+    },
+    shortEntry: null,
+    exit: { mode: 'static', stopLossPct: 4, takeProfitPct: 10 },
+    maxBarsInTrade: null,
+  },
+  'long-only',
+  DEFAULT_LIMITS,
+);
+
+/** Volume ratio of flat volume is exactly 1 > 0.5: true on every candle once the 10-bar SMA exists (first signal on bar 9). */
+const ALWAYS_LONG = (exit: StrategyGenome['exit'], maxBarsInTrade: number | null = null): StrategyGenome => ({
+  archetype: 'TREND',
+  longEntry: { logic: 'AND', conditions: [{ ind: 'VOLUME', period: 10, op: 'gt', level: 0.5 }] },
   shortEntry: null,
-  exit: { mode: 'static', stopLossPct: 4, takeProfitPct: 9 },
-  sizing: { mode: 'full' },
-};
+  exit,
+  maxBarsInTrade,
+});
 
 describe('backtester', () => {
   it('has no look-ahead bias: future candles cannot change past equity', () => {
@@ -183,33 +273,52 @@ describe('backtester', () => {
       const wsCut = new BacktestWorkspace(cut);
       runBacktest(new IndicatorCache(part), genome, SETTINGS, wsCut);
       // The final candle of the truncated run differs only by the forced liquidation.
-      for (let i = 0; i < cut - 1; i++) expect(wsCut.equity[i]).toBeCloseTo(wsFull.equity[i], 6);
+      for (let i = 0; i < cut - 1; i++) {
+        expect(wsCut.equity[i]).toBeCloseTo(wsFull.equity[i], 6);
+        expect(wsCut.equityLow[i]).toBeCloseTo(wsFull.equityLow[i], 6);
+      }
       expect(wsFull.tradeCount).toBeGreaterThan(3);
     }
   });
 
+  it('never reads the holdout when the run is limited to the search period', () => {
+    const full = dataset('ETH-USD');
+    const split = splitFor(full.c.length);
+    const poisoned = truncate(full, full.c.length);
+    // Corrupt every holdout candle: a search-period run must be completely unaffected.
+    for (let i = split.holdoutStart; i < poisoned.c.length; i++) {
+      poisoned.o[i] = poisoned.h[i] = poisoned.l[i] = poisoned.c[i] = 1e-6;
+    }
+    const ppy = barsPerYear(full.t);
+    for (const genome of [TREND, DIP]) {
+      const a = evaluateSearch(new IndicatorCache(full), genome, SETTINGS, new BacktestWorkspace(full.c.length), split, ppy);
+      const b = evaluateSearch(new IndicatorCache(poisoned), genome, SETTINGS, new BacktestWorkspace(full.c.length), split, ppy);
+      expect(b.search.netPnl).toBeCloseTo(a.search.netPnl, 6);
+      expect(b.validation.sharpe).toBeCloseTo(a.validation.sharpe, 9);
+      expect(b.search.trades).toBe(a.search.trades);
+    }
+  });
+
   it('fills a close-of-bar signal at the NEXT bar open, with fee and slippage', () => {
-    // Close crosses above SMA(3) on bar 5; the entry must happen at bar 6's open.
+    // Close crosses above SMA(5) on bar 5; the entry must happen at bar 6's open.
     const closes = [100, 100, 100, 100, 100, 110, 111, 112, 113, 114];
     const opens = [100, 100, 100, 100, 100, 100, 120, 111, 112, 113];
+    const data = candles(
+      opens,
+      closes.map((c, i) => Math.max(c, opens[i]) + 1),
+      closes.map((c, i) => Math.min(c, opens[i]) - 1),
+      closes,
+    );
     const n = closes.length;
-    const data: OHLCV = {
-      t: Float64Array.from({ length: n }, (_, i) => i * 86_400_000),
-      o: f64(opens),
-      h: f64(closes.map((c, i) => Math.max(c, opens[i]) + 1)),
-      l: f64(closes.map((c, i) => Math.min(c, opens[i]) - 1)),
-      c: f64(closes),
-      v: new Float64Array(n).fill(1000),
-    };
     const genome: StrategyGenome = {
-      longEntry: { logic: 'AND', conditions: [{ ind: 'PRICE_MA', maType: 'SMA', period: 3, op: 'cross_above' }] },
+      archetype: 'TREND',
+      longEntry: { logic: 'AND', conditions: [{ ind: 'PRICE_MA', maType: 'SMA', period: 5, op: 'cross_above' }] },
       shortEntry: null,
-      exit: { mode: 'static', stopLossPct: 15, takeProfitPct: 60 },
-      sizing: { mode: 'full' },
+      exit: { mode: 'static', stopLossPct: 15, takeProfitPct: 30 },
+      maxBarsInTrade: null,
     };
-    const settings: BacktestSettings = { initialCapital: 10_000, feePct: 0.1, slippagePct: 0.05, tradeMode: 'long-only' };
     const ws = new BacktestWorkspace(n);
-    runBacktest(new IndicatorCache(data), genome, settings, ws);
+    runBacktest(new IndicatorCache(data), genome, LONG_ONLY, ws);
 
     for (let i = 0; i <= 5; i++) expect(ws.equity[i]).toBe(10_000); // still flat on the signal candle
     expect(ws.tradeCount).toBe(1);
@@ -224,51 +333,99 @@ describe('backtester', () => {
     expect(ws.equity[n - 1]).toBeCloseTo(afterFee + qty * (exitPx - entry) - qty * exitPx * 0.001, 6);
   });
 
-  it('honours stop-loss and take-profit levels intrabar', () => {
+  it('honours stop-loss and take-profit levels intrabar and counts ambiguous candles', () => {
     const n = 12;
     const flat = new Array<number>(n).fill(100);
-    const make = (lows: number[], highs: number[], closes: number[]): OHLCV => ({
-      t: Float64Array.from({ length: n }, (_, i) => i * 86_400_000),
-      o: f64(flat),
-      h: f64(highs),
-      l: f64(lows),
-      c: f64(closes),
-      v: new Float64Array(n).fill(1000),
-    });
-    const genome: StrategyGenome = {
-      // Volume ratio is exactly 1 > 0.5 → always true once the SMA exists (first signal on bar 9).
-      longEntry: { logic: 'AND', conditions: [{ ind: 'VOLUME', period: 10, op: 'gt', level: 0.5 }] },
-      shortEntry: null,
-      exit: { mode: 'static', stopLossPct: 5, takeProfitPct: 10 },
-      sizing: { mode: 'full' },
-    };
-    const settings: BacktestSettings = { initialCapital: 10_000, feePct: 0, slippagePct: 0, tradeMode: 'long-only' };
+    const genome = ALWAYS_LONG({ mode: 'static', stopLossPct: 5, takeProfitPct: 10 });
 
     // Stop: bar 10 trades down to 90 → exit at 95 (−5%).
     const lows = [...flat];
     lows[10] = 90;
     const wsStop = new BacktestWorkspace(n);
-    runBacktest(new IndicatorCache(make(lows, flat, flat)), genome, settings, wsStop);
+    runBacktest(new IndicatorCache(candles(flat, flat, lows, flat)), genome, FREE, wsStop);
     expect(wsStop.tradeEntryBar[0]).toBe(10);
     expect(wsStop.tradePnl[0]).toBeCloseTo(-500, 6);
+    expect(wsStop.tradeAmbiguous[0]).toBe(0);
 
     // Target: bar 10 trades up to 115 → exit at 110 (+10%).
     const highs = [...flat];
     highs[10] = 115;
     const wsTarget = new BacktestWorkspace(n);
-    runBacktest(new IndicatorCache(make(flat, highs, flat)), genome, settings, wsTarget);
+    runBacktest(new IndicatorCache(candles(flat, highs, flat, flat)), genome, FREE, wsTarget);
     expect(wsTarget.tradePnl[0]).toBeCloseTo(1000, 6);
 
-    // Both touched in the same candle → the stop is assumed to fill first.
+    // Both touched in the same candle → the stop is assumed to fill first, and the trade is flagged.
     const wsBoth = new BacktestWorkspace(n);
-    runBacktest(new IndicatorCache(make(lows, highs, flat)), genome, settings, wsBoth);
+    runBacktest(new IndicatorCache(candles(flat, highs, lows, flat)), genome, FREE, wsBoth);
     expect(wsBoth.tradePnl[0]).toBeCloseTo(-500, 6);
+    expect(wsBoth.tradeAmbiguous[0]).toBe(1);
+    const m = segmentMetrics(wsBoth.equity, 0, n, 10_000, 365, wsBoth);
+    expect(m.ambiguousTrades).toBe(1);
   });
 
-  it('never opens short trades in Long-Only mode', () => {
+  it('sizes by risk: 2% of starting capital at the stop, no compounding, never above 1× equity', () => {
+    const n = 14;
+    const flat = new Array<number>(n).fill(100);
+    const lows = [...flat];
+    lows[10] = 90; // stop of trade 1
+    lows[11] = 90; // stop of trade 2 (re-entered on bar 11's open)
+    const data = candles(flat, flat, lows, flat);
+    const genome = ALWAYS_LONG({ mode: 'static', stopLossPct: 3, takeProfitPct: 30 });
+    const risk: BacktestSettings = { ...FREE, sizing: { mode: 'risk', riskPct: 2, compounding: false } };
+    const ws = new BacktestWorkspace(n);
+    runBacktest(new IndicatorCache(data), genome, risk, ws);
+
+    // Stopped out twice in a row at a 3% stop while risking 2% → two −$200 trades.
+    expect(ws.tradePnl[0]).toBeCloseTo(-200, 6);
+    expect(ws.tradePnl[1]).toBeCloseTo(-200, 6); // still $200: risk is based on the starting capital
+    const m = segmentMetrics(ws.equity, 0, n, 10_000, 365, ws);
+    expect(m.maxDrawdown).toBeGreaterThanOrEqual(3.99);
+    expect(m.maxConsecLosses).toBeGreaterThanOrEqual(2);
+
+    // Compounding: the second loss is 2% of the reduced equity.
+    runBacktest(new IndicatorCache(data), genome, { ...risk, sizing: { mode: 'risk', riskPct: 2, compounding: true } }, ws);
+    expect(ws.tradePnl[1]).toBeCloseTo(-196, 6);
+
+    // A 1% stop with 2% risk would need 2× leverage – exposure is capped at 1× equity instead.
+    const tight = ALWAYS_LONG({ mode: 'static', stopLossPct: 1, takeProfitPct: 30 });
+    runBacktest(new IndicatorCache(data), tight, risk, ws);
+    expect(ws.tradePnl[0]).toBeCloseTo(-100, 6);
+  });
+
+  it('measures drawdown from intrabar lows, not only from closes', () => {
+    const n = 14;
+    const flat = new Array<number>(n).fill(100);
+    const lows = [...flat];
+    lows[11] = 92; // dips 8% intrabar but closes unchanged and never reaches the 15% stop
+    const ws = new BacktestWorkspace(n);
+    runBacktest(new IndicatorCache(candles(flat, flat, lows, flat)), ALWAYS_LONG({ mode: 'static', stopLossPct: 15, takeProfitPct: 30 }), FREE, ws);
+    const m = segmentMetrics(ws.equity, 0, n, 10_000, 365, ws);
+    expect(m.maxDrawdown).toBeCloseTo(8, 6);
+    // The close-to-close curve alone would report no drawdown at all.
+    expect(segmentMetrics(ws.equity, 0, n, 10_000, 365, ws, null).maxDrawdown).toBe(0);
+  });
+
+  it('applies the time stop and the funding cost', () => {
+    const n = 30;
+    const flat = new Array<number>(n).fill(100);
+    const data = candles(flat, flat, flat, flat);
+    const ws = new BacktestWorkspace(n);
+    runBacktest(new IndicatorCache(data), ALWAYS_LONG({ mode: 'static', stopLossPct: 15, takeProfitPct: 30 }, 5), FREE, ws);
+    // Entry on bar 10, closed at the open of bar 15, no re-entry on that bar, next entry on bar 16.
+    expect(ws.tradeEntryBar[0]).toBe(10);
+    expect(ws.tradeExitBar[0]).toBe(15);
+    expect(ws.inMarket[15]).toBe(0);
+    expect(ws.tradeEntryBar[1]).toBe(16);
+
+    // Funding: 0.1% of notional per bar held, for the 5 closes the trade is open.
+    runBacktest(new IndicatorCache(data), ALWAYS_LONG({ mode: 'static', stopLossPct: 15, takeProfitPct: 30 }, 5), { ...FREE, fundingPctPerBar: 0.1 }, ws);
+    expect(ws.tradePnl[0]).toBeCloseTo(-50, 6);
+  });
+
+  it('never opens short trades in Long-Only mode, and mirrors the long rules in Long/Short mode', () => {
     const data = dataset('SOL-USD');
     const ws = new BacktestWorkspace(data.c.length);
-    runBacktest(new IndicatorCache(data), TREND, { ...SETTINGS, tradeMode: 'long-only' }, ws);
+    runBacktest(new IndicatorCache(data), normalizeGenome(TREND, 'long-only', DEFAULT_LIMITS), LONG_ONLY, ws);
     expect(ws.tradeCount).toBeGreaterThan(0);
     for (let k = 0; k < ws.tradeCount; k++) expect(ws.tradeDir[k]).toBe(1);
 
@@ -285,181 +442,411 @@ describe('backtester', () => {
     runBacktest(ind, TREND, { ...SETTINGS, feePct: 0, slippagePct: 0 }, ws);
     const free = ws.equity[data.c.length - 1];
     runBacktest(ind, TREND, SETTINGS, ws);
-    const costly = ws.equity[data.c.length - 1];
-    expect(costly).toBeLessThan(free);
+    expect(ws.equity[data.c.length - 1]).toBeLessThan(free);
   });
 
-  it('volatility sizing reduces exposure and drawdown', () => {
+  it('splits 60 / 20 / 20 and keeps the three segments consistent', () => {
+    expect(TRAIN_FRACTION + VALIDATION_FRACTION + HOLDOUT_FRACTION).toBeCloseTo(1, 12);
+    expect([TRAIN_FRACTION, VALIDATION_FRACTION, HOLDOUT_FRACTION]).toEqual([0.6, 0.2, 0.2]);
     const data = dataset();
+    const n = data.c.length;
+    const split = splitFor(n);
+    expect(split).toEqual({ validationStart: Math.floor(n * 0.6), holdoutStart: Math.floor(n * 0.8), n });
+
     const ind = new IndicatorCache(data);
-    const ws = new BacktestWorkspace(data.c.length);
+    const ws = new BacktestWorkspace(n);
     const ppy = barsPerYear(data.t);
-    const split = Math.floor(data.c.length * 0.7);
-    const full = evaluateGenome(ind, TREND, SETTINGS, ws, split, ppy).full;
-    const sized = evaluateGenome(ind, { ...TREND, sizing: { mode: 'risk', riskPct: 1 } }, SETTINGS, ws, split, ppy).full;
-    expect(sized.trades).toBe(full.trades);
-    expect(sized.maxDrawdown).toBeLessThan(full.maxDrawdown);
-  });
-
-  it('splits metrics so in-sample + out-of-sample PnL equals the full-period PnL', () => {
-    const data = dataset();
-    const ind = new IndicatorCache(data);
-    const ws = new BacktestWorkspace(data.c.length);
-    const split = Math.floor(data.c.length * 0.7);
-    const m = evaluateGenome(ind, TREND, SETTINGS, ws, split, barsPerYear(data.t));
-    expect(m.inSample.netPnl + m.outOfSample.netPnl).toBeCloseTo(m.full.netPnl, 6);
-    expect(m.inSample.trades + m.outOfSample.trades).toBe(m.full.trades);
-    expect(m.full.roi).toBeCloseTo((m.full.netPnl / SETTINGS.initialCapital) * 100, 9);
-    expect(m.full.maxDrawdown).toBeGreaterThanOrEqual(m.outOfSample.maxDrawdown - 1e-9);
-    expect(m.full.winRate).toBeGreaterThanOrEqual(0);
-    expect(m.full.winRate).toBeLessThanOrEqual(100);
+    runBacktest(ind, TREND, SETTINGS, ws);
+    const m = searchMetrics(ws.equity, split, SETTINGS.initialCapital, ppy, ws);
+    const holdout = holdoutMetrics(ws.equity, split, ppy, ws);
+    const full = segmentMetrics(ws.equity, 0, n, SETTINGS.initialCapital, ppy, ws);
+    expect(m.train.netPnl + m.validation.netPnl).toBeCloseTo(m.search.netPnl, 6);
+    expect(m.search.netPnl + holdout.netPnl).toBeCloseTo(full.netPnl, 6);
+    expect(m.train.trades + m.validation.trades + holdout.trades).toBe(full.trades);
+    expect(m.train.bars + m.validation.bars + holdout.bars).toBe(n);
+    expect(full.maxDrawdown).toBeGreaterThanOrEqual(holdout.maxDrawdown - 1e-9);
+    expect(full.winRate).toBeGreaterThanOrEqual(0);
+    expect(full.winRate).toBeLessThanOrEqual(100);
+    expect(full.breakevenWinRate).toBeCloseTo(100 / (1 + full.payoffRatio), 9);
+    expect(Number.isFinite(full.skew)).toBe(true);
+    expect(full.kurtosis).toBeGreaterThan(1);
+    expect(full.sharpe).toBeCloseTo(full.sharpeRaw * Math.sqrt(ppy), 9);
   });
 
   it('builds an exact Buy & Hold benchmark', () => {
     const data = dataset('SPY');
     const n = data.c.length;
-    const split = Math.floor(n * 0.7);
-    const bench = buildBenchmark(data, SETTINGS, split, barsPerYear(data.t));
+    const split = splitFor(n);
+    const equity = benchmarkEquity(data, SETTINGS);
     const units = 10_000 / (data.o[0] * 1.0005 * 1.001);
-    expect(bench.equity[n - 1]).toBeCloseTo(units * data.c[n - 1], 6);
-    expect(bench.full.netPnl).toBeCloseTo(units * data.c[n - 1] - 10_000, 6);
-    expect(bench.inSample.netPnl + bench.outOfSample.netPnl).toBeCloseTo(bench.full.netPnl, 6);
-    // Sharpe of a known curve: constant +1% per bar has zero variance → Sharpe 0, positive CAGR.
+    expect(equity[n - 1]).toBeCloseTo(units * data.c[n - 1], 6);
+    const bench = benchmarkSearch(data, SETTINGS, split, barsPerYear(data.t));
+    expect(bench.equity.length).toBe(split.holdoutStart); // the holdout is not part of the search benchmark
+    expect(bench.search.netPnl).toBeCloseTo(units * data.c[split.holdoutStart - 1] - 10_000, 6);
+    expect(bench.train.netPnl + bench.validation.netPnl).toBeCloseTo(bench.search.netPnl, 6);
+    // A known curve: constant +1% per bar has zero variance → Sharpe 0, no drawdown, positive CAGR.
     const steady = Float64Array.from({ length: 100 }, (_, i) => 100 * 1.01 ** (i + 1));
-    const s = splitMetrics(steady, 70, 100, 252, null);
-    expect(s.full.maxDrawdown).toBe(0);
-    expect(s.full.cagr).toBeGreaterThan(0);
-    expect(s.full.roi).toBeCloseTo((1.01 ** 100 - 1) * 100, 6);
+    const s = segmentMetrics(steady, 0, 100, 100, 252, null, null);
+    expect(s.maxDrawdown).toBe(0);
+    expect(s.cagr).toBeGreaterThan(0);
+    expect(s.roi).toBeCloseTo((1.01 ** 100 - 1) * 100, 6);
   });
 
-  it('ranks by a fitness that penalises inactivity and deep drawdowns', () => {
-    const data = dataset();
-    const ind = new IndicatorCache(data);
-    const ws = new BacktestWorkspace(data.c.length);
-    const ppy = barsPerYear(data.t);
-    const split = Math.floor(data.c.length * 0.7);
-    const bench = buildBenchmark(data, SETTINGS, split, ppy);
-    const m = evaluateGenome(ind, TREND, SETTINGS, ws, split, ppy);
-    const base = computeFitness(m, bench);
-    expect(Number.isFinite(base)).toBe(true);
+  it('ranks by a fitness that penalises inactivity, complexity, poor payoff and deep drawdowns', () => {
+    const base = { assetScores: [2], searchTrades: 150, validationTrades: 40, profitableShare: 1, params: 4, rewardToRisk: 2, validationWinRate: 50 };
+    const score = combineFitness(base);
+    expect(score).toBe(2);
+    expect(combineFitness({ ...base, searchTrades: MIN_TRADES / 2 })).toBeCloseTo(score - 3, 9);
+    expect(combineFitness({ ...base, validationTrades: 5 })).toBeLessThan(score);
+    expect(combineFitness({ ...base, params: 8 })).toBeCloseTo(score - 0.6, 9);
+    expect(combineFitness({ ...base, searchTrades: 0 })).toBe(UNFIT);
+    // Reward:risk below 1 needs a win rate 10 points above break-even (66.7% at 0.5:1).
+    expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 70 })).toBeCloseTo(score - 0.75, 9);
+    expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 80 })).toBe(score);
+    // Robust universe: the median counts, and fewer than 2/3 profitable assets costs a point.
+    expect(combineFitness({ ...base, assetScores: [5, 1, 2], profitableShare: 1 })).toBe(2);
+    expect(combineFitness({ ...base, assetScores: [5, 1, 2], profitableShare: 1 / 3 })).toBe(1);
 
-    const fewTrades = { ...m, full: { ...m.full, trades: 5 }, outOfSample: { ...m.outOfSample, trades: 1 } };
-    expect(computeFitness(fewTrades, bench)).toBeLessThan(base);
-    const deepDd = { ...m, full: { ...m.full, maxDrawdown: m.full.maxDrawdown + 40 } };
-    expect(computeFitness(deepDd, bench)).toBeLessThan(base);
-    const betterOos = { ...m, outOfSample: { ...m.outOfSample, sharpe: m.outOfSample.sharpe + 1, sortino: m.outOfSample.sortino + 1 } };
-    expect(computeFitness(betterOos, bench)).toBeGreaterThan(base);
-    const moreAlpha = { ...m, outOfSample: { ...m.outOfSample, roi: m.outOfSample.roi + 30 } };
-    expect(computeFitness(moreAlpha, bench)).toBeGreaterThan(base);
-    expect(computeFitness({ ...m, full: { ...m.full, trades: 0 } }, bench)).toBe(UNFIT);
+    const data = dataset();
+    const split = splitFor(data.c.length);
+    const ppy = barsPerYear(data.t);
+    const bench = benchmarkSearch(data, SETTINGS, split, ppy);
+    const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, ppy);
+    const assetScore = assetBaseScore(m, bench);
+    expect(Number.isFinite(assetScore)).toBe(true);
+    const deeper = { ...m, search: { ...m.search, maxDrawdown: m.search.maxDrawdown + 40 } };
+    expect(assetBaseScore(deeper, bench)).toBeLessThan(assetScore);
+    const moreAlpha = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
+    expect(assetBaseScore(moreAlpha, bench)).toBeGreaterThan(assetScore);
   });
 });
 
 /* -------------------------------------------------------------------------- */
 
+describe('selection-bias statistics', () => {
+  it('implements the normal distribution helpers', () => {
+    expect(normalCdf(0)).toBeCloseTo(0.5, 6);
+    expect(normalCdf(1.96)).toBeCloseTo(0.975, 4);
+    expect(inverseNormalCdf(0.975)).toBeCloseTo(1.96, 3);
+    expect(normalCdf(inverseNormalCdf(0.123))).toBeCloseTo(0.123, 5);
+  });
+
+  it('tracks a running mean and variance (Welford)', () => {
+    const stats = new RunningStats();
+    const values = [0.1, -0.05, 0.02, 0.3, -0.2, 0.07];
+    values.forEach((v) => stats.push(v));
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1);
+    expect(stats.count).toBe(6);
+    expect(stats.mean).toBeCloseTo(mean, 12);
+    expect(stats.variance).toBeCloseTo(variance, 12);
+  });
+
+  it('deflates the Sharpe ratio as more strategies are tried', () => {
+    const m = { sharpeRaw: 0.12, bars: 365, skew: 0, kurtosis: 3 };
+    // A single trial: plain probabilistic Sharpe against zero.
+    expect(deflatedSharpe(m, 1, 0).probability).toBeGreaterThan(0.98);
+    const few = deflatedSharpe(m, 10, 0.003);
+    const many = deflatedSharpe(m, 10_000, 0.003);
+    expect(many.hurdle).toBeGreaterThan(few.hurdle);
+    expect(many.probability).toBeLessThan(few.probability);
+    expect(many.probability).toBeLessThan(0.5);
+    expect(expectedMaxSharpe(10_000, 0.003)).toBeCloseTo(Math.sqrt(0.003) * 3.85, 1);
+    // Negative skew and fat tails widen the uncertainty.
+    expect(deflatedSharpe({ ...m, skew: -2, kurtosis: 12 }, 10, 0.003).probability).toBeLessThan(few.probability);
+  });
+
+  it('reports a 95% confidence interval for the Sharpe ratio', () => {
+    // 23 trades over ~1.5 years of daily bars with an annualised Sharpe of 4.2: the interval is huge.
+    const perBar = 4.2 / Math.sqrt(365);
+    const [lo, hi] = sharpeConfidenceInterval({ sharpeRaw: perBar, bars: 550, skew: 0, kurtosis: 3 }, 365);
+    expect(lo).toBeLessThan(4.2);
+    expect(hi).toBeGreaterThan(4.2);
+    expect(hi - lo).toBeGreaterThan(3);
+    const [lo2, hi2] = sharpeConfidenceInterval({ sharpeRaw: perBar, bars: 5500, skew: 0, kurtosis: 3 }, 365);
+    expect(hi2 - lo2).toBeLessThan(hi - lo);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+function conditionsOf(genome: StrategyGenome): Condition[] {
+  const all = [...genome.longEntry.conditions, ...(genome.shortEntry?.conditions ?? [])];
+  if (genome.exit.mode === 'dynamic') {
+    all.push(...(genome.exit.longExit?.conditions ?? []), ...(genome.exit.shortExit?.conditions ?? []));
+  }
+  return all;
+}
+
+function numericParams(c: Condition): number[] {
+  const out: number[] = [];
+  for (const [key, value] of Object.entries(c)) {
+    if (typeof value === 'number' && /period|fast|slow|kPeriod/i.test(key) && key !== 'dPeriod') out.push(value);
+  }
+  return out;
+}
+
 function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): void {
+  // Structure.
+  expect(genome.longEntry.logic).toBe('AND');
   expect(genome.longEntry.conditions.length).toBeGreaterThanOrEqual(1);
-  expect(genome.longEntry.conditions.length).toBeLessThanOrEqual(4);
-  if (mode === 'long-only') expect(genome.shortEntry).toBeNull();
-  else {
-    expect(genome.shortEntry).not.toBeNull();
-    expect(genome.shortEntry?.conditions.length).toBeGreaterThanOrEqual(1);
-    expect(genome.shortEntry?.conditions.length).toBeLessThanOrEqual(4);
-  }
-  if (genome.exit.mode === 'static') {
-    expect(genome.exit.stopLossPct).toBeGreaterThanOrEqual(RANGES.stopLossPct[0]);
-    expect(genome.exit.stopLossPct).toBeLessThanOrEqual(RANGES.stopLossPct[1]);
-    expect(genome.exit.takeProfitPct).toBeGreaterThanOrEqual(RANGES.takeProfitPct[0]);
-    expect(genome.exit.takeProfitPct).toBeLessThanOrEqual(RANGES.takeProfitPct[1]);
+  expect(genome.longEntry.conditions.length).toBeLessThanOrEqual(2);
+  expect(isCoherent(genome)).toBe(true);
+  expect(countParameters(genome)).toBeLessThanOrEqual(MAX_PARAMETERS);
+  expect('sizing' in genome).toBe(false);
+
+  // Archetype.
+  const [trigger, second] = genome.longEntry.conditions;
+  const role = conditionRole(trigger);
+  if (genome.archetype === 'TREND') {
+    expect(role).toBe('TREND_UP');
+    if (second) expect(conditionRole(second)).toBe('FILTER');
   } else {
-    expect(genome.exit.stopAtrMult).toBeGreaterThanOrEqual(RANGES.stopAtrMult[0]);
-    expect(genome.exit.stopAtrMult).toBeLessThanOrEqual(RANGES.stopAtrMult[1]);
-    if (genome.exit.takeProfitAtrMult !== null) {
-      expect(genome.exit.takeProfitAtrMult).toBeGreaterThanOrEqual(RANGES.takeProfitAtrMult[0]);
-      expect(genome.exit.takeProfitAtrMult).toBeLessThanOrEqual(RANGES.takeProfitAtrMult[1]);
+    expect(['OVERSOLD', 'TREND_DOWN']).toContain(role);
+    if (second) expect(['FILTER', 'TREND_UP']).toContain(conditionRole(second));
+  }
+
+  // Shorts are the exact mirror of the longs.
+  if (mode === 'long-only') expect(genome.shortEntry).toBeNull();
+  else expect(genome.shortEntry).toEqual(mirrorGroup(genome.longEntry));
+
+  // Grids.
+  for (const c of conditionsOf(genome)) {
+    for (const lookback of numericParams(c)) expect(LOOKBACK_GRID).toContain(lookback);
+    if (c.ind === 'MACD') expect(c.slow).toBeGreaterThan(c.fast);
+    if (c.ind === 'MA_CROSS') expect(c.slowPeriod).toBeGreaterThan(c.fastPeriod);
+    if (c.ind === 'RSI' || (c.ind === 'STOCH' && c.variant === 'level') || c.ind === 'CCI') expect(Math.abs(c.level % 5)).toBe(0);
+    if (c.ind === 'SUPERTREND' || c.ind === 'BB') expect((c.mult * 2) % 1).toBe(0);
+    if (c.ind === 'VOLUME' || c.ind === 'ATR') expect(['gt', 'lt']).toContain(c.op);
+  }
+
+  // Exits.
+  if (genome.exit.mode === 'static') {
+    expect(STATIC_PCT_GRID).toContain(genome.exit.stopLossPct);
+    expect(STATIC_PCT_GRID).toContain(genome.exit.takeProfitPct);
+    expect(genome.exit.stopLossPct).toBeLessThanOrEqual(15);
+  } else {
+    const exit = genome.exit;
+    expect(GRIDS.stopAtrMult).toContain(exit.stopAtrMult);
+    expect(GRIDS.atrPeriod).toContain(exit.atrPeriod);
+    if (exit.takeProfitAtrMult !== null) {
+      expect(GRIDS.takeProfitAtrMult).toContain(exit.takeProfitAtrMult);
+      // A trail is only kept when the target sits at least 1 ATR beyond the stop distance.
+      if (exit.trailing) expect(exit.takeProfitAtrMult).toBeGreaterThanOrEqual(exit.stopAtrMult + 1);
     } else {
-      // Without a target there must be another profit-taking path.
-      expect(genome.exit.trailing || genome.exit.longExit !== null).toBe(true);
+      expect(exit.trailing || exit.reversalExit || genome.maxBarsInTrade !== null).toBe(true);
     }
-    if (mode === 'long-only') expect(genome.exit.shortExit).toBeNull();
-    if (mode === 'long-short' && genome.exit.longExit) expect(genome.exit.shortExit).not.toBeNull();
-  }
-  const groups = [genome.longEntry, genome.shortEntry];
-  if (genome.exit.mode === 'dynamic') groups.push(genome.exit.longExit, genome.exit.shortExit);
-  for (const group of groups) {
-    if (!group) continue;
-    for (const c of group.conditions) {
-      if (c.ind === 'RSI') {
-        expect(c.period).toBeGreaterThanOrEqual(7);
-        expect(c.period).toBeLessThanOrEqual(28);
-      }
-      if (c.ind === 'MACD') expect(c.slow).toBeGreaterThan(c.fast);
-      if (c.ind === 'MA_CROSS') expect(c.slowPeriod).toBeGreaterThan(c.fastPeriod);
-      if (c.ind === 'VOLUME' || c.ind === 'ATR') expect(['gt', 'lt']).toContain(c.op);
+    // Reversal exits: TREND only, a single condition, the mirror of the entry trigger.
+    if (genome.archetype === 'MEAN_REVERSION') expect(exit.reversalExit).toBe(false);
+    if (exit.reversalExit) {
+      expect(exit.longExit?.conditions).toEqual([mirrorCondition(trigger)]);
+      if (mode === 'long-short') expect(exit.shortExit?.conditions).toEqual([trigger]);
+      else expect(exit.shortExit).toBeNull();
+    } else {
+      expect(exit.longExit).toBeNull();
+      expect(exit.shortExit).toBeNull();
     }
   }
+  if (genome.maxBarsInTrade !== null) expect(TIME_STOP_GRID).toContain(genome.maxBarsInTrade);
 }
 
 describe('genome', () => {
-  it('generates, mutates and recombines only valid genomes', () => {
+  it('classifies every condition variant', () => {
+    const table: [Condition, ConditionRole][] = [
+      // Filters.
+      [{ ind: 'ATR', period: 14, op: 'gt', level: 2 }, 'FILTER'],
+      [{ ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }, 'FILTER'],
+      [{ ind: 'ADX', period: 14, variant: 'strength', op: 'gt', level: 25 }, 'FILTER'],
+      [{ ind: 'BB', period: 20, mult: 2, variant: 'bandwidth', op: 'lt', level: 5 }, 'FILTER'],
+      // Oscillators: the zone decides.
+      [{ ind: 'RSI', period: 14, op: 'lt', level: 30 }, 'OVERSOLD'],
+      [{ ind: 'RSI', period: 14, op: 'cross_above', level: 30 }, 'OVERSOLD'],
+      [{ ind: 'RSI', period: 14, op: 'gt', level: 70 }, 'OVERBOUGHT'],
+      [{ ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'level', op: 'lt', level: 20 }, 'OVERSOLD'],
+      [{ ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'level', op: 'gt', level: 80 }, 'OVERBOUGHT'],
+      [{ ind: 'CCI', period: 20, op: 'lt', level: -100 }, 'OVERSOLD'],
+      [{ ind: 'CCI', period: 20, op: 'gt', level: 100 }, 'OVERBOUGHT'],
+      [{ ind: 'BB', period: 20, mult: 2, variant: 'pctb', op: 'lt', level: 0.1 }, 'OVERSOLD'],
+      [{ ind: 'BB', period: 20, mult: 2, variant: 'pctb', op: 'gt', level: 0.9 }, 'OVERBOUGHT'],
+      [{ ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'lt', level: 0 }, 'OVERSOLD'],
+      [{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'gt', level: 0 }, 'OVERBOUGHT'],
+      // Trend: the operator decides.
+      [{ ind: 'PRICE_MA', maType: 'SMA', period: 200, op: 'gt' }, 'TREND_UP'],
+      [{ ind: 'PRICE_MA', maType: 'EMA', period: 20, op: 'cross_below' }, 'TREND_DOWN'],
+      [{ ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: 20, slowType: 'SMA', slowPeriod: 50, op: 'cross_above' }, 'TREND_UP'],
+      [{ ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: 20, slowType: 'SMA', slowPeriod: 50, op: 'lt' }, 'TREND_DOWN'],
+      [{ ind: 'MACD', fast: 10, slow: 26, signal: 10, variant: 'signal', op: 'cross_above' }, 'TREND_UP'],
+      [{ ind: 'MACD', fast: 10, slow: 26, signal: 10, variant: 'zero', op: 'lt' }, 'TREND_DOWN'],
+      [{ ind: 'MACD', fast: 10, slow: 26, signal: 10, variant: 'hist', op: 'gt' }, 'TREND_UP'],
+      [{ ind: 'SUPERTREND', period: 10, mult: 3, op: 'gt' }, 'TREND_UP'],
+      [{ ind: 'SUPERTREND', period: 10, mult: 3, op: 'cross_below' }, 'TREND_DOWN'],
+      [{ ind: 'ADX', period: 14, variant: 'di', op: 'gt', level: 25 }, 'TREND_UP'],
+      [{ ind: 'ADX', period: 14, variant: 'di', op: 'cross_below', level: 25 }, 'TREND_DOWN'],
+      [{ ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'kd', op: 'cross_above', level: 50 }, 'TREND_UP'],
+      [{ ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'kd', op: 'lt', level: 50 }, 'TREND_DOWN'],
+    ];
+    const mirrored: Record<ConditionRole, ConditionRole> = {
+      FILTER: 'FILTER',
+      OVERSOLD: 'OVERBOUGHT',
+      OVERBOUGHT: 'OVERSOLD',
+      TREND_UP: 'TREND_DOWN',
+      TREND_DOWN: 'TREND_UP',
+    };
+    const variants = new Set<string>();
+    for (const [condition, role] of table) {
+      expect(conditionRole(condition), JSON.stringify(condition)).toBe(role);
+      expect(conditionRole(mirrorCondition(condition)), JSON.stringify(condition)).toBe(mirrored[role]);
+      expect(mirrorCondition(mirrorCondition(condition))).toEqual(condition);
+      variants.add(`${condition.ind}:${'variant' in condition ? condition.variant : ''}`);
+    }
+    // Every indicator family and every variant is covered.
+    expect([...variants].sort()).toEqual(
+      [
+        'ADX:di', 'ADX:strength', 'ATR:', 'BB:bandwidth', 'BB:lower', 'BB:pctb', 'BB:upper', 'CCI:',
+        'MACD:hist', 'MACD:signal', 'MACD:zero', 'MA_CROSS:', 'PRICE_MA:', 'RSI:', 'STOCH:kd', 'STOCH:level',
+        'SUPERTREND:', 'VOLUME:',
+      ].sort(),
+    );
+  });
+
+  it('generates, mutates and recombines only coherent, capped, on-grid genomes', () => {
     const rng = mulberry32(42);
     for (const mode of ['long-only', 'long-short'] as const) {
       let genome = randomGenome(rng, mode, DEFAULT_LIMITS);
       const kinds = new Set<string>();
-      for (let i = 0; i < 3000; i++) {
+      const archetypes = new Set<string>();
+      let reversals = 0;
+      let timeStops = 0;
+      for (let i = 0; i < 4000; i++) {
         const r = rng();
         if (r < 0.2) genome = randomGenome(rng, mode, DEFAULT_LIMITS);
         else if (r < 0.3) genome = crossoverGenomes(rng, genome, randomGenome(rng, mode, DEFAULT_LIMITS), mode, DEFAULT_LIMITS);
         else genome = mutateGenome(rng, genome, mode, DEFAULT_LIMITS, 1 + Math.floor(rng() * 3));
         assertValid(genome, mode);
         for (const c of genome.longEntry.conditions) kinds.add(c.ind);
-        // Repair is idempotent and signatures are stable.
-        const repaired = repairGenome(genome, mode, DEFAULT_LIMITS, rng);
-        expect(genomeSignature(repaired)).toBe(genomeSignature(genome));
+        archetypes.add(genome.archetype);
+        if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit) reversals++;
+        if (genome.maxBarsInTrade !== null) timeStops++;
+        // Repair and normalisation are idempotent; signatures are stable.
+        expect(genomeSignature(repairGenome(genome, mode, DEFAULT_LIMITS, rng))).toBe(genomeSignature(genome));
+        expect(normalizeGenome(genome, mode, DEFAULT_LIMITS)).toEqual(genome);
       }
-      // Every indicator family is reachable.
-      expect(kinds.size).toBe(11);
+      expect(kinds.size).toBe(11); // every indicator family is reachable
+      expect(archetypes.size).toBe(2);
+      expect(reversals).toBeGreaterThan(50);
+      expect(timeStops).toBeGreaterThan(50);
     }
+  });
+
+  it('repairs incoherent and over-parameterised genomes', () => {
+    const rng = mulberry32(5);
+    // The reviewed strategy's pattern: a "trend" long that fires on bearish signals, four conditions, OR logic.
+    const mess: StrategyGenome = {
+      archetype: 'TREND',
+      longEntry: {
+        logic: 'OR',
+        conditions: [
+          { ind: 'SUPERTREND', period: 19, mult: 3.6, op: 'cross_below' },
+          { ind: 'RSI', period: 9, op: 'cross_below', level: 12 },
+          { ind: 'MA_CROSS', fastType: 'SMA', fastPeriod: 162, slowType: 'SMA', slowPeriod: 228, op: 'cross_above' },
+          { ind: 'CCI', period: 33, op: 'gt', level: 87 },
+        ],
+      },
+      shortEntry: { logic: 'AND', conditions: [{ ind: 'RSI', period: 9, op: 'gt', level: 71 }] },
+      exit: dynamicExit(2.4, 1.6, true),
+      maxBarsInTrade: 13,
+    };
+    const fixed = repairGenome(mess, 'long-short', DEFAULT_LIMITS, rng);
+    assertValid(fixed, 'long-short');
+    expect(fixed.longEntry.conditions.length).toBeLessThanOrEqual(2);
+    // 2.4 / 1.6 ATR snaps to 2.5 / 1.5: the target is not 1 ATR beyond the stop, so the trail is dropped.
+    expect(fixed.exit).toMatchObject({ stopAtrMult: 2.5, takeProfitAtrMult: 1.5, trailing: false });
+    expect(fixed.maxBarsInTrade).toBe(10);
+
+    // A valid mean-reversion version of the same idea survives intact.
+    const fade = repairGenome(
+      {
+        archetype: 'MEAN_REVERSION',
+        longEntry: {
+          logic: 'AND',
+          conditions: [
+            { ind: 'SUPERTREND', period: 10, mult: 3, op: 'cross_below' },
+            { ind: 'PRICE_MA', maType: 'SMA', period: 200, op: 'gt' },
+          ],
+        },
+        shortEntry: null,
+        exit: dynamicExit(2.5, 3, false),
+        maxBarsInTrade: 20,
+      },
+      'long-short',
+      DEFAULT_LIMITS,
+      rng,
+    );
+    expect(groupFormula(fade.longEntry)).toBe('Close crosses below Supertrend(10,3.0) AND Close > SMA(200)');
+    expect(groupFormula(fade.shortEntry!)).toBe('Close crosses above Supertrend(10,3.0) AND Close < SMA(200)');
+    expect(countParameters(fade)).toBe(7); // 2 + 1 + ATR period, stop, target + time stop
+
+    // Parameter cap: MACD (3) + Bollinger bandwidth (3) + ATR exit (3) + time stop (1) = 10 → trimmed to ≤ 8.
+    const heavy = repairGenome(
+      {
+        archetype: 'TREND',
+        longEntry: {
+          logic: 'AND',
+          conditions: [
+            { ind: 'MACD', fast: 10, slow: 26, signal: 10, variant: 'signal', op: 'gt' },
+            { ind: 'BB', period: 20, mult: 2, variant: 'bandwidth', op: 'gt', level: 10 },
+          ],
+        },
+        shortEntry: null,
+        exit: dynamicExit(2, 4, false),
+        maxBarsInTrade: 20,
+      },
+      'long-only',
+      DEFAULT_LIMITS,
+      rng,
+    );
+    expect(countParameters(heavy)).toBeLessThanOrEqual(MAX_PARAMETERS);
+    expect(heavy.maxBarsInTrade).toBeNull();
   });
 
   it('respects dataset limits (short histories, missing volume)', () => {
     const rng = mulberry32(7);
-    const limits = { ...DEFAULT_LIMITS, maxLookback: 40, hasVolume: false };
+    const limits = { maxLookback: 50, hasVolume: false };
     let genome = randomGenome(rng, 'long-short', limits);
     for (let i = 0; i < 2000; i++) {
       genome = rng() < 0.3 ? randomGenome(rng, 'long-short', limits) : mutateGenome(rng, genome, 'long-short', limits, 2);
-      for (const group of [genome.longEntry, genome.shortEntry]) {
-        for (const c of group?.conditions ?? []) {
-          expect(c.ind).not.toBe('VOLUME');
-          if (c.ind === 'PRICE_MA') expect(c.period).toBeLessThanOrEqual(40);
-          if (c.ind === 'MA_CROSS') expect(c.slowPeriod).toBeLessThanOrEqual(40);
-          if (c.ind === 'MACD') expect(c.slow).toBeLessThanOrEqual(40);
-        }
+      expect(isCoherent(genome, limits)).toBe(true);
+      for (const c of conditionsOf(genome)) {
+        expect(c.ind).not.toBe('VOLUME');
+        for (const lookback of numericParams(c)) expect(lookback).toBeLessThanOrEqual(50);
       }
+      // No 100-bar regime filter is possible, so the optional second condition must be a FILTER.
+      const second = genome.longEntry.conditions[1];
+      if (second) expect(conditionRole(second)).toBe('FILTER');
     }
   });
 
-  it('mirrors directional conditions symmetrically', () => {
-    const samples: Condition[] = [
-      { ind: 'RSI', period: 14, op: 'lt', level: 30 },
-      { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'cross_above' },
-      { ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 },
-      { ind: 'BB', period: 20, mult: 2, variant: 'pctb', op: 'lt', level: 0.1 },
-      { ind: 'CCI', period: 20, op: 'lt', level: -100 },
-      { ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'level', op: 'lt', level: 20 },
-      { ind: 'VOLUME', period: 20, op: 'gt', level: 1.3 },
-    ];
-    for (const c of samples) expect(mirrorCondition(mirrorCondition(c))).toEqual(c);
-    expect(mirrorCondition(samples[0])).toEqual({ ind: 'RSI', period: 14, op: 'gt', level: 70 });
-    expect(mirrorCondition(samples[2])).toMatchObject({ variant: 'upper', op: 'cross_below' });
-    expect(mirrorCondition(samples[6])).toEqual(samples[6]); // filters are direction-agnostic
-  });
-
-  it('treats condition order as irrelevant for identity', () => {
-    const a: StrategyGenome = { ...DIP, longEntry: { logic: 'AND', conditions: [...DIP.longEntry.conditions] } };
-    const b: StrategyGenome = { ...DIP, longEntry: { logic: 'AND', conditions: [...DIP.longEntry.conditions].reverse() } };
-    expect(genomeSignature(a)).toBe(genomeSignature(b));
-    expect(genomeSignature(a)).not.toBe(genomeSignature(TREND));
+  it('enumerates ±20% single-parameter neighbours on the grids', () => {
+    const variants = parameterVariants(DIP, 'long-only', DEFAULT_LIMITS);
+    // RSI period, RSI level, stop %, target % → two neighbours each; the 100-bar regime filter can only move up.
+    expect(variants.length).toBeGreaterThanOrEqual(8);
+    const base = genomeSignature(DIP);
+    const signatures = new Set(variants.map(genomeSignature));
+    expect(signatures.size).toBe(variants.length);
+    expect(signatures.has(base)).toBe(false);
+    for (const variant of variants) {
+      assertValid(variant, 'long-only');
+      expect(variant.archetype).toBe(DIP.archetype);
+      // Exactly one number differs from the original.
+      const a = JSON.stringify(variant).match(/-?\d+(\.\d+)?/g) ?? [];
+      const b = JSON.stringify(DIP).match(/-?\d+(\.\d+)?/g) ?? [];
+      expect(a.length).toBe(b.length);
+      expect(a.filter((value, index) => value !== b[index]).length).toBe(1);
+    }
+    // RSI(14): −20% = 11.2 → 10, +20% = 16.8 → snaps back to 14, so the next grid step (20) is used.
+    const periods = variants.map((v) => (v.longEntry.conditions[0] as { period: number }).period);
+    expect(periods).toContain(10);
+    expect(periods).toContain(20);
   });
 });
 
@@ -468,115 +855,144 @@ describe('genome', () => {
 describe('descriptions and Pine export', () => {
   const data = dataset();
   const ppy = barsPerYear(data.t);
-  const split = Math.floor(data.c.length * 0.7);
+  const split = splitFor(data.c.length);
+  const RISK: BacktestSettings = { ...SETTINGS, sizing: { mode: 'risk', riskPct: 2, compounding: false } };
 
   function resultFor(genome: StrategyGenome, settings: BacktestSettings): StrategyResult {
-    const ws = new BacktestWorkspace(data.c.length);
-    const m = evaluateGenome(new IndicatorCache(data), genome, settings, ws, split, ppy);
+    const m = evaluateSearch(new IndicatorCache(data), genome, settings, new BacktestWorkspace(data.c.length), split, ppy);
     return {
       id: 'S-1',
       genome,
       fitness: 1,
+      dsr: 0.42,
+      params: countParameters(genome),
       ...m,
+      holdout: null,
       alpha: 0,
-      alphaOos: 0,
       equity: new Float32Array(0),
       foundAt: 1,
+      assets: [],
+      robustness: null,
+      verdict: null,
     };
   }
 
   const ctx = (settings: BacktestSettings) => ({
-    label: 'BTC-USD',
+    label: 'XRP-USD',
     interval: '1d' as const,
     settings,
-    components: [{ symbol: 'BTC-USD', weight: 1 }],
+    components: [{ symbol: 'XRP-USD', weight: 1 }],
     units: [],
     windowStart: data.t[0],
     windowEnd: data.t[data.t.length - 1],
     bars: data.t.length,
     benchmarkRoi: 12.3,
+    venue: 'XRPUSDT on Binance',
     simulatedData: true,
   });
 
-  it('renders formulas and plain-English rules', () => {
-    const genome: StrategyGenome = {
-      ...DIP,
-      longEntry: {
-        logic: 'AND',
-        conditions: [
-          { ind: 'RSI', period: 14, op: 'lt', level: 34 },
-          { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' },
-          { ind: 'VOLUME', period: 20, op: 'gt', level: 1.3 },
-        ],
-      },
-    };
-    expect(groupFormula(genome.longEntry)).toBe('RSI(14) < 34 AND Close > EMA(200) AND Volume_Ratio(20) > 1.30');
-    expect(indicatorBadges(genome)).toEqual(['RSI', 'EMA', 'Volume']);
+  it('renders formulas and coherent plain-English rules', () => {
+    expect(groupFormula(DIP.longEntry)).toBe('RSI(14) < 45 AND Close > EMA(100)');
+    expect(indicatorBadges(DIP)).toEqual(['RSI', 'EMA']);
     expect(indicatorBadges(TREND)).toEqual(['Supertrend', 'ATR']);
-    const entry = describeLongEntry(genome);
-    expect(entry.intro).toContain('ALL of the following');
-    expect(entry.bullets).toHaveLength(3);
-    const exit = describeExit(genome, SETTINGS);
+    const entry = describeLongEntry(DIP);
+    expect(entry.intro).toContain('BOTH of the following');
+    expect(entry.bullets[0].text.startsWith('Trigger: ')).toBe(true);
+    expect(entry.bullets[1].text.startsWith('Regime filter: ')).toBe(true);
+    expect(ARCHETYPE_LABEL[DIP.archetype]).toBe('Mean reversion');
+    expect(describeArchetype(DIP)).toContain('buys weakness');
+    expect(describeArchetype(DIP)).toContain('slow trend is still up');
+    expect(describeArchetype(TREND)).toContain('buys strength');
+    expect(describeArchetype(TREND)).toContain('mirror image');
+
+    const exit = describeExit(DIP, RISK);
     expect(exit.mode).toBe('Static %');
-    expect(exit.bullets.map((b) => b.title)).toEqual(['Stop loss', 'Take profit', 'Position size', 'Execution']);
-    const dynamic = describeExit(TREND, SETTINGS);
+    expect(exit.bullets.map((b) => b.title)).toEqual(['Stop loss', 'Take profit', 'Position size (run setting)', 'Execution']);
+    expect(exit.bullets[2].text).toContain('risks 2.00% of the starting capital (no compounding)');
+    const dynamic = describeExit({ ...TREND, maxBarsInTrade: 20 }, { ...SETTINGS, fundingPctPerBar: 0.03 });
     expect(dynamic.mode).toBe('Dynamic ATR');
-    expect(dynamic.bullets[0].title).toBe('Trailing ATR stop');
+    expect(dynamic.bullets.map((b) => b.title)).toEqual([
+      'Trailing ATR stop', 'Take profit', 'Time stop', 'Stop-and-reverse', 'Position size (run setting)', 'Funding', 'Execution',
+    ]);
     expect(listIndicators(TREND).map((u) => u.name)).toEqual(['Supertrend', 'ATR']);
   });
 
   it('exports syntactically well-formed Pine Script v5 for every kind of genome', () => {
     const rng = mulberry32(99);
     for (const mode of ['long-only', 'long-short'] as const) {
-      const settings = { ...SETTINGS, tradeMode: mode };
-      for (let i = 0; i < 400; i++) {
-        const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
-        const script = generatePineScript(resultFor(genome, settings), ctx(settings));
-        expect(script.startsWith('//@version=5\n')).toBe(true);
-        expect(script).toContain('strategy("StrategyFinder S-1 | BTC-USD 1d"');
-        expect(script).toContain('commission_value=0.15');
-        expect(script).toContain('strategy.entry("Long", strategy.long, qty=orderQty)');
-        expect(script.includes('strategy.entry("Short"')).toBe(mode === 'long-short');
-        // ASCII only, balanced brackets, no leaked JS values.
-        expect(/^[\x09\x0a\x20-\x7e]*$/.test(script)).toBe(true);
-        expect(script).not.toMatch(/undefined|NaN|\[object/);
-        const code = script
-          .split('\n')
-          .filter((line) => !line.trimStart().startsWith('//'))
-          .map((line) => line.replace(/\/\/.*$/, '').replace(/"[^"]*"/g, '""'))
-          .join('\n');
-        for (const [open, close] of [['(', ')'], ['[', ']']] as const) {
-          expect(code.split(open).length).toBe(code.split(close).length);
+      for (const sizing of [RISK.sizing, SETTINGS.sizing, { mode: 'risk', riskPct: 1, compounding: true }] as const) {
+        const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
+        for (let i = 0; i < 150; i++) {
+          const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
+          const script = generatePineScript(resultFor(genome, settings), ctx(settings));
+          expect(script.startsWith('//@version=5\n')).toBe(true);
+          expect(script).toContain('strategy("StrategyFinder S-1 | XRP-USD 1d"');
+          expect(script).toContain('use_bar_magnifier=true');
+          expect(script).toContain('commission_value=0.15');
+          expect(script).toContain('Tested on    : XRPUSDT on Binance');
+          expect(script).toContain(`Archetype    : ${ARCHETYPE_LABEL[genome.archetype]}`);
+          expect(script).toContain(`Parameters   : ${countParameters(genome)} tunable values`);
+          expect(script).toContain('strategy.entry("Long", strategy.long, qty=orderQty)');
+          expect(script.includes('strategy.entry("Short"')).toBe(mode === 'long-short');
+          // Never more than the account can buy.
+          expect(script).toContain('maxQty = math.max(strategy.equity, 0) / (close * (1 + costPct / 100))');
+          expect(script).toMatch(sizing.mode === 'full' ? /orderQty = maxQty/ : /math\.min\(riskCapital \* riskPct \/ 100 \/ stopDistance, maxQty\)/);
+          expect(script.includes('timedOut')).toBe(genome.maxBarsInTrade !== null);
+          expect(script).not.toMatch(/(Entry|Signal) = .* or /); // rules are AND-only now
+          // ASCII only, balanced brackets, no leaked JS values.
+          expect(/^[\x09\x0a\x20-\x7e]*$/.test(script)).toBe(true);
+          expect(script).not.toMatch(/undefined|NaN|\[object/);
+          const code = script
+            .split('\n')
+            .filter((line) => !line.trimStart().startsWith('//'))
+            .map((line) => line.replace(/\/\/.*$/, '').replace(/"[^"]*"/g, '""'))
+            .join('\n');
+          for (const [open, close] of [['(', ')'], ['[', ']']] as const) {
+            expect(code.split(open).length).toBe(code.split(close).length);
+          }
+          // Every identifier is declared before it is used.
+          const declared = new Set<string>();
+          for (const line of code.split('\n')) {
+            const tuple = /^\[([^\]]+)\]\s*=/.exec(line);
+            if (tuple) tuple[1].split(',').forEach((name) => declared.add(name.trim()));
+            const single = /^(?:var float )?([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]/.exec(line);
+            if (single) declared.add(single[1]);
+          }
+          const used = code.match(/\b(?:rsi|ema|sma|macdLine|macdSignal|macdHist|bbUpper|bbLower|bbBasis|bbPctB|bbWidth|atr|atrPct|stochK|stochD|diPlus|diMinus|adx|volRatio|supertrend|cci)_[0-9_]+\b/g) ?? [];
+          for (const name of used) expect(declared.has(name)).toBe(true);
+          for (const name of ['orderQty', 'maxQty', 'goLong', 'canEnter', 'stopTicks']) expect(declared.has(name)).toBe(true);
         }
-        // Every identifier used in a rule is declared before the rules section.
-        const declared = new Set<string>();
-        for (const line of code.split('\n')) {
-          const tuple = /^\[([^\]]+)\]\s*=/.exec(line);
-          if (tuple) tuple[1].split(',').forEach((name) => declared.add(name.trim()));
-          const single = /^(?:var float )?([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]/.exec(line);
-          if (single) declared.add(single[1]);
-        }
-        const used = code.match(/\b(?:rsi|ema|sma|macdLine|macdSignal|macdHist|bbUpper|bbLower|bbBasis|bbPctB|bbWidth|atr|atrPct|stochK|stochD|diPlus|diMinus|adx|volRatio|supertrend|cci)_[0-9_]+\b/g) ?? [];
-        for (const name of used) expect(declared.has(name)).toBe(true);
       }
     }
   });
 
-  it('writes the exact exit construction into the script', () => {
-    const staticScript = generatePineScript(resultFor(DIP, { ...SETTINGS, tradeMode: 'long-only' }), ctx({ ...SETTINGS, tradeMode: 'long-only' }));
+  it('writes the exact exit construction, sizing and time stop into the script', () => {
+    const longOnly = { ...RISK, tradeMode: 'long-only' as const };
+    const staticScript = generatePineScript(resultFor(DIP, longOnly), ctx(longOnly));
     expect(staticScript).toContain('stopLossPct   = input.float(4.0, "Stop loss %"');
-    expect(staticScript).toContain('takeProfitPct = input.float(9.0, "Take profit %"');
-    expect(staticScript).toContain('longCond1 = rsi_14 < 48');
-    expect(staticScript).toContain('longCond2 = close > ema_50');
+    expect(staticScript).toContain('takeProfitPct = input.float(10.0, "Take profit %"');
+    expect(staticScript).toContain('longCond1 = rsi_14 < 45');
+    expect(staticScript).toContain('longCond2 = close > ema_100');
+    expect(staticScript).toContain('riskPct       = input.float(2.0, "Risk per trade (%)"');
+    expect(staticScript).toContain('compound      = input.bool(false,');
+    expect(staticScript).toContain('riskCapital  = compound ? math.max(strategy.equity, 0) : strategy.initial_capital');
+    expect(staticScript).toContain('stopDistance = close * stopLossPct / 100');
     expect(staticScript).toContain('if goLong and strategy.position_size == 0');
     expect(staticScript).not.toContain('goShort');
+    expect(staticScript).toContain('Holdout      : not revealed yet');
 
-    const trailScript = generatePineScript(resultFor(TREND, SETTINGS), ctx(SETTINGS));
+    const timed = { ...TREND, maxBarsInTrade: 20 };
+    const trailScript = generatePineScript({ ...resultFor(timed, RISK), holdout: resultFor(timed, RISK).validation }, ctx(RISK));
     expect(trailScript).toContain('[supertrend_10_3, supertrendDir_10_3] = ta.supertrend(3.0, 10)');
+    expect(trailScript).toContain('stopDistance = stopAtrMult * atrValue');
     expect(trailScript).toContain('longTrail := math.max(longTrail, longPeak - stopAtrMult * atrValue)');
     expect(trailScript).toContain('shortTrail  := math.min(shortTrail, shortTrough + stopAtrMult * atrValue)');
-    expect(trailScript).toContain('strategy.exit("Long exit", from_entry="Long", loss=stopTicks)');
+    expect(trailScript).toContain('maxBarsInTrade = input.int(20, "Time stop (bars in trade)"');
+    expect(trailScript).toContain('timedOut = strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBarsInTrade - 1');
+    expect(trailScript).toContain('if timedOut\n    strategy.close_all(comment="Time stop")');
+    expect(trailScript).toContain('and not timedOut');
     expect(trailScript).toContain('if goShort and strategy.position_size >= 0');
+    expect(trailScript).not.toContain('not revealed yet');
   });
 });
 

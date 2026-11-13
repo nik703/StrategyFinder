@@ -3,7 +3,9 @@
  * and tables, and plain-English sentences for the Strategy Breakdown view.
  */
 
+import { conditionRole } from './genome';
 import type {
+  Archetype,
   BacktestSettings,
   CmpOp,
   Condition,
@@ -86,7 +88,7 @@ export function conditionFormula(c: Condition): string {
 
 /** e.g. "RSI(14) < 34 AND Close > EMA(200) AND Volume_Ratio(20) > 1.30" */
 export function groupFormula(group: RuleGroup): string {
-  return group.conditions.map(conditionFormula).join(` ${group.logic} `);
+  return group.conditions.map(conditionFormula).join(' AND ');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -228,16 +230,23 @@ export interface RuleDescription {
   bullets: { text: string; formula: string }[];
 }
 
-function describeGroup(group: RuleGroup, action: string): RuleDescription {
-  const many = group.conditions.length > 1;
-  const quantifier = !many
-    ? 'when, on the close of a candle:'
-    : group.logic === 'AND'
-      ? 'when ALL of the following are true on the close of the same candle:'
-      : 'when ANY of the following is true on the close of a candle:';
+/** Label for the job a condition does inside its entry. */
+function conditionJob(c: Condition, index: number): string {
+  if (index === 0) return 'Trigger';
+  return conditionRole(c) === 'FILTER' ? 'Filter' : 'Regime filter';
+}
+
+function describeGroup(group: RuleGroup, action: string, labelled = true): RuleDescription {
+  const quantifier =
+    group.conditions.length > 1
+      ? 'when BOTH of the following are true on the close of the same candle:'
+      : 'when, on the close of a candle:';
   return {
     intro: `${action} ${quantifier}`,
-    bullets: group.conditions.map((c) => ({ text: conditionSentence(c), formula: conditionFormula(c) })),
+    bullets: group.conditions.map((c, index) => ({
+      text: labelled ? `${conditionJob(c, index)}: ${conditionSentence(c)}` : conditionSentence(c),
+      formula: conditionFormula(c),
+    })),
   };
 }
 
@@ -248,6 +257,34 @@ export function describeLongEntry(genome: StrategyGenome): RuleDescription {
 export function describeShortEntry(genome: StrategyGenome): RuleDescription | null {
   if (genome.shortEntry === null) return null;
   return describeGroup(genome.shortEntry, "Sell short at the next candle's open");
+}
+
+export const ARCHETYPE_LABEL: Record<Archetype, string> = {
+  TREND: 'Trend-following',
+  MEAN_REVERSION: 'Mean reversion',
+};
+
+/** One paragraph that states the idea behind the strategy in plain English. */
+export function describeArchetype(genome: StrategyGenome): string {
+  const second = genome.longEntry.conditions[1];
+  const hasShorts = genome.shortEntry !== null;
+  if (genome.archetype === 'TREND') {
+    return (
+      'Trend-following: it buys strength. The trigger fires when price or momentum turns up' +
+      (second ? ', and the filter only lets trades through in the right market conditions' : '') +
+      (hasShorts ? '. Shorts are the exact mirror image: it sells weakness under the same rules.' : '.')
+    );
+  }
+  const regime = second && conditionRole(second) !== 'FILTER';
+  return (
+    'Mean reversion: it buys weakness and expects a bounce. The trigger fires on an oversold reading or a short-term downswing' +
+    (regime
+      ? ', but only while the slow trend is still up, so it fades dips inside an uptrend rather than catching falling knives'
+      : second
+        ? ', and the filter only lets trades through in the right market conditions'
+        : '') +
+    (hasShorts ? '. Shorts are the exact mirror image: it sells strength under the same rules.' : '.')
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -264,7 +301,8 @@ export interface ExitDescription {
 }
 
 export function describeExit(genome: StrategyGenome, settings: BacktestSettings): ExitDescription {
-  const { exit, sizing } = genome;
+  const { exit } = genome;
+  const { sizing } = settings;
   const hasShorts = genome.shortEntry !== null;
   const bullets: { title: string; text: string }[] = [];
   let headline: string;
@@ -320,22 +358,31 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
       bullets.push({
         title: 'Take profit',
         text: `No fixed target – winners run until ${
-          exit.trailing && exit.longExit
-            ? 'the trailing stop or the indicator-reversal exit'
-            : exit.trailing
-              ? 'the trailing stop'
-              : 'the indicator-reversal exit'
+          [
+            exit.trailing ? 'the trailing stop' : null,
+            exit.longExit ? 'the trigger reversal' : null,
+            genome.maxBarsInTrade !== null ? 'the time stop' : null,
+          ]
+            .filter((part): part is string => part !== null)
+            .join(' or ')
         } closes the trade.`,
       });
     }
     if (exit.longExit) {
-      longSignalExit = describeGroup(exit.longExit, "Close the long at the next candle's open");
-      if (exit.shortExit) shortSignalExit = describeGroup(exit.shortExit, "Cover the short at the next candle's open");
+      longSignalExit = describeGroup(exit.longExit, "Close the long at the next candle's open", false);
+      if (exit.shortExit) shortSignalExit = describeGroup(exit.shortExit, "Cover the short at the next candle's open", false);
       bullets.push({
-        title: 'Indicator-reversal exit',
-        text: 'Positions are also closed when the indicators turn against the trade (rules listed below).',
+        title: 'Trigger-reversal exit',
+        text: 'A trade is also closed when its own entry trigger flips to the opposite side (rule listed below).',
       });
     }
+  }
+
+  if (genome.maxBarsInTrade !== null) {
+    bullets.push({
+      title: 'Time stop',
+      text: `A trade still open after ${genome.maxBarsInTrade} candles is closed at the next candle's open.`,
+    });
   }
 
   if (hasShorts) {
@@ -347,20 +394,27 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
 
   if (sizing.mode === 'full') {
     bullets.push({
-      title: 'Position size',
+      title: 'Position size (run setting)',
       text: '100% of account equity on every trade (profits are compounded, no leverage).',
     });
   } else {
     const risk = fmt(sizing.riskPct, 2);
+    const base = sizing.compounding ? 'current equity' : 'the starting capital (no compounding)';
     bullets.push({
-      title: 'Position size',
+      title: 'Position size (run setting)',
       text:
-        exit.mode === 'dynamic'
-          ? `ATR volatility sizing: each trade risks ${risk}% of equity. Size = ${risk}% ÷ (${mult(exit.stopAtrMult)} × ATR(${exit.atrPeriod}) ÷ price), capped at 100% of equity – larger positions in calm markets, smaller ones in volatile markets.`
-          : `Fixed-fractional sizing: each trade risks ${risk}% of equity. Size = ${risk}% ÷ ${fmt(exit.stopLossPct, 1)}% stop = ${fmt(
-              Math.min(100, (sizing.riskPct / exit.stopLossPct) * 100),
-              0,
-            )}% of equity per trade.`,
+        `Each trade risks ${risk}% of ${base} at the stop: size = risk ÷ stop distance` +
+        (exit.mode === 'dynamic'
+          ? ` (${mult(exit.stopAtrMult)} × ATR(${exit.atrPeriod})), so positions shrink when volatility rises.`
+          : ` (${fmt(exit.stopLossPct, 1)}% of price).`) +
+        ' Exposure is capped at 1× equity – no leverage.',
+    });
+  }
+
+  if (settings.fundingPctPerBar > 0) {
+    bullets.push({
+      title: 'Funding',
+      text: `Every open position pays ${trimPct(settings.fundingPctPerBar)}% of its notional per candle as perpetual funding.`,
     });
   }
 
@@ -398,10 +452,10 @@ export function exitTags(genome: StrategyGenome): string[] {
   const tags: string[] = [];
   if (genome.exit.mode === 'dynamic') {
     if (genome.exit.trailing) tags.push('Trailing');
-    if (genome.exit.longExit) tags.push('Signal exit');
+    if (genome.exit.longExit) tags.push('Reversal exit');
     if (genome.exit.takeProfitAtrMult === null) tags.push('No target');
   }
-  if (genome.sizing.mode === 'risk') tags.push('Vol-sized');
+  if (genome.maxBarsInTrade !== null) tags.push(`${genome.maxBarsInTrade}-bar time stop`);
   return tags;
 }
 
@@ -517,7 +571,6 @@ export function listIndicators(genome: StrategyGenome): IndicatorUsage[] {
     const stop = `${exit.trailing ? 'trailing stop' : 'stop'} ×${mult(exit.stopAtrMult)}`;
     const target = exit.takeProfitAtrMult !== null ? ` · target ×${mult(exit.takeProfitAtrMult)}` : '';
     add('ATR', `period ${exit.atrPeriod} · ${stop}${target}`, 'Stop / target');
-    if (genome.sizing.mode === 'risk') add('ATR', `period ${exit.atrPeriod} · ${stop}${target}`, 'Position sizing');
   }
   return [...byKey.values()];
 }

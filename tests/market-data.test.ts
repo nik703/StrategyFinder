@@ -89,6 +89,7 @@ describe('market-data function', () => {
     const body = (await response.json()) as MarketDataResponse;
     const series = body.series['BTC-USD'];
     expect(series.source).toBe('binance');
+    expect(series.venueSymbol).toBe('BTCUSDT'); // BTC-USD is routed to the USDT pair on Binance
     // 365 days of 4h candles = 2190 → three pages of 1000.
     expect(fetchMock.mock.calls.length).toBe(3);
     expect(series.t.length).toBeGreaterThan(2180);
@@ -151,6 +152,7 @@ describe('market-data function', () => {
     const ok = (await (await call('?symbols=DOGE-USDT&interval=1d&range=1y')).json()) as MarketDataResponse;
     expect(ok.series['DOGE-USDT'].source).toBe('yahoo');
     expect(ok.series['DOGE-USDT'].symbol).toBe('DOGE-USDT');
+    expect(ok.series['DOGE-USDT'].venueSymbol).toBe('DOGE-USD');
     expect(ok.series['DOGE-USDT'].t).toHaveLength(2);
 
     mockFetch(() => jsonResponse({ chart: { error: { code: 'Not Found', description: 'No data found' }, result: null } }, 404));

@@ -147,8 +147,14 @@ function aggregate(candles: Candle[], bucketMs: number): Candle[] {
   return out;
 }
 
-function toSeries(symbol: string, source: CandleSeries['source'], candles: Candle[], note?: string): CandleSeries {
-  const series: CandleSeries = { symbol, source, t: [], o: [], h: [], l: [], c: [], v: [] };
+function toSeries(
+  symbol: string,
+  source: CandleSeries['source'],
+  candles: Candle[],
+  venueSymbol: string,
+  note?: string,
+): CandleSeries {
+  const series: CandleSeries = { symbol, source, venueSymbol, t: [], o: [], h: [], l: [], c: [], v: [] };
   for (const candle of candles) {
     // Guarantee a self-consistent candle even if the upstream feed is slightly off.
     const high = Math.max(candle.h, candle.o, candle.c);
@@ -216,7 +222,7 @@ async function fetchBinance(
     }
   }
   if (candles.length === 0) throw new UpstreamError(`Binance returned no candles for ${pair}`);
-  return toSeries(symbol, 'binance', sortAndDedupe(candles));
+  return toSeries(symbol, 'binance', sortAndDedupe(candles), pair);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -300,7 +306,7 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
     intraday && requestedDays > YAHOO_INTRADAY_MAX_DAYS
       ? `Yahoo Finance limits intraday history to ~${YAHOO_INTRADAY_MAX_DAYS} days.`
       : undefined;
-  return toSeries(symbol, 'yahoo', clean, note);
+  return toSeries(symbol, 'yahoo', clean, symbol, note);
 }
 
 /* -------------------------------------------------------------------------- */
