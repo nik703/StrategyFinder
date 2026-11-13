@@ -311,14 +311,14 @@ export default function ControlBar({ config, onChange, status, onStart, onStop }
           className="w-[92px]"
         />
         <NumberField
-          label="Stop after stagnant iterations"
+          label="Stagnation limit"
           value={config.maxStagnation}
           min={MIN_MAX_STAGNATION}
           max={MAX_MAX_STAGNATION}
           step={500}
           onChange={(maxStagnation) => onChange({ maxStagnation: Math.round(maxStagnation) })}
           disabled={busy}
-          className="w-[210px]"
+          className="w-[124px]"
         />
         <div>
           <FieldLabel>Mode</FieldLabel>
