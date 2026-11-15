@@ -216,7 +216,13 @@ function emitGroup(
 /*  Script assembly                                                           */
 /* -------------------------------------------------------------------------- */
 
-const TV_INTERVAL: Record<Interval, string> = { '1h': '1 hour', '4h': '4 hours', '1d': '1 day' };
+const TV_INTERVAL: Record<Interval, string> = {
+  '15m': '15 minute',
+  '30m': '30 minute',
+  '1h': '1 hour',
+  '4h': '4 hour',
+  '1d': '1 day',
+};
 
 /** Generate a complete Pine Script v5 strategy for `result`. */
 export function generatePineScript(result: StrategyResult, ctx: PineContext): string {

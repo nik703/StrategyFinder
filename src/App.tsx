@@ -31,8 +31,10 @@ import {
 } from './lib/config';
 import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
 import { datasetFingerprint, holdoutViews, recordHoldoutView } from './lib/holdoutLog';
+import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
+  clampRange,
   DEFAULT_CRYPTO_UNIVERSE,
   DEFAULT_STOCK_UNIVERSE,
   type BenchmarkResult,
@@ -98,6 +100,9 @@ const COMPARISON_ROWS: ComparisonRow[] = [
 
 export default function App(): JSX.Element {
   const [config, setConfig] = useState<RunConfig>(DEFAULT_CONFIG);
+  const [savedTickers, setSavedTickers] = useState<string[]>(loadSavedTickers);
+  const saveTickers = useCallback((symbols: string[]) => setSavedTickers((current) => addSavedTickers(current, symbols)), []);
+  const forgetTicker = useCallback((symbol: string) => setSavedTickers((current) => removeSavedTicker(current, symbol)), []);
   const [status, setStatus] = useState<EngineStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<ProgressSnapshot>(EMPTY_TELEMETRY);
@@ -147,6 +152,8 @@ export default function App(): JSX.Element {
   const updateConfig = useCallback((patch: Partial<RunConfig>) => {
     setConfig((current) => {
       const next = { ...current, ...patch };
+      // Short timeframes can only load a limited history: clamp the range when the timeframe changes.
+      next.range = clampRange(next.interval, next.range);
       if (patch.symbol !== undefined && isCrypto(patch.symbol) !== isCrypto(current.symbol)) {
         next.robustUniverse = isCrypto(patch.symbol); // on by default for crypto, off for stocks
         if (DEFAULT_UNIVERSES.includes(current.universe.trim())) next.universe = defaultUniverse(patch.symbol);
@@ -231,6 +238,8 @@ export default function App(): JSX.Element {
       setError(universe.error);
       return;
     }
+    // Remember the custom tickers of this run so they never have to be typed again.
+    saveTickers(assets.components.map((component) => component.symbol));
     disposeWorker();
     const runId = ++runIdRef.current;
     finishedRef.current = false;
@@ -329,7 +338,7 @@ export default function App(): JSX.Element {
       setError(cause instanceof Error ? cause.message : 'Could not start the optimisation.');
       setStatus('error');
     }
-  }, [config, disposePool, disposeWorker, handleMessage]);
+  }, [config, disposePool, disposeWorker, handleMessage, saveTickers]);
 
   const stop = useCallback(() => {
     if (status === 'optimizing' && workerRef.current) {
@@ -436,6 +445,9 @@ export default function App(): JSX.Element {
       <ControlBar
         config={config}
         onChange={updateConfig}
+        savedTickers={savedTickers}
+        onSaveTickers={saveTickers}
+        onRemoveTicker={forgetTicker}
         status={status}
         onStart={() => void start()}
         onStop={stop}

@@ -11,7 +11,7 @@
  * Timestamps use the same normalisation as the market-data function.
  */
 
-import { INTERVAL_MS, RANGE_DAYS, type CandleSeries, type HistoryRange, type Interval } from '../types/trading';
+import { INTERVAL_MS, RANGE_DAYS, YAHOO_MAX_DAYS, type CandleSeries, type HistoryRange, type Interval } from '../types/trading';
 
 interface AssetProfile {
   /** Approximate price of the most recent candle. */
@@ -98,7 +98,9 @@ function profileFor(symbol: string): AssetProfile {
 function buildCalendar(crypto: boolean, interval: Interval, range: HistoryRange, now: number): number[] {
   const step = INTERVAL_MS[interval];
   const lastOpen = Math.floor(now / step) * step - step; // last fully closed bar
-  const start = Math.floor((now - RANGE_DAYS[range] * DAY_MS) / step) * step;
+  // Stocks get no more history than Yahoo Finance would serve for this timeframe.
+  const days = crypto ? RANGE_DAYS[range] : Math.min(RANGE_DAYS[range], YAHOO_MAX_DAYS[interval]);
+  const start = Math.floor((now - days * DAY_MS) / step) * step;
   const times: number[] = [];
   for (let t = start; t <= lastOpen; t += step) {
     if (!crypto) {
@@ -107,14 +109,20 @@ function buildCalendar(crypto: boolean, interval: Interval, range: HistoryRange,
       if (interval !== '1d') {
         // US cash session expressed in the function's normalised UTC buckets.
         const hour = new Date(t).getUTCHours();
+        const minuteOfDay = hour * 60 + new Date(t).getUTCMinutes();
         if (interval === '1h' && (hour < 13 || hour > 19)) continue;
         if (interval === '4h' && hour !== 12 && hour !== 16) continue;
+        // 15m / 30m: 13:30–20:00 UTC (09:30–16:00 New York, ignoring daylight saving).
+        if ((interval === '15m' || interval === '30m') && (minuteOfDay < 810 || minuteOfDay >= 1200)) continue;
       }
     }
     times.push(t);
   }
   return times;
 }
+
+/** Candles per trading day for session-based assets (6.5-hour US session). */
+const STOCK_BARS_PER_DAY: Record<Interval, number> = { '15m': 26, '30m': 13, '1h': 7, '4h': 2, '1d': 1 };
 
 /* -------------------------------------------------------------------------- */
 /*  Generator                                                                 */
@@ -145,7 +153,7 @@ export function generateSyntheticCandles(
 
   const rng = mulberry32(hashString(`${symbol}|${interval}`));
   const factorSeed = hashString(profile.crypto ? 'crypto-factor' : 'equity-factor');
-  const barsPerDay = profile.crypto ? DAY_MS / INTERVAL_MS[interval] : interval === '1d' ? 1 : interval === '1h' ? 7 : 2;
+  const barsPerDay = profile.crypto ? DAY_MS / INTERVAL_MS[interval] : STOCK_BARS_PER_DAY[interval];
   const barsPerYear = barsPerDay * (profile.crypto ? 365 : 252);
   const dt = 1 / barsPerYear;
   const baseSigma = profile.vol * Math.sqrt(dt);

@@ -37,7 +37,7 @@ const settingsFor = (tradeMode: BacktestSettings['tradeMode']): BacktestSettings
   fundingPctPerBar: 0,
 });
 
-function dataset(symbol: string, interval: '1h' | '4h' | '1d', range: '1y' | '2y' | '5y'): NamedDataset {
+function dataset(symbol: string, interval: '15m' | '30m' | '1h' | '4h' | '1d', range: '1y' | '2y' | '5y'): NamedDataset {
   const series = generateSyntheticCandles(symbol, interval, range, Date.UTC(2026, 0, 15));
   return { symbol, data: buildDataset({ [symbol]: series }, [{ symbol, weight: 1 }]).data };
 }
@@ -340,6 +340,21 @@ describe('optimizer worker', () => {
     // Progress is still streamed every 25 iterations even though rounds are 75 candidates long.
     const progress = ofType(pooled, 'progress');
     progress.slice(0, -1).forEach((p, index) => expect(p.iteration).toBe((index + 1) * PROGRESS_EVERY));
+  }, 300_000);
+
+  it('runs on 15m and 30m candles', async () => {
+    for (const [symbol, interval, range] of [['SOL-USD', '30m', '1y'], ['AAPL', '15m', '1y']] as const) {
+      const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxStagnation: 300 });
+      const done = messages[messages.length - 1] as Of<'done'>;
+      expect(done.type, `${symbol} ${interval}`).toBe('done');
+      expect(done.reason).toBe('converged');
+      expect(done.strategies.length).toBeGreaterThan(0);
+      for (const s of done.strategies) expect(s.holdout).not.toBeNull();
+      const ready = messages[0] as Of<'ready'>;
+      // 30m crypto over a year: 17,520 candles; 15m stock: Yahoo's 60-day window.
+      if (interval === '30m') expect(ready.axis.bars).toBeGreaterThan(17_000);
+      else expect(ready.axis.bars).toBeLessThan(1_200);
+    }
   }, 300_000);
 
   it('reports an error instead of crashing on unusable data', async () => {

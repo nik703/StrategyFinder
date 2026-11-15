@@ -10,14 +10,16 @@
 /*  Market data                                                               */
 /* -------------------------------------------------------------------------- */
 
-export type Interval = '1h' | '4h' | '1d';
+export type Interval = '15m' | '30m' | '1h' | '4h' | '1d';
 export type HistoryRange = '1y' | '2y' | '5y';
 export type DataSource = 'binance' | 'yahoo' | 'synthetic';
 
-export const INTERVALS: readonly Interval[] = ['1h', '4h', '1d'];
+export const INTERVALS: readonly Interval[] = ['15m', '30m', '1h', '4h', '1d'];
 export const HISTORY_RANGES: readonly HistoryRange[] = ['1y', '2y', '5y'];
 
 export const INTERVAL_MS: Record<Interval, number> = {
+  '15m': 900_000,
+  '30m': 1_800_000,
   '1h': 3_600_000,
   '4h': 14_400_000,
   '1d': 86_400_000,
@@ -27,6 +29,41 @@ export const RANGE_DAYS: Record<HistoryRange, number> = {
   '1y': 365,
   '2y': 730,
   '5y': 1826,
+};
+
+/**
+ * Longest history each timeframe may load. Short timeframes are capped at roughly
+ * 35,000 crypto candles: beyond that the download outgrows a serverless response
+ * and every backtest gets proportionally slower.
+ */
+export const MAX_RANGE: Record<Interval, HistoryRange> = {
+  '15m': '1y',
+  '30m': '2y',
+  '1h': '5y',
+  '4h': '5y',
+  '1d': '5y',
+};
+
+/** True when `range` is allowed for `interval`. */
+export function rangeAllowed(interval: Interval, range: HistoryRange): boolean {
+  return RANGE_DAYS[range] <= RANGE_DAYS[MAX_RANGE[interval]];
+}
+
+/** The longest allowed range that does not exceed `range`. */
+export function clampRange(interval: Interval, range: HistoryRange): HistoryRange {
+  return rangeAllowed(interval, range) ? range : MAX_RANGE[interval];
+}
+
+/**
+ * How far back Yahoo Finance serves each timeframe (stocks, ETFs and the crypto fallback).
+ * Sub-hour data only covers the last 60 days; hourly data about two years.
+ */
+export const YAHOO_MAX_DAYS: Record<Interval, number> = {
+  '15m': 59,
+  '30m': 59,
+  '1h': 729,
+  '4h': 729,
+  '1d': 100_000,
 };
 
 /**

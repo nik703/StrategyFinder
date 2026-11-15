@@ -23,7 +23,7 @@ export function FieldLabel({ children, htmlFor }: { children: ReactNode; htmlFor
 /* -------------------------------------------------------------------------- */
 
 interface SegmentedProps<T extends string> {
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; disabled?: boolean; title?: string }[];
   value: T;
   onChange: (value: T) => void;
   ariaLabel: string;
@@ -54,12 +54,15 @@ export function Segmented<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
-            disabled={disabled}
+            title={option.title}
+            disabled={disabled || option.disabled}
             onClick={() => onChange(option.value)}
             className={cx(
               'rounded-md font-medium transition-colors disabled:cursor-not-allowed',
               size === 'sm' ? 'px-2.5 py-1 text-xs' : 'px-3 py-1.5 text-sm',
               active ? 'bg-raised text-ink shadow-sm ring-1 ring-line-strong' : 'text-ink-3 hover:text-ink-2',
+              // An option that is unavailable on its own (not just while the whole control is locked).
+              option.disabled && !active && 'opacity-35 hover:text-ink-3',
             )}
           >
             {option.label}

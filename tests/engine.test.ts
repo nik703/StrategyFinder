@@ -53,7 +53,9 @@ import { atr, bollinger, ema, IndicatorCache, rsi, sma, stochastic, supertrend }
 import { generatePineScript } from '../src/engine/pine';
 import { deflatedSharpe, expectedMaxSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
 import {
+  clampRange,
   HOLDOUT_FRACTION,
+  rangeAllowed,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
   type BacktestSettings,
@@ -1104,6 +1106,41 @@ describe('fallback data and baskets', () => {
     const btc = generateSyntheticCandles('BTC-USD', '1h', '1y', NOW);
     expect(btc.t.length).toBeGreaterThan(8700);
     expect(generateSyntheticCandles('SPY', '1d', '1y', NOW).t.length).toBeGreaterThan(250);
+  });
+
+  it('generates 15m and 30m candles: 24/7 for crypto, the US session over the 60-day Yahoo window for stocks', () => {
+    const btc = generateSyntheticCandles('BTC-USD', '15m', '1y', NOW);
+    expect(btc.t.length).toBeGreaterThan(35_000);
+    expect(btc.t[1] - btc.t[0]).toBe(15 * 60_000);
+
+    for (const [interval, perDay] of [['15m', 26], ['30m', 13]] as const) {
+      const spy = generateSyntheticCandles('SPY', interval, '1y', NOW);
+      const days = new Set<number>();
+      for (const t of spy.t) {
+        const d = new Date(t);
+        expect([1, 2, 3, 4, 5]).toContain(d.getUTCDay());
+        const minute = d.getUTCHours() * 60 + d.getUTCMinutes();
+        expect(minute).toBeGreaterThanOrEqual(13 * 60 + 30);
+        expect(minute).toBeLessThan(20 * 60);
+        days.add(Math.floor(t / 86_400_000));
+      }
+      expect(spy.t.length).toBe(days.size * perDay);
+      expect(NOW - spy.t[0]).toBeLessThanOrEqual(60 * 86_400_000);
+      expect(days.size).toBeGreaterThan(35);
+      for (let i = 0; i < spy.t.length; i++) expect(spy.h[i]).toBeGreaterThanOrEqual(Math.max(spy.o[i], spy.c[i]));
+    }
+  });
+
+  it('limits how much history short timeframes may load', () => {
+    expect(rangeAllowed('15m', '1y')).toBe(true);
+    expect(rangeAllowed('15m', '2y')).toBe(false);
+    expect(rangeAllowed('30m', '2y')).toBe(true);
+    expect(rangeAllowed('30m', '5y')).toBe(false);
+    for (const interval of ['1h', '4h', '1d'] as const) expect(rangeAllowed(interval, '5y')).toBe(true);
+    expect(clampRange('15m', '5y')).toBe('1y');
+    expect(clampRange('30m', '5y')).toBe('2y');
+    expect(clampRange('30m', '1y')).toBe('1y');
+    expect(clampRange('1d', '5y')).toBe('5y');
   });
 
   it('normalises basket weights to 100%', () => {

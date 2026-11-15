@@ -11,7 +11,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 /** Binance kline rows covering [startTime, endTime] for the requested interval. */
 function binanceRows(url: URL): unknown[] {
-  const step = { '1h': HOUR, '4h': 4 * HOUR, '1d': DAY }[url.searchParams.get('interval') as '1h' | '4h' | '1d'];
+  const step = { '15m': HOUR / 4, '30m': HOUR / 2, '1h': HOUR, '4h': 4 * HOUR, '1d': DAY }[
+    url.searchParams.get('interval') as '15m' | '30m' | '1h' | '4h' | '1d'
+  ];
   const start = Number(url.searchParams.get('startTime'));
   const end = Number(url.searchParams.get('endTime'));
   const limit = Number(url.searchParams.get('limit'));
@@ -139,7 +141,7 @@ describe('market-data function', () => {
     expect(series.h).toEqual([104, 108]);
     expect(series.l).toEqual([99, 102]);
     expect(series.v).toEqual([3000, 4000]);
-    expect(series.note).toContain('intraday history');
+    expect(series.note).toContain('Yahoo Finance limits 4h history to the last ~730 days');
   });
 
   it('falls back from Binance to Yahoo for crypto, and reports total failure as 502', async () => {
@@ -161,6 +163,43 @@ describe('market-data function', () => {
     const body = (await failed.json()) as MarketDataResponse;
     expect(Object.keys(body.series)).toHaveLength(0);
     expect(Object.keys(body.errors).sort()).toEqual(['NOPE', 'SPY']);
+  });
+
+  it('serves 15m crypto from Binance and refuses ranges that are too long for the timeframe', async () => {
+    const fetchMock = mockFetch((url) => jsonResponse(binanceRows(url)));
+    const response = await call('?symbols=ETH-USD&interval=15m&range=1y');
+    expect(fetchMock.mock.calls.every(([input]) => new URL(String(input)).searchParams.get('interval') === '15m')).toBe(true);
+    expect(response.status).toBe(200);
+    const series = ((await response.json()) as MarketDataResponse).series['ETH-USD'];
+    // 365 days of 15-minute candles = 35,040 → 36 pages of 1,000.
+    expect(fetchMock.mock.calls.length).toBe(36);
+    expect(series.t.length).toBeGreaterThan(35_000);
+    for (let i = 1; i < series.t.length; i++) expect(series.t[i] - series.t[i - 1]).toBe(15 * 60_000);
+
+    for (const [interval, range] of [['15m', '2y'], ['15m', '5y'], ['30m', '5y']]) {
+      const refused = await call(`?symbols=ETH-USD&interval=${interval}&range=${range}`);
+      expect(refused.status).toBe(400);
+      expect(((await refused.json()) as { error: string }).error).toContain(`${interval} candles are limited to`);
+    }
+    expect((await call('?symbols=ETH-USD&interval=30m&range=2y')).status).toBe(200);
+  });
+
+  it('asks Yahoo for 30m stock candles over its 60-day window and buckets them on the half hour', async () => {
+    const day = Date.UTC(2025, 5, 2);
+    const stamps = [13.5, 14, 14.5, 15].map((h) => (day + h * HOUR) / 1000 + 7); // a few seconds past the bucket
+    let period1 = 0;
+    mockFetch((url) => {
+      expect(url.searchParams.get('interval')).toBe('30m');
+      period1 = Number(url.searchParams.get('period1'));
+      return jsonResponse(yahooBody(stamps));
+    });
+    const response = await call('?symbols=AAPL&interval=30m&range=1y');
+    const body = (await response.json()) as MarketDataResponse;
+    const days = (body.generatedAt / 1000 - period1) / 86_400;
+    expect(days).toBeGreaterThan(58);
+    expect(days).toBeLessThan(60);
+    expect(body.series.AAPL.t).toEqual([13.5, 14, 14.5, 15].map((h) => day + h * HOUR));
+    expect(body.series.AAPL.note).toContain('last ~60 days');
   });
 
   it('returns partial results when only some symbols fail', async () => {

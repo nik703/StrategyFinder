@@ -26,6 +26,10 @@ Other commands:
 | `npm run build` | Type-check, then build to `dist/`. |
 | `npm run preview` | Serve the production build locally. |
 
+**Saved tickers.** A custom ticker is remembered once you run it, or press Enter in a ticker field.
+Saved tickers appear as one-click chips next to the presets and as autocomplete suggestions; the × on a
+chip forgets it. They are stored in the browser's `localStorage`.
+
 **Works offline.** If the function is unreachable, or Yahoo / Binance fail or rate-limit, the app switches to
 a built-in OHLCV generator and labels the run **Simulated** in amber. Simulated prices contain artificial
 trend regimes, so results on them are illustrative only.
@@ -69,14 +73,16 @@ timeout is irrelevant to optimisation.
 | Parameter | Values |
 | --- | --- |
 | `symbols` | Comma-separated tickers, up to 10. `BASE-USD` pairs go to Binance, falling back to Yahoo. Everything else goes to Yahoo. |
-| `interval` | `1h`, `4h`, `1d` |
+| `interval` | `15m`, `30m`, `1h`, `4h`, `1d` |
 | `range` | `1y`, `2y`, `5y` |
 
 The response is columnar JSON with CORS headers: `{ interval, range, generatedAt, series: { SYMBOL: { symbol,
 source, venueSymbol, t, o, h, l, c, v } }, errors }`. `t` is the bar open time in UTC milliseconds, normalised so venues
 line up: daily bars sit at 00:00 UTC of the exchange-local date, hourly bars at the top of the hour, and 4h
-bars in UTC-aligned buckets. Yahoo serves hourly history for about 730 days only, so `1h` / `4h` stock
-requests longer than that are truncated (the response carries a `note`).
+bars in UTC-aligned buckets. `15m` loads at most `1y` and `30m` at most `2y` (about 35,000 crypto
+candles; longer requests get a 400). Yahoo serves 15m / 30m history for the last 60 days only and hourly
+history for about 730 days, so stock requests longer than that are shortened (the response carries a
+`note`). Crypto pairs come from Binance and get the full range.
 
 ### Backtester
 

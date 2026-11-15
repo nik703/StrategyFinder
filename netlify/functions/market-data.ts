@@ -9,32 +9,43 @@
  *   • Stocks, ETFs and indices → Yahoo Finance chart API.
  *
  * Timestamps are normalised to the bar OPEN time in UTC milliseconds:
- *   • 1d → 00:00 UTC of the exchange-local trading date
- *   • 1h → top of the hour
- *   • 4h → UTC-aligned 4-hour buckets (00, 04, 08, 12, 16, 20)
+ *   • 1d       → 00:00 UTC of the exchange-local trading date
+ *   • 15m, 30m → start of the UTC 15- / 30-minute bucket
+ *   • 1h       → top of the hour
+ *   • 4h       → UTC-aligned 4-hour buckets (00, 04, 08, 12, 16, 20)
  * so series from different venues line up when they are combined into a basket.
+ *
+ * Limits: 15m loads at most 1y and 30m at most 2y (about 35,000 crypto candles).
+ * Yahoo Finance only serves 15m / 30m candles for the last 60 days and hourly
+ * candles for about two years, so stock requests are shortened and carry a `note`.
  *
  * The function only proxies and normalises data. All backtesting happens in the
  * browser, so the serverless execution limit is never a concern.
  */
 
 import type { Context } from '@netlify/functions';
-import type { CandleSeries, HistoryRange, Interval, MarketDataResponse } from '../../src/types/trading';
+import {
+  INTERVAL_MS,
+  RANGE_DAYS,
+  rangeAllowed,
+  MAX_RANGE,
+  YAHOO_MAX_DAYS,
+  type CandleSeries,
+  type HistoryRange,
+  type Interval,
+  type MarketDataResponse,
+} from '../../src/types/trading';
 
 /* -------------------------------------------------------------------------- */
 /*  Configuration                                                             */
 /* -------------------------------------------------------------------------- */
 
-const INTERVAL_MS: Record<Interval, number> = { '1h': 3_600_000, '4h': 14_400_000, '1d': 86_400_000 };
-const RANGE_DAYS: Record<HistoryRange, number> = { '1y': 365, '2y': 730, '5y': 1826 };
 const DAY_MS = 86_400_000;
 
 const BINANCE_KLINES = 'https://data-api.binance.vision/api/v3/klines';
 const BINANCE_PAGE = 1000;
 const BINANCE_CONCURRENCY = 8;
 const YAHOO_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
-/** Yahoo only serves hourly candles for roughly the last 730 days. */
-const YAHOO_INTRADAY_MAX_DAYS = 729;
 
 const MAX_SYMBOLS = 10;
 const UPSTREAM_TIMEOUT_MS = 8000;
@@ -266,11 +277,14 @@ async function fetchYahooChart(symbol: string, query: string): Promise<YahooChar
 async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRange, now: number): Promise<CandleSeries> {
   const intraday = interval !== '1d';
   const requestedDays = RANGE_DAYS[range];
-  const days = intraday ? Math.min(requestedDays, YAHOO_INTRADAY_MAX_DAYS) : requestedDays;
+  const maxDays = YAHOO_MAX_DAYS[interval];
+  const days = Math.min(requestedDays, maxDays);
   const period1 = Math.floor((now - days * DAY_MS) / 1000);
   const period2 = Math.floor(now / 1000);
   // 4h candles are built from hourly candles so they align with Binance's UTC buckets.
-  const query = `period1=${period1}&period2=${period2}&interval=${intraday ? '1h' : '1d'}&includePrePost=false&events=div%2Csplits`;
+  const yahooInterval = interval === '4h' ? '1h' : interval;
+  const bucket = INTERVAL_MS[yahooInterval];
+  const query = `period1=${period1}&period2=${period2}&interval=${yahooInterval}&includePrePost=false&events=div%2Csplits`;
 
   const body = await fetchYahooChart(symbol, query);
   const chartError = body.chart?.error;
@@ -292,8 +306,8 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
     if (typeof ts !== 'number' || !isPrice(o) || !isPrice(h) || !isPrice(l) || !isPrice(c)) continue;
     const ms = ts * 1000;
     const t = intraday
-      ? // Hourly: floor to the top of the hour (US sessions start at :30).
-        Math.floor(ms / INTERVAL_MS['1h']) * INTERVAL_MS['1h']
+      ? // Intraday: floor to the start of the UTC bucket (hourly bars of US sessions start at :30).
+        Math.floor(ms / bucket) * bucket
       : // Daily: 00:00 UTC of the exchange-local trading date.
         Math.floor((ms + offsetMs) / DAY_MS) * DAY_MS;
     candles.push({ t, o, h, l, c, v: typeof v === 'number' && Number.isFinite(v) ? v : 0 });
@@ -303,8 +317,8 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
   let clean = sortAndDedupe(candles);
   if (interval === '4h') clean = aggregate(clean, INTERVAL_MS['4h']);
   const note =
-    intraday && requestedDays > YAHOO_INTRADAY_MAX_DAYS
-      ? `Yahoo Finance limits intraday history to ~${YAHOO_INTRADAY_MAX_DAYS} days.`
+    intraday && requestedDays > maxDays
+      ? `Yahoo Finance limits ${interval} history to the last ~${maxDays + 1} days.`
       : undefined;
   return toSeries(symbol, 'yahoo', clean, symbol, note);
 }
@@ -341,7 +355,7 @@ function parseSymbols(raw: string): string[] {
   return [...unique];
 }
 
-const isInterval = (x: string): x is Interval => x === '1h' || x === '4h' || x === '1d';
+const isInterval = (x: string): x is Interval => x === '15m' || x === '30m' || x === '1h' || x === '4h' || x === '1d';
 const isRange = (x: string): x is HistoryRange => x === '1y' || x === '2y' || x === '5y';
 
 export default async function handler(request: Request, _context?: Context): Promise<Response> {
@@ -357,8 +371,11 @@ export default async function handler(request: Request, _context?: Context): Pro
   if (symbols.length > MAX_SYMBOLS) return json(400, { error: `At most ${MAX_SYMBOLS} symbols per request.` });
   const invalid = symbols.filter((symbol) => !SYMBOL_PATTERN.test(symbol));
   if (invalid.length > 0) return json(400, { error: `Invalid symbol(s): ${invalid.join(', ')}` });
-  if (!isInterval(interval)) return json(400, { error: 'Invalid "interval". Use one of: 1h, 4h, 1d.' });
+  if (!isInterval(interval)) return json(400, { error: 'Invalid "interval". Use one of: 15m, 30m, 1h, 4h, 1d.' });
   if (!isRange(range)) return json(400, { error: 'Invalid "range". Use one of: 1y, 2y, 5y.' });
+  if (!rangeAllowed(interval, range)) {
+    return json(400, { error: `${interval} candles are limited to ${MAX_RANGE[interval]} of history.` });
+  }
 
   const now = Date.now();
   const body: MarketDataResponse = { interval, range, generatedAt: now, series: {}, errors: {} };
