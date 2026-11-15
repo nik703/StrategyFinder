@@ -11,10 +11,9 @@
 import { ChevronDown, ChevronsUpDown, ChevronUp, Lock, Trophy } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
-import { MIN_TRADES, MIN_TRADES_PER_YEAR, MIN_VALIDATION_TRADES } from '../engine/backtester';
 import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
 import { overfittingRisk } from '../lib/risk';
-import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type Verdict } from '../types/trading';
+import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type TradeGates, type Verdict } from '../types/trading';
 import { cx, Panel, Pill } from './ui';
 
 interface LeaderboardProps {
@@ -24,6 +23,10 @@ interface LeaderboardProps {
   lockedId: string | null;
   onSelect: (strategy: StrategyResult) => void;
   status: EngineStatus;
+  /** The run's minimum-trade gates (null before the data has loaded). */
+  gates: TradeGates | null;
+  /** True when the gates apply to trades pooled over every asset. */
+  pooled: boolean;
 }
 
 type SortKey =
@@ -285,7 +288,11 @@ const COLUMNS: Column[] = [
   },
 ];
 
-export default function Leaderboard({ strategies, selectedId, lockedId, onSelect, status }: LeaderboardProps): JSX.Element {
+export default function Leaderboard({ strategies, selectedId, lockedId, onSelect, status, gates, pooled }: LeaderboardProps): JSX.Element {
+  const gateText =
+    gates === null
+      ? null
+      : `at least ${fmtInt(gates.search)} trades (${fmtInt(gates.validation)} in validation) and ${fmtNum(gates.perYear, 0)} trades a year${pooled ? ', pooled over the assets' : ' on every asset'}`;
   const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
 
   const rows = useMemo<Row[]>(() => {
@@ -342,9 +349,11 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
           </p>
           <p className="mt-1 text-xs text-ink-3">
             {status === 'optimizing' || status === 'loading'
-              ? `Only strategies with at least ${MIN_TRADES} trades (${MIN_VALIDATION_TRADES} in validation) and ${MIN_TRADES_PER_YEAR} trades a year on every asset can be listed.`
+              ? gateText
+                ? `Only strategies with ${gateText} can be listed.`
+                : 'Loading market data…'
               : status === 'converged' || status === 'stopped'
-                ? `Every candidate had fewer than ${MIN_TRADES} trades, ${MIN_VALIDATION_TRADES} validation trades or ${MIN_TRADES_PER_YEAR} trades a year. Daily candles over 1–2 years rarely allow that many: try 4h or 1h candles, or a longer history.`
+                ? `No candidate had ${gateText ?? 'enough trades'}. Try a longer history, shorter candles, or pool several assets.`
                 : 'Configure an asset above and press Start Optimization.'}
           </p>
         </div>

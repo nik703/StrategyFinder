@@ -12,6 +12,7 @@
  * The script is plain ASCII so it survives any clipboard / editor round-trip.
  */
 
+import { SLOPE_LAG } from '../types/trading';
 import type {
   BacktestSettings,
   BasketComponent,
@@ -175,6 +176,16 @@ function operands(c: Condition, decl: Declarations): { left: string; right: stri
       decl.add(name, `${name} = ta.cci(hlc3, ${c.period})`);
       return { left: name, right: String(c.level) };
     }
+    case 'DONCHIAN': {
+      // Channel of the PREVIOUS candles: the current candle is excluded, as in StrategyFinder.
+      const name = c.variant === 'upper' ? `donchianHigh_${c.period}` : `donchianLow_${c.period}`;
+      decl.add(name, c.variant === 'upper' ? `${name} = ta.highest(high, ${c.period})[1]` : `${name} = ta.lowest(low, ${c.period})[1]`);
+      return { left: 'close', right: name };
+    }
+    case 'MA_SLOPE': {
+      const ma = maVar(decl, c.maType, c.period);
+      return { left: ma, right: `${ma}[${SLOPE_LAG}]` };
+    }
   }
   throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
 }
@@ -286,8 +297,9 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     `//    Buy & Hold   : ROI ${signed(ctx.benchmarkRoi)}% over train + validation`,
     '//',
     '//  Notes',
-    '//   - use_bar_magnifier=true resolves candles that touch both the stop and the target with',
-    '//     lower-timeframe data. It needs a TradingView Premium plan; remove it on other plans.',
+    '//   - use_bar_magnifier=false so the script compiles on every TradingView plan. Premium users can',
+    '//     set it to true in the strategy() call to resolve candles that touch both the stop and the',
+    '//     target with lower-timeframe data (StrategyFinder assumes the stop fills first).',
     "//   - Orders are placed on bar close and filled at the next bar's open, exactly as in StrategyFinder.",
     '//   - Fee and slippage are both charged through commission_value (fee + slippage per side).',
     ...((settings.slippageAtrMult ?? 0) > 0 || (settings.borrowPctPerBar ?? 0) > 0 || settings.fundingPctPerBar > 0
@@ -299,6 +311,15 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     '//   - Small differences are expected: TradingView uses its own data feed and intrabar fill model.',
     '//   - Educational tool, not financial advice. Past performance does not guarantee future results.',
   );
+  if (settings.poolAssets) {
+    push(
+      '//',
+      '//  Asset pool',
+      `//   This strategy was optimised on a pool of assets (${label.replace(/^Pool:\s*/, '')}), each traded`,
+      '//   separately with these exact rules. Apply the script to each asset\'s chart; the trade-count',
+      '//   gates were met by the pooled sample, so one chart alone shows fewer trades.',
+    );
+  }
   if (ctx.components.length > 1) {
     push(
       '//',
@@ -317,7 +338,7 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
   push(
     '// =============================================================================',
-    `strategy("${title}", overlay=true, initial_capital=${Math.round(settings.initialCapital)}, currency=currency.USD, pyramiding=0, commission_type=strategy.commission.percent, commission_value=${costPct}, slippage=0, calc_on_every_tick=false, process_orders_on_close=false, use_bar_magnifier=true, margin_long=0, margin_short=0)`,
+    `strategy("${title}", overlay=true, initial_capital=${Math.round(settings.initialCapital)}, currency=currency.USD, pyramiding=0, commission_type=strategy.commission.percent, commission_value=${costPct}, slippage=0, calc_on_every_tick=false, process_orders_on_close=false, use_bar_magnifier=false, margin_long=0, margin_short=0)`,
     '',
   );
 
@@ -365,7 +386,10 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   push('// ---- Indicators --------------------------------------------------------------', ...decl.render(), '');
   push('// ---- Entry / exit rules ------------------------------------------------------', ...rules, '');
 
-  const atrReady = `${dynamic ? ' and not na(atrValue)' : ''}${timeStop !== null ? ' and not timedOut' : ''}`;
+  const atrReady = dynamic ? ' and not na(atrValue)' : '';
+  // A time stop blocks re-entering the SAME side on that open; an opposite signal still reverses.
+  const longTimed = timeStop !== null ? ' and not (timedOut and strategy.position_size > 0)' : '';
+  const shortTimed = timeStop !== null ? ' and not (timedOut and strategy.position_size < 0)' : '';
   if (timeStop !== null) {
     push(
       "// Time stop: a trade that has been open for maxBarsInTrade candles is closed at the next bar's open.",
@@ -373,13 +397,16 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
       '',
     );
   }
-  push('// An entry is actionable only when the opposite side and its own exit signal are silent.');
   push(
-    `goLong  = longEntry${hasShorts ? ' and not shortEntry' : ''}${hasSignalExit ? ' and not longExitSignal' : ''} and canEnter${atrReady}`,
+    '// An entry is actionable only when the opposite side and its own exit signal are silent.',
+    '// An actionable entry against an open position reverses it (strategy.entry closes the other side first).',
+  );
+  push(
+    `goLong  = longEntry${hasShorts ? ' and not shortEntry' : ''}${hasSignalExit ? ' and not longExitSignal' : ''} and canEnter${atrReady}${longTimed}`,
   );
   if (hasShorts) {
     push(
-      `goShort = shortEntry and not longEntry${hasShortSignalExit ? ' and not shortExitSignal' : ''} and canEnter${atrReady}`,
+      `goShort = shortEntry and not longEntry${hasShortSignalExit ? ' and not shortExitSignal' : ''} and canEnter${atrReady}${shortTimed}`,
     );
   }
   push('');
@@ -487,7 +514,7 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
 
   if (hasSignalExit) {
     push(
-      "// Trigger-reversal exits: close at the next bar's open.",
+      "// Opposite-signal exits: close at the next bar's open (a reversal entry, when there is one, takes precedence).",
       `if longExitSignal and strategy.position_size > 0${hasShorts ? ' and not goShort' : ''}`,
       '    strategy.close("Long", comment="Signal exit")',
     );

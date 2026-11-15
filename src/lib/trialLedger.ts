@@ -8,7 +8,8 @@
  * symbols and the dates of the SEARCH period (train + validation). A later run whose search period
  * overlaps an earlier one (on a shared symbol, by at least half of the shorter window) inherits
  * those trials: they raise its selection-bias hurdle and count against the window's budget of
- * `WINDOW_TRIAL_BUDGET` evaluations. Refreshing the page, a new end date, another range or another
+ * `WINDOW_TRIAL_BUDGET` evaluations. The user can extend a spent budget by `BUDGET_EXTENSION`
+ * trials at a time; extensions are recorded here too, and the trials still count in full. Refreshing the page, a new end date, another range or another
  * timeframe over the same dates does not reset the count.
  */
 
@@ -19,6 +20,7 @@ import {
   RANGE_DAYS,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
+  BUDGET_EXTENSION,
   WINDOW_TRIAL_BUDGET,
   type HistoryRange,
   type Interval,
@@ -26,6 +28,7 @@ import {
 } from '../types/trading';
 
 const STORAGE_KEY = 'strategyfinder.trialLedger.v1';
+const EXTENSIONS_KEY = 'strategyfinder.budgetExtensions.v1';
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365.25 * DAY_MS;
 /** Oldest records are dropped beyond this many. */
@@ -100,6 +103,51 @@ export function recordRunTrials(window: TrialWindow, runId: string, stats: Trial
   persist(all.slice(-MAX_RECORDS));
 }
 
+/** A user's explicit decision to search a data window beyond its budget. */
+interface BudgetExtension extends TrialWindow {
+  at: number;
+}
+
+function readExtensions(): BudgetExtension[] {
+  try {
+    const raw = window.localStorage.getItem(EXTENSIONS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (e): e is BudgetExtension =>
+        typeof e === 'object' &&
+        e !== null &&
+        Array.isArray((e as BudgetExtension).symbols) &&
+        typeof (e as BudgetExtension).start === 'number' &&
+        typeof (e as BudgetExtension).end === 'number' &&
+        (e as BudgetExtension).end > (e as BudgetExtension).start,
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Number of explicit budget extensions granted to windows overlapping `window`. */
+export function budgetExtensions(window: TrialWindow): number {
+  return readExtensions().filter((e) => windowsMatch(e, window)).length;
+}
+
+/** Trial budget of a window: the default plus every extension the user granted on overlapping data. */
+export function windowBudget(window: TrialWindow): number {
+  return WINDOW_TRIAL_BUDGET + BUDGET_EXTENSION * budgetExtensions(window);
+}
+
+/** Record that the user chose to extend this window's budget by `BUDGET_EXTENSION` trials. */
+export function extendWindowBudget(win: TrialWindow, now: number = Date.now()): void {
+  const all = readExtensions();
+  all.push({ symbols: normaliseSymbols(win.symbols), interval: win.interval, start: win.start, end: win.end, at: now });
+  try {
+    window.localStorage.setItem(EXTENSIONS_KEY, JSON.stringify(all.slice(-MAX_RECORDS)));
+  } catch {
+    // Storage unavailable – the extension lasts for this page only via the caller's state.
+  }
+}
+
 export type BudgetLevel = 'fresh' | 'degrading' | 'critical' | 'exhausted';
 
 export interface BudgetStatus {
@@ -117,16 +165,19 @@ export interface BudgetStatus {
   level: BudgetLevel;
   /** Annualised Sharpe the luckiest of `used` skill-less strategies is expected to reach on this window. */
   luckSharpe: number;
+  /** Times the user extended this window's budget beyond the default. */
+  extensions: number;
 }
 
-/** Budget status of a window after `used` trials. */
-export function budgetStatus(window: TrialWindow, used: number, limit: number = WINDOW_TRIAL_BUDGET): BudgetStatus {
+/** Budget status of a window after `used` trials (the limit includes any extensions the user granted). */
+export function budgetStatus(window: TrialWindow, used: number, limit: number = windowBudget(window)): BudgetStatus {
   const share = limit > 0 ? Math.min(1, used / limit) : 1;
   const years = Math.max(1 / 365, (window.end - window.start) / YEAR_MS);
   // Under the null the annualised Sharpe estimate over `years` has a variance of about 1 / years.
   const luckSharpe = used > 1 ? expectedMaxSharpe(used, 1 / years) : 0;
   const level: BudgetLevel = used >= limit ? 'exhausted' : share >= 0.9 ? 'critical' : share >= 0.5 ? 'degrading' : 'fresh';
-  return { used, limit, remaining: Math.max(0, limit - used), share, level, luckSharpe };
+  const extensions = Math.max(0, Math.round((limit - WINDOW_TRIAL_BUDGET) / BUDGET_EXTENSION));
+  return { used, limit, remaining: Math.max(0, limit - used), share, level, luckSharpe, extensions };
 }
 
 /* -------------------------------------------------------------------------- */

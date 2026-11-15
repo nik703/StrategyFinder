@@ -14,11 +14,13 @@ import {
   benchmarkSearch,
   combineFitness,
   deflatedTerm,
+  median,
   evaluateSearch,
   isSingleRegime,
   plateauFitness,
   regimeMask,
   splitFor,
+  tradeGatesFor,
   tradeLogHash,
   UNFIT,
   type Regimes,
@@ -28,7 +30,7 @@ import {
 import { countParameters, rewardToRisk, stepNeighbours, type GenomeLimits } from './genome';
 import { IndicatorCache } from './indicators';
 import { deflatedSharpeAgainst } from '../lib/stats';
-import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, StrategyGenome } from '../types/trading';
+import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, StrategyGenome, TradeGates } from '../types/trading';
 
 /** Minimum number of candles required for a meaningful three-way split. */
 export const MIN_BARS = 150;
@@ -65,6 +67,10 @@ export interface EvalContext {
   hurdle: number;
   /** Trade-log fingerprints already evaluated in this run (frozen for a batch, see `tradeLogHash`). */
   knownTrades: Set<string>;
+  /** Minimum-trade gates, from the primary asset's timeframe and history. */
+  gates: TradeGates;
+  /** True when the trade gates apply to the trades pooled over every asset (`settings.poolAssets`). */
+  pooled: boolean;
 }
 
 /**
@@ -215,6 +221,35 @@ function minTradesPerYear(ctx: EvalContext, scores: AssetScore[]): number {
   return min;
 }
 
+/**
+ * The sample a strategy is gated on: the primary asset's trades and the lowest per-asset trade
+ * rate, or – with a pooled universe – the trades summed over every asset (`missing` unscored
+ * assets count as unlimited, so a bound stays an upper bound).
+ */
+export function sampleOf(
+  ctx: EvalContext,
+  scores: AssetScore[],
+  missing = 0,
+): { trades: number; validationTrades: number; tradesPerYear: number } {
+  if (!ctx.pooled) {
+    return {
+      trades: scores[0].metrics.search.trades,
+      validationTrades: scores[0].metrics.validation.trades,
+      tradesPerYear: minTradesPerYear(ctx, scores),
+    };
+  }
+  if (missing > 0) return { trades: Infinity, validationTrades: Infinity, tradesPerYear: Infinity };
+  let trades = 0;
+  let validationTrades = 0;
+  let perYear = 0;
+  scores.forEach((score, a) => {
+    trades += score.metrics.search.trades;
+    validationTrades += score.metrics.validation.trades;
+    perYear += tradesPerYear(ctx, a, score.metrics);
+  });
+  return { trades, validationTrades, tradesPerYear: perYear };
+}
+
 /** Highest fitness a partly scored strategy can still reach if every remaining asset turns out perfect. */
 function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetScore[]): number {
   const missing = ctx.assets.length - scores.length;
@@ -228,9 +263,8 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
   // cannot lower the minimum trade rate below what the scored ones already show.
   return combineFitness({
     assetScores,
-    primaryTrades: scores[0].metrics.search.trades,
-    primaryValidationTrades: scores[0].metrics.validation.trades,
-    minTradesPerYear: minTradesPerYear(ctx, scores),
+    ...sampleOf(ctx, scores, missing),
+    gates: ctx.gates,
     singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / ctx.assets.length,
     params: countParameters(genome, ctx.limits),
@@ -239,26 +273,31 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
   });
 }
 
-/** Fitness of a fully scored genome against the current selection-bias hurdle. */
+/**
+ * Fitness of a fully scored genome against the current selection-bias hurdle. `dsr` is the primary
+ * asset's deflated Sharpe ratio – with a pooled universe the MEDIAN over the assets, so pooling
+ * raises the sample size for the gates without letting one lucky asset carry the statistic.
+ */
 export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: AssetScore[]): { fitness: number; dsr: number } {
   let profitable = 0;
+  const dsrs: number[] = [];
   const assetScores = scores.map((score) => {
     if (score.metrics.validation.roi > 0) profitable++;
-    return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
+    const deflated = deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle);
+    dsrs.push(deflated.probability);
+    return score.base + deflatedTerm(deflated);
   });
   const fitness = combineFitness({
     assetScores,
-    primaryTrades: scores[0].metrics.search.trades,
-    primaryValidationTrades: scores[0].metrics.validation.trades,
-    minTradesPerYear: minTradesPerYear(ctx, scores),
+    ...sampleOf(ctx, scores),
+    gates: ctx.gates,
     singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / scores.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
     validationWinRate: scores[0].metrics.validation.winRate,
   });
-  const dsr = deflatedSharpeAgainst(scores[0].metrics.validation, ctx.hurdle).probability;
-  return { fitness, dsr };
+  return { fitness, dsr: ctx.pooled ? median(dsrs) : dsrs[0] };
 }
 
 /** A one-grid-step neighbour of a candidate and its per-asset scores. */
@@ -320,8 +359,8 @@ export interface CandidateResult {
  *
  * Candidates whose own fitness beats the floor – the only ones that can enter the leaderboard –
  * also have their one-grid-step parameter neighbourhood backtested, and are ranked by their
- * fitness capped at the neighbours' median (`plateauFitness`). The cap only ever lowers a score,
- * so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
+ * fitness blended with the neighbours' median (`plateauFitness`). The blend only ever lowers a
+ * score, so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
  */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
   const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, floor, true);
@@ -350,6 +389,8 @@ export function createContext(datasets: NamedDataset[], settings: BacktestSettin
     axis: buildAxis(primary.data.t, primary.split),
     hurdle: 0,
     knownTrades: new Set(),
+    gates: tradeGatesFor(primary.split, primary.periodsPerYear),
+    pooled: settings.poolAssets === true && assets.length > 1,
   };
 }
 

@@ -19,7 +19,7 @@ import {
 import { FREE_PARAMETERS, HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
 import { overfittingRisk } from '../lib/risk';
 import StabilityHeatmap from './StabilityHeatmap';
-import { MIN_HOLDOUT_TRADES } from '../engine/backtester';
+import { MIN_HOLDOUT_TRADES_FLOOR } from '../engine/backtester';
 import { generatePineScript } from '../engine/pine';
 import type { RunContext } from '../lib/config';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
@@ -633,9 +633,9 @@ export default function StrategyModal({
                         detail={`${fmtNum(strategy.holdout.sharpe)} vs ${fmtNum(benchmark.holdout?.sharpe ?? null)} · ROI ${fmtPct(strategy.holdout.roi, true)} vs ${fmtPct(benchmark.holdout?.roi ?? null, true)}`}
                       />
                       <TestRow
-                        pass={strategy.holdout.trades >= MIN_HOLDOUT_TRADES}
-                        label={`At least ${MIN_HOLDOUT_TRADES} holdout trades`}
-                        detail={fmtInt(strategy.holdout.trades)}
+                        pass={(strategy.sample?.holdoutTrades ?? strategy.holdout.trades) >= (strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR)}
+                        label={`At least ${strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR} holdout trades${strategy.sample?.pooled ? ' (pooled over the assets)' : ''}`}
+                        detail={fmtInt(strategy.sample?.holdoutTrades ?? strategy.holdout.trades)}
                       />
                     </>
                   )}

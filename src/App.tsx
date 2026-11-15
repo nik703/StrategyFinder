@@ -32,14 +32,13 @@ import {
 } from './lib/config';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
-import { budgetStatus, estimateSearchWindow, priorTrials, recordRunTrials, searchWindowFor } from './lib/trialLedger';
+import { budgetStatus, estimateSearchWindow, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, windowBudget, type TrialWindow } from './lib/trialLedger';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
   clampRange,
   DEFAULT_CRYPTO_UNIVERSE,
   DEFAULT_STOCK_UNIVERSE,
-  WINDOW_TRIAL_BUDGET,
   type BenchmarkResult,
   type ChartAxis,
   type EngineStatus,
@@ -51,6 +50,7 @@ import {
   type StrategyResult,
   type Verdict,
   type WorkerRequest,
+  type TradeGates,
   type WorkerResponse,
 } from './types/trading';
 
@@ -77,7 +77,7 @@ const EMPTY_TELEMETRY: ProgressSnapshot = {
   stagnation: 0,
   evaluations: 0,
   windowTrials: 0,
-  dsrStall: 0,
+  fitnessStall: 0,
   duplicates: 0,
   runTrials: { count: 0, mean: 0, m2: 0 },
   bestFitness: null,
@@ -123,6 +123,8 @@ export default function App(): JSX.Element {
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null);
   const [axis, setAxis] = useState<ChartAxis | null>(null);
   const [barsPerYear, setBarsPerYear] = useState(365);
+  const [gates, setGates] = useState<TradeGates | null>(null);
+  const [pooledRun, setPooledRun] = useState(false);
   const [context, setContext] = useState<RunContext | null>(null);
   /** Strategy pinned by clicking a leaderboard row; null = follow the current #1. */
   const [pinned, setPinned] = useState<StrategyResult | null>(null);
@@ -203,6 +205,8 @@ export default function App(): JSX.Element {
           setBenchmark(message.benchmark);
           setAxis(message.axis);
           setBarsPerYear(message.barsPerYear);
+          setGates(message.gates);
+          setPooledRun(message.pooled);
           break;
         case 'progress': {
           const { type: _type, ...snapshot } = message;
@@ -332,27 +336,28 @@ export default function App(): JSX.Element {
       // Every trial already spent on this search period – in any run, any session – counts against it.
       const trialWindow = searchWindowFor(symbols, config.interval, dataset.data.t);
       const prior = priorTrials(trialWindow);
-      if (prior.count >= WINDOW_TRIAL_BUDGET) {
+      const limit = windowBudget(trialWindow);
+      if (prior.count >= limit) {
         setError(
-          `The trial budget of this data window is spent (${fmtInt(prior.count)} of ${fmtInt(WINDOW_TRIAL_BUDGET)} evaluations over ` +
-            `${prior.runs} runs). More search on the same data can only find luckier noise – wait for new data or test other assets.`,
+          `The trial budget of this data window is spent (${fmtInt(prior.count)} of ${fmtInt(limit)} evaluations over ` +
+            `${prior.runs} runs). Extend the budget to keep searching – knowing every extra trial weakens significance – or test other data.`,
         );
         setLedgerVersion((v) => v + 1);
         setStatus('idle');
         return;
       }
       const runContext: RunContext = {
-        label: dataset.label,
+        label: config.assetMode === 'pool' ? `Pool: ${universe.symbols.join(' · ')}` : dataset.label,
         interval: config.interval,
         range: config.range,
         settings,
-        maxEvaluations: Math.min(config.maxEvaluations, WINDOW_TRIAL_BUDGET - prior.count),
+        maxEvaluations: Math.min(config.maxEvaluations, limit - prior.count),
         hypothesis: config.hypothesis,
         runId: ledgerRunId,
         trialWindow,
         priorTrials: prior,
         universe: datasets.map((entry) => entry.symbol),
-        venue: venueLabel(tradedSymbols.map((symbol) => loaded.series[symbol])),
+        venue: venueLabel((config.assetMode === 'pool' ? universe.symbols : tradedSymbols).map((symbol) => loaded.series[symbol])),
         holdoutWindow,
         priorHoldoutReveals: earlier.reduce((sum, entry) => sum + entry.views, 0),
         lastHoldoutReveal: earlier.length > 0 ? earlier[earlier.length - 1].revealedAt : null,
@@ -408,7 +413,7 @@ export default function App(): JSX.Element {
           hypothesis: config.hypothesis,
           maxEvaluations: config.maxEvaluations,
           priorTrials: { count: prior.count, mean: prior.mean, m2: prior.m2 },
-          windowBudget: WINDOW_TRIAL_BUDGET,
+          windowBudget: limit,
           ports,
         },
       };
@@ -513,7 +518,7 @@ export default function App(): JSX.Element {
    * selection is unchanged) it is the run's exact window: earlier trials plus this run's. Otherwise
    * it is estimated from the selected assets, timeframe and range, read from the persistent ledger.
    */
-  const budget = useMemo(() => {
+  const budget = useMemo((): { status: ReturnType<typeof budgetStatus>; estimated: boolean; window: TrialWindow } | null => {
     void ledgerVersion; // re-read the ledger after this tab wrote it
     const symbols = runSymbols(config);
     const sameSelection =
@@ -523,16 +528,23 @@ export default function App(): JSX.Element {
       [...symbols].sort().join('+') === context.trialWindow.symbols.join('+');
     if (context && (busy || sameSelection)) {
       const used = busy || finished ? context.priorTrials.count + telemetry.evaluations : priorTrials(context.trialWindow).count;
-      return { status: budgetStatus(context.trialWindow, used), estimated: false };
+      return { status: budgetStatus(context.trialWindow, used), estimated: false, window: context.trialWindow };
     }
     if (symbols.length === 0) return null;
     const window = estimateSearchWindow(symbols, config.interval, config.range, Date.now());
-    return { status: budgetStatus(window, priorTrials(window).count), estimated: true };
+    return { status: budgetStatus(window, priorTrials(window).count), estimated: true, window };
   }, [config, context, busy, finished, telemetry.evaluations, ledgerVersion]);
   const budgetBlocked =
     !busy && budget !== null && budget.status.level === 'exhausted'
-      ? `The trial budget of this data window is spent (${fmtInt(budget.status.used)} of ${fmtInt(budget.status.limit)} evaluations). Search on the same data is disabled – pick other assets, another period, or wait for new data.`
+      ? `The trial budget of this data window is spent (${fmtInt(budget.status.used)} of ${fmtInt(budget.status.limit)} evaluations). Search on the same data is paused: pick other assets or another period, or extend the budget knowingly.`
       : null;
+  /** Explicitly allow `BUDGET_EXTENSION` more trials on the selected window (recorded in the ledger). */
+  const extendBudget = useCallback(() => {
+    if (!budget) return;
+    extendWindowBudget(budget.window);
+    setLedgerVersion((v) => v + 1);
+    setError(null);
+  }, [budget]);
 
   // Opening the breakdown requests a robustness report: once while the run is live
   // (no verdict yet) and once after it has ended (with the holdout and other assets).
@@ -579,6 +591,7 @@ export default function App(): JSX.Element {
         onStart={() => void start()}
         onStop={stop}
         budgetBlocked={budgetBlocked}
+        onExtendBudget={extendBudget}
       />
 
       <TelemetryStrip
@@ -788,6 +801,8 @@ export default function App(): JSX.Element {
         lockedId={lockedId}
         onSelect={selectStrategy}
         status={status}
+        gates={gates}
+        pooled={pooledRun}
       />
 
       <footer className="pb-2 text-[11px] leading-relaxed text-ink-3">
