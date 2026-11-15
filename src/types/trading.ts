@@ -163,7 +163,17 @@ export type Condition =
   /** Close <op> Supertrend(period, mult) */
   | { ind: 'SUPERTREND'; period: number; mult: number; op: CmpOp }
   /** CCI(period) <op> level */
-  | { ind: 'CCI'; period: number; op: CmpOp; level: number };
+  | { ind: 'CCI'; period: number; op: CmpOp; level: number }
+  /**
+   * upper: Close <op> highest high of the previous `period` candles (a range breakout)
+   * lower: Close <op> lowest low of the previous `period` candles
+   */
+  | { ind: 'DONCHIAN'; period: number; variant: 'upper' | 'lower'; op: CmpOp }
+  /** MA(period) <op> the same MA `SLOPE_LAG` candles earlier – the sign of the trend's slope */
+  | { ind: 'MA_SLOPE'; maType: MaType; period: number; op: CmpOp };
+
+/** Candles over which an MA_SLOPE condition measures the slope. */
+export const SLOPE_LAG = 10;
 
 export type IndicatorFamily = Condition['ind'];
 
@@ -261,6 +271,12 @@ export const DEFAULT_SIZING: SizingSetting = { mode: 'risk', riskPct: 2, compoun
 
 export interface BacktestSettings {
   initialCapital: number;
+  /**
+   * Pooled multi-asset sample: every asset of the run is traded with the same rules and the
+   * minimum-trade gates apply to the trades summed over all of them (default: off – each asset
+   * must clear the gates on its own and the first asset is the one traded).
+   */
+  poolAssets?: boolean;
   /** Trading fee charged on every fill, in percent (0.1 = 0.1% per side). */
   feePct: number;
   /** Adverse slippage applied to every fill, in percent (0.05 = 0.05%). */
@@ -405,6 +421,29 @@ export interface RobustnessReport {
   } | null;
 }
 
+/** The minimum-trade gates of a run's data (see `tradeGatesFor` in engine/backtester.ts). */
+export interface TradeGates {
+  /** Trades over train + validation. */
+  search: number;
+  /** Trades in the validation segment. */
+  validation: number;
+  /** Average trades per year of the search period. */
+  perYear: number;
+  /** Holdout trades below which a locked strategy cannot be rated Robust. */
+  holdout: number;
+}
+
+/** The sample a strategy was gated on. */
+export interface SampleInfo {
+  /** Train + validation trades: the primary asset's, or summed over a pooled universe. */
+  trades: number;
+  validationTrades: number;
+  /** Holdout trades counted the same way (null while the holdout is sealed). */
+  holdoutTrades: number | null;
+  gates: TradeGates;
+  pooled: boolean;
+}
+
 export interface StrategyResult {
   /** Unique within one optimisation run, e.g. "S-4821". */
   id: string;
@@ -452,6 +491,8 @@ export interface StrategyResult {
   verdict: Verdict | null;
   /** Why the locked strategy is not Robust (empty when it is). Absent until the holdout is revealed. */
   verdictNotes?: string[];
+  /** The trade sample the strategy was gated on, and the gates. */
+  sample?: SampleInfo;
 }
 
 export interface BenchmarkResult {
@@ -484,16 +525,23 @@ export interface ChartAxis {
 /* -------------------------------------------------------------------------- */
 
 /** Default number of strategy evaluations (trials) per run. */
-export const DEFAULT_RUN_EVALUATIONS = 2_000;
+export const DEFAULT_RUN_EVALUATIONS = 5_000;
 /** Smallest per-run evaluation limit the controls accept. */
 export const MIN_RUN_EVALUATIONS = 100;
 /**
- * Hard ceiling of evaluations per data window, summed over EVERY run and session whose search
- * period overlaps it. Past this, more search on the same data can only find luckier noise.
+ * Evaluations per data window, summed over EVERY run and session whose search period overlaps it.
+ * At this point search stops by default: the user may extend the window by `BUDGET_EXTENSION`
+ * trials at a time, knowingly – every extra trial raises the luck hurdle the deflated Sharpe uses.
  */
-export const WINDOW_TRIAL_BUDGET = 10_000;
-/** Early stopping: a run ends after this many evaluations in a row fail to beat the best deflated Sharpe. */
-export const DSR_PATIENCE = 500;
+export const WINDOW_TRIAL_BUDGET = 25_000;
+/** Trials one explicit "Extend budget" adds to a data window. */
+export const BUDGET_EXTENSION = 10_000;
+/**
+ * Early stopping: a run ends after this many evaluations in a row fail to improve the best
+ * composite fitness on the leaderboard. (Not the deflated Sharpe: it sits at 0% through the early
+ * generations, which stopped runs before good combinations had a chance to evolve.)
+ */
+export const FITNESS_PATIENCE = 1_500;
 /** Safety stop: proposals in a row that yield no new (non-duplicate) evaluation, i.e. the search space is exhausted. */
 export const EXHAUSTION_LIMIT = 2_000;
 /** Size of the live leaderboard. */
@@ -528,7 +576,7 @@ export interface OptimizerStartPayload {
   settings: BacktestSettings;
   /** The market hypothesis every strategy of this run is built from. */
   hypothesis: Hypothesis;
-  /** Evaluations this run may spend (default 2,000, at most the window's remaining budget). */
+  /** Evaluations this run may spend (default 5,000, at most the window's remaining budget). */
   maxEvaluations?: number;
   /**
    * Trials already spent on this data window by earlier runs (from the persistent trial ledger).
@@ -569,8 +617,8 @@ export interface ProgressSnapshot {
   evaluations: number;
   /** Trials on this data window across all runs, this one included. */
   windowTrials: number;
-  /** Evaluations since a candidate last beat the best deflated Sharpe (early stop at `DSR_PATIENCE`). */
-  dsrStall: number;
+  /** Evaluations since a candidate last improved the best fitness (early stop at `FITNESS_PATIENCE`). */
+  fitnessStall: number;
   /** Candidates dropped because their trade log repeated one already evaluated. */
   duplicates: number;
   /** This run's own trials, in annualised Sharpe units – persisted to the trial ledger. */
@@ -590,7 +638,7 @@ export interface ProgressSnapshot {
 
 /**
  * stopped       – the user pressed Stop;
- * converged     – early stop: no candidate beat the best deflated Sharpe for `DSR_PATIENCE` evaluations;
+ * converged     – early stop: no candidate improved the best fitness for `FITNESS_PATIENCE` evaluations;
  * budget        – the run's evaluation limit was reached;
  * window-budget – the data window's cumulative trial budget is spent;
  * exhausted     – the hypothesis's search space yields no new strategies.
@@ -598,7 +646,7 @@ export interface ProgressSnapshot {
 export type StopReason = 'stopped' | 'converged' | 'budget' | 'window-budget' | 'exhausted';
 
 export type WorkerResponse =
-  | { type: 'ready'; benchmark: BenchmarkResult; axis: ChartAxis; barsPerYear: number }
+  | { type: 'ready'; benchmark: BenchmarkResult; axis: ChartAxis; barsPerYear: number; gates: TradeGates; pooled: boolean }
   | ({ type: 'progress' } & ProgressSnapshot)
   | { type: 'leaderboard'; iteration: number; strategies: StrategyResult[] }
   /** The run has ended. The holdout stays sealed until the user locks one strategy (see `lock`). */

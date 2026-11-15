@@ -25,6 +25,7 @@
 
 import {
   REGIME_NAMES,
+  SLOPE_LAG,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
   type RegimeMetrics,
@@ -33,6 +34,7 @@ import {
   type PerformanceMetrics,
   type RuleGroup,
   type StrategyGenome,
+  type TradeGates,
 } from '../types/trading';
 import { sharpeConfidenceInterval, type DeflatedSharpe } from '../lib/stats';
 import { FREE_PARAMETERS } from './genome';
@@ -100,6 +102,10 @@ export function resolveOperands(c: Condition, ind: IndicatorCache): Operands {
       return { left: ind.data.c, right: ind.supertrend(c.period, c.mult), level: 0 };
     case 'CCI':
       return { left: ind.cci(c.period), right: null, level: c.level };
+    case 'DONCHIAN':
+      return { left: ind.data.c, right: c.variant === 'upper' ? ind.donchianUpper(c.period) : ind.donchianLower(c.period), level: 0 };
+    case 'MA_SLOPE':
+      return { left: ind.ma(c.maType, c.period), right: ind.maLagged(c.maType, c.period, SLOPE_LAG), level: 0 };
   }
   throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
 }
@@ -356,7 +362,7 @@ export function runBacktest(
     const l = L[i];
     const c = C[i];
     let worst = equity;
-    let exitedAtOpen = false;
+    let exitedAtOpen = 0;
 
     if (i > 0 && !busted) {
       const p = i - 1; // signal candle
@@ -379,17 +385,18 @@ export function runBacktest(
           tradeDir[trades] = pos;
           tradeAmbiguous[trades] = 0;
           trades++;
+          // A pure time-stop exit does not re-enter the SAME side on the same open; an opposite
+          // entry signal still reverses the position.
+          exitedAtOpen = timedOut ? pos : 0;
           pos = 0;
           worst = equity;
-          // A pure time-stop exit does not re-enter on the same open.
-          exitedAtOpen = timedOut;
         }
       }
 
       /* -- 3b. Entries at the open ---------------------------------------- */
-      if (pos === 0 && equity > 0 && !exitedAtOpen) {
+      if (pos === 0 && equity > 0) {
         const dir = goLong[p] === 1 ? 1 : allowShort && goShort[p] === 1 ? -1 : 0;
-        if (dir !== 0) {
+        if (dir !== 0 && dir !== exitedAtOpen) {
           const a = atr !== null ? atr[p] : 0;
           // Dynamic exits need a valid ATR on the signal candle.
           if (!dynamic || (a === a && a > 0)) {
@@ -1255,36 +1262,58 @@ export function benchmarkSearch(
 /* -------------------------------------------------------------------------- */
 
 /*
- * Hard sample-size gates. A strategy below ANY of them is disqualified outright (fitness UNFIT):
- * a few dozen trades cannot tell skill from luck, and a soft penalty can be bought back with one
- * lucky validation year. The counts are per asset – never pooled across the universe.
+ * Hard sample-size gates, calibrated to the timeframe and the length of the data. A strategy below
+ * ANY of them is disqualified outright (fitness UNFIT). The bar is a number of trades per YEAR of
+ * data – 15 a year on daily candles, rising slowly with the number of candles per day (≈ 26 on 4h,
+ * ≈ 39 on 1h, ≈ 59 on 15m) – times the years each segment covers, with small absolute floors.
+ * A flat count would either disqualify every daily swing strategy or wave through intraday noise.
+ * With a pooled multi-asset sample the counts are summed over the assets (see `evaluation.ts`).
  */
-/** Minimum trades the primary asset must open over train + validation. */
-export const MIN_TRADES = 100;
-/**
- * Minimum trades the primary asset must open in the validation segment. With 60 trades a mean
- * trade return is significant (t ≥ 2) only from a per-trade Sharpe of about 0.26 upwards.
- */
-export const MIN_VALIDATION_TRADES = 60;
-/** Minimum average number of trades per year of the search period, on EVERY asset scored. */
-export const MIN_TRADES_PER_YEAR = 25;
-/** Holdout trades below which a locked strategy cannot be rated Robust. */
-export const MIN_HOLDOUT_TRADES = 30;
+/** Trades a year required on daily candles. */
+export const BASE_TRADES_PER_YEAR = 15;
+/** Absolute floors: search period (train + validation), validation segment, holdout. */
+export const MIN_SEARCH_TRADES_FLOOR = 30;
+export const MIN_VALIDATION_TRADES_FLOOR = 10;
+export const MIN_HOLDOUT_TRADES_FLOOR = 10;
+
+/** Minimum trades per year of data for candles of this frequency. */
+export function minTradesPerYearFor(periodsPerYear: number): number {
+  const barsPerDay = periodsPerYear / 365;
+  return BASE_TRADES_PER_YEAR * Math.pow(Math.max(1, barsPerDay), 0.3);
+}
+
+export function tradeGatesFor(split: Split, periodsPerYear: number): TradeGates {
+  const rate = minTradesPerYearFor(periodsPerYear);
+  const years = (bars: number): number => Math.max(0, bars) / periodsPerYear;
+  return {
+    search: Math.max(MIN_SEARCH_TRADES_FLOOR, Math.ceil(rate * years(split.holdoutStart))),
+    validation: Math.max(MIN_VALIDATION_TRADES_FLOOR, Math.ceil(rate * years(split.holdoutStart - split.validationStart))),
+    perYear: rate,
+    holdout: Math.max(MIN_HOLDOUT_TRADES_FLOOR, Math.ceil(rate * years(split.n - split.holdoutStart))),
+  };
+}
+
 /**
  * The holdout conditions of a Robust verdict, as a list of the ones a strategy misses (empty =
  * the holdout supports an edge): the holdout Sharpe's 95% confidence interval must lie above zero,
  * the holdout Sharpe must beat Buy & Hold's holdout Sharpe, and there must be at least
- * `MIN_HOLDOUT_TRADES` holdout trades. Raw holdout profit is NOT enough: on a trending market
+ * `minTrades` holdout trades. Raw holdout profit is NOT enough: on a trending market
  * most long strategies make money on the holdout by drift alone.
  */
-export function holdoutShortfalls(holdout: PerformanceMetrics, benchmark: PerformanceMetrics | null, periodsPerYear: number): string[] {
+export function holdoutShortfalls(
+  holdout: PerformanceMetrics,
+  benchmark: PerformanceMetrics | null,
+  periodsPerYear: number,
+  minTrades: number,
+  trades: number = holdout.trades,
+): string[] {
   const out: string[] = [];
   const [ciLow] = sharpeConfidenceInterval(holdout, periodsPerYear);
   if (!(ciLow > 0)) out.push(`The holdout Sharpe's 95% confidence interval reaches ${ciLow.toFixed(2)}: it includes zero.`);
   if (benchmark !== null && !(holdout.sharpe > benchmark.sharpe)) {
     out.push(`Holdout Sharpe ${holdout.sharpe.toFixed(2)} does not beat Buy & Hold's ${benchmark.sharpe.toFixed(2)}.`);
   }
-  if (holdout.trades < MIN_HOLDOUT_TRADES) out.push(`Only ${holdout.trades} holdout trades (at least ${MIN_HOLDOUT_TRADES} needed).`);
+  if (trades < minTrades) out.push(`Only ${trades} holdout trades (at least ${minTrades} needed).`);
   return out;
 }
 
@@ -1298,8 +1327,14 @@ function riskAdjusted(m: PerformanceMetrics): number {
   return 0.6 * (clampTo(m.sortino, -3, 4.5) / 1.5) + 0.4 * clampTo(m.sharpe, -3, 3);
 }
 
-/** Quantile of the fold scores the fitness is built on: a strategy is judged by its second-worst of five folds. */
-export const FOLD_QUANTILE = 0.25;
+/** A strategy is consistent when at least this many of the five folds made money (scaled to its active folds). */
+export const CONSISTENT_FOLDS = 3;
+/** Folds a strategy must be active in (in the market at some point) before flat folds are set aside. */
+export const MIN_ACTIVE_FOLDS = 3;
+/** Fitness bonus for a consistent strategy, and the cost of each profitable fold it is short of one. */
+export const CONSISTENCY_BONUS = 0.5;
+/** Intrabar drawdown inside a single fold beyond which the fold counts as a catastrophe. */
+export const CATASTROPHIC_FOLD_DRAWDOWN = 0.35;
 /** A regime slice is only judged when it covers at least this share of the search period ... */
 export const REGIME_MIN_COVERAGE = 0.1;
 /** ... and the strategy opened at least this many trades in it. */
@@ -1317,6 +1352,11 @@ export function quantile(values: readonly number[], q: number): number {
   const lo = Math.floor(pos);
   const hi = Math.ceil(pos);
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+/** True when the strategy held a position at some point during the fold. */
+export function isActiveFold(fold: PerformanceMetrics): boolean {
+  return fold.trades > 0 || fold.exposure > 0;
 }
 
 /** Risk-adjusted score of every fold of the search period, oldest first. */
@@ -1351,18 +1391,36 @@ export function isSingleRegime(regimes: readonly RegimeMetrics[] | null): boolea
  * Per-asset score, everything except the deflated-Sharpe term (which changes as
  * more strategies are tried and is therefore added separately – see `deflatedTerm`):
  *
- *   + 1.50 × 25th percentile of the five fold scores (each 0.6 Sortino + 0.4 Sharpe, clamped)
- *   + 0.25 × median fold score
- *   − drawdown penalty beyond 20%, steeper beyond 45% (intrabar drawdown)
+ *   + 1.50 × MEDIAN of the fold scores (each 0.6 Sortino + 0.4 Sharpe, clamped)
+ *   + 0.50 when at least 3 of 5 folds made money, else − 0.50 per profitable fold short of that
+ *
+ *   A fold in which the strategy never held a position is FLAT: it neither made nor lost money.
+ *   When a strategy was active in at least 3 folds, flat folds are left out of the median and the
+ *   consistency count (which then asks for 60% of the active folds) – a regime filter that sat out
+ *   a bear year did its job and is not punished for it. Below 3 active folds every fold counts.
+ *
+ *   − 3 (and 6 more per unit beyond 35%) when any single fold suffers a catastrophic drawdown
+ *   − drawdown penalty beyond 20% over the whole search period, steeper beyond 45%
  *   − 0.75 for every regime slice (bull, bear, high volatility) the strategy collapses in
  *
- * Every fold is judged on its own and the score rests on the second-worst of the five, so one
- * lucky year cannot carry a strategy that fails in the others. Nothing here rewards raw return
- * over Buy & Hold: that is a bet on the market's direction in a given window, not a sign of edge.
+ * The median, not a low quantile: a trend follower that sits out a sideways year loses a little in
+ * that fold, and grading it on its second-worst fold punished exactly the strategies that work.
+ * Consistency is enforced instead by counting profitable folds, and blow-ups by the per-fold
+ * drawdown. Nothing here rewards raw return over Buy & Hold.
  */
 export function assetBaseScore(m: SearchMetrics): number {
-  const folds = foldScores(m);
-  let score = 1.5 * quantile(folds, FOLD_QUANTILE) + 0.25 * median(folds);
+  const scores = foldScores(m);
+  const active = m.folds.map(isActiveFold);
+  const activeCount = active.filter(Boolean).length;
+  const judged = activeCount >= MIN_ACTIVE_FOLDS ? m.folds.map((_, k) => k).filter((k) => active[k]) : m.folds.map((_, k) => k);
+  let score = 1.5 * median(judged.map((k) => scores[k]));
+  const profitable = judged.filter((k) => m.folds[k].roi > 0).length;
+  const needed = Math.ceil((CONSISTENT_FOLDS / FOLDS) * judged.length - 1e-9);
+  score += profitable >= needed ? CONSISTENCY_BONUS : -CONSISTENCY_BONUS * (needed - profitable);
+  let worstFold = 0;
+  for (const fold of m.folds) if (fold.maxDrawdown > worstFold) worstFold = fold.maxDrawdown;
+  worstFold /= 100;
+  if (worstFold > CATASTROPHIC_FOLD_DRAWDOWN) score -= 3 + 6 * (worstFold - CATASTROPHIC_FOLD_DRAWDOWN);
   const dd = m.search.maxDrawdown / 100;
   score -= 4 * Math.max(0, dd - 0.2) + 6 * Math.max(0, dd - 0.45);
   score -= REGIME_COLLAPSE_PENALTY * collapsedRegimes(m.regimes).length;
@@ -1380,12 +1438,14 @@ export function deflatedTerm(d: DeflatedSharpe): number {
 export interface FitnessInputs {
   /** One score per asset: `assetBaseScore + deflatedTerm`. */
   assetScores: number[];
-  /** Train + Validation trades of the primary asset. */
-  primaryTrades: number;
-  /** Validation trades of the primary asset. */
-  primaryValidationTrades: number;
-  /** Lowest search-period trades-per-year rate across every asset scored. */
-  minTradesPerYear: number;
+  /** Train + Validation trades: the primary asset's, or the pooled total over a pooled universe. */
+  trades: number;
+  /** Validation trades, primary or pooled like `trades`. */
+  validationTrades: number;
+  /** Trades per year of the search period: the lowest rate of any asset, or the pooled rate. */
+  tradesPerYear: number;
+  /** The minimum-trade gates of the run's data (see `tradeGatesFor`). */
+  gates: TradeGates;
   /** True when the primary asset makes all of its money in a single market regime (see `isSingleRegime`). */
   singleRegime: boolean;
   /** Share of assets that were profitable on validation (0–1). */
@@ -1401,13 +1461,12 @@ export interface FitnessInputs {
 /**
  * Composite fitness used to rank strategies (higher is better).
  *
- *   UNFIT (disqualified) below 100 trades or 60 validation trades on the primary asset, or
- *   below 25 trades per year on any asset – see the gates above – or when the primary asset makes
- *   all of its money in one market regime and collapses in the others; otherwise
+ *   UNFIT (disqualified) below the minimum-trade gates (see `tradeGatesFor`), or when the primary
+ *   asset makes all of its money in one market regime and collapses in the others; otherwise
  *
- *   median of the per-asset scores (a single asset when the Robust universe is off)
+ *   median of the per-asset scores (a single asset without a universe)
  *   − 1.0 when fewer than 2/3 of the universe is profitable on validation
- *   − 0.15 for every tunable parameter above 4
+ *   − 0.15 for every tunable parameter above 6
  *   − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
  */
 export function combineFitness(f: FitnessInputs): number {
@@ -1422,23 +1481,29 @@ export function combineFitness(f: FitnessInputs): number {
   return Number.isFinite(score) ? score : UNFIT;
 }
 
+/** Weight of the neighbourhood in the rank fitness of a strategy that sits above its neighbours. */
+export const STABILITY_WEIGHT = 0.3;
+/** A neighbour counts as at worst this far below the strategy itself (a disqualified neighbour is not −1000). */
+export const NEIGHBOUR_SPAN = 3;
+
 /**
- * Rank fitness after the parameter-neighbourhood check: the strategy's own fitness, capped at the
- * MEDIAN fitness of its one-grid-step neighbours. A broad plateau (neighbours about as good) keeps
- * its score; an isolated spike (neighbours much worse) is pulled down to what its neighbourhood
- * supports. The cap can only lower a score, so it never lifts a strategy over the leaderboard floor.
+ * Rank fitness after the parameter-neighbourhood check: a proportional blend of the strategy's own
+ * fitness (70%) and the MEDIAN fitness of its one-grid-step neighbours (30%) when the neighbours
+ * are worse; the strategy's own fitness when they are as good or better. A plateau keeps its
+ * score, a spike loses 30% of its lead over its neighbourhood – enough to rank plateaus first,
+ * not so much that a promising new rule combination is discarded the moment one neighbour slips
+ * under a trade gate (neighbours count as at most `NEIGHBOUR_SPAN` below the strategy). The blend
+ * never lifts a score, so it never lifts a strategy over the leaderboard floor.
  */
 export function plateauFitness(point: number, neighbours: readonly number[]): number {
-  if (neighbours.length === 0) return point;
-  const m = median(neighbours);
-  return m < point ? m : point;
+  if (neighbours.length === 0 || point <= UNFIT) return point;
+  const m = median(neighbours.map((value) => Math.max(value, point - NEIGHBOUR_SPAN)));
+  return m < point ? (1 - STABILITY_WEIGHT) * point + STABILITY_WEIGHT * m : point;
 }
 
 /** True when a strategy clears every hard minimum-trade gate. */
-export function passesTradeGates(f: Pick<FitnessInputs, 'primaryTrades' | 'primaryValidationTrades' | 'minTradesPerYear'>): boolean {
-  return (
-    f.primaryTrades >= MIN_TRADES && f.primaryValidationTrades >= MIN_VALIDATION_TRADES && f.minTradesPerYear >= MIN_TRADES_PER_YEAR
-  );
+export function passesTradeGates(f: Pick<FitnessInputs, 'trades' | 'validationTrades' | 'tradesPerYear' | 'gates'>): boolean {
+  return f.trades >= f.gates.search && f.validationTrades >= f.gates.validation && f.tradesPerYear >= f.gates.perYear - 1e-9;
 }
 
 export function median(values: readonly number[]): number {

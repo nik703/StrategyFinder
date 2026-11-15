@@ -27,6 +27,7 @@ import {
   MAX_RANGE,
   MIN_RUN_EVALUATIONS,
   rangeAllowed,
+  BUDGET_EXTENSION,
   WINDOW_TRIAL_BUDGET,
   YAHOO_MAX_DAYS,
   type EngineStatus,
@@ -50,6 +51,8 @@ interface ControlBarProps {
   onStop: () => void;
   /** Set when the trial budget of the selected data window is spent: Start is then disabled with this reason. */
   budgetBlocked: string | null;
+  /** Grant the selected data window `BUDGET_EXTENSION` more trials. */
+  onExtendBudget: () => void;
 }
 
 /** Colours for the allocation bar (identity only – not a chart series). */
@@ -84,6 +87,7 @@ const SIZING_OPTIONS: { value: RunConfig['sizingMode']; label: string }[] = [
 const ASSET_MODE_OPTIONS: { value: RunConfig['assetMode']; label: string }[] = [
   { value: 'single', label: 'Single asset' },
   { value: 'basket', label: 'Weighted basket' },
+  { value: 'pool', label: 'Asset pool' },
 ];
 
 function TickerInput({
@@ -300,6 +304,7 @@ export default function ControlBar({
   onStart,
   onStop,
   budgetBlocked,
+  onExtendBudget,
 }: ControlBarProps): JSX.Element {
   const listId = useId();
   const busy = status === 'loading' || status === 'optimizing';
@@ -309,11 +314,17 @@ export default function ControlBar({
   const subHour = config.interval === '15m' || config.interval === '30m';
   const financing = financingFor(config);
   const tradesStocks =
-    config.assetMode === 'single'
+    config.assetMode === 'pool'
+      ? parseUniverse(config.pool).some((symbol) => !isCrypto(symbol))
+      : config.assetMode === 'single'
       ? !isCrypto(config.symbol)
       : config.basket.some((row) => row.symbol.trim() !== '' && !isCrypto(row.symbol));
   const commit = (ticker: string): void => onSaveTickers([ticker]);
   const universeOn = config.robustUniverse && config.assetMode === 'single';
+  const poolList = parseUniverse(config.pool);
+  const poolInvalid =
+    config.assetMode === 'pool' &&
+    (poolList.length < 2 || poolList.length > MAX_UNIVERSE_ASSETS || poolList.some((symbol) => !TICKER_PATTERN.test(symbol)));
   const universeList = parseUniverse(config.universe);
   const universeInvalid =
     universeOn && (universeList.some((symbol) => !TICKER_PATTERN.test(symbol)) || universeList.length > MAX_UNIVERSE_ASSETS);
@@ -340,8 +351,29 @@ export default function ControlBar({
         </div>
 
         <div className="min-w-0 flex-1">
-          <FieldLabel>{config.assetMode === 'single' ? 'Ticker' : 'Basket allocation'}</FieldLabel>
-          {config.assetMode === 'single' ? (
+          <FieldLabel>{config.assetMode === 'single' ? 'Ticker' : config.assetMode === 'pool' ? 'Pooled assets' : 'Basket allocation'}</FieldLabel>
+          {config.assetMode === 'pool' ? (
+            <div>
+              <input
+                type="text"
+                value={config.pool}
+                disabled={busy}
+                aria-label="Pooled asset tickers"
+                aria-invalid={poolInvalid}
+                spellCheck={false}
+                onChange={(event) => onChange({ pool: event.target.value.toUpperCase() })}
+                className={cx(
+                  'num h-9 w-full max-w-[520px] rounded-lg border bg-base px-3 text-sm text-ink outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60',
+                  poolInvalid ? 'border-down/70' : 'border-line',
+                )}
+              />
+              <p className="mt-1.5 text-xs text-ink-3">
+                Every asset is traded separately with the same rules. Trades are pooled across the assets for the sample-size
+                gates, and the score is the median over the assets – one strategy that must work on all of them, not a fit to one
+                price path. 2–{MAX_UNIVERSE_ASSETS} tickers.
+              </p>
+            </div>
+          ) : config.assetMode === 'single' ? (
             <div className="flex flex-wrap items-center gap-1.5">
               {PRESET_TICKERS.map((ticker) => {
                 const active = config.symbol === ticker;
@@ -488,7 +520,7 @@ export default function ControlBar({
             className="w-[112px]"
           />
         </div>
-        <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs.`}>
+        <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs by default (extendable).`}>
           <NumberField
             label="Evaluations / run"
             value={config.maxEvaluations}
@@ -545,10 +577,22 @@ export default function ControlBar({
         )}
       </div>
       {budgetBlocked !== null && !busy && (
-        <p role="alert" className="mt-3 flex items-start gap-1.5 text-xs text-down">
-          <Info size={13} className="mt-0.5 shrink-0" />
-          {budgetBlocked}
-        </p>
+        <div role="alert" className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
+          <span className="flex min-w-0 flex-1 items-start gap-1.5">
+            <Info size={13} className="mt-0.5 shrink-0" />
+            <span>
+              {budgetBlocked} Extending keeps every earlier trial in the count: the luck hurdle keeps rising and multiple-testing
+              significance degrades further.
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={onExtendBudget}
+            className="inline-flex h-8 shrink-0 items-center rounded-md border border-warn/60 px-3 font-semibold text-warn transition-colors hover:bg-warn/15"
+          >
+            Extend Budget (+{BUDGET_EXTENSION.toLocaleString('en-US')} trials)
+          </button>
+        </div>
       )}
       {/* Hypothesis – what the run tests; the search only tunes its numbers */}
       <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">

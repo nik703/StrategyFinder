@@ -31,7 +31,14 @@ export interface BasketRow {
 }
 
 export interface RunConfig {
-  assetMode: 'single' | 'basket';
+  /**
+   * single – one ticker; basket – a synthetic weighted composite traded as one series;
+   * pool – several tickers traded separately with the SAME rules, their trades pooled for the
+   * sample-size gates (one strategy that must work across the pool, not on one price path).
+   */
+  assetMode: 'single' | 'basket' | 'pool';
+  /** Comma-separated tickers of a pooled multi-asset run. */
+  pool: string;
   symbol: string;
   basket: BasketRow[];
   interval: Interval;
@@ -65,6 +72,8 @@ export interface RunConfig {
 }
 
 export const MAX_UNIVERSE_ASSETS = 8;
+/** Default pooled sample: the four most liquid crypto majors. */
+export const DEFAULT_POOL = 'BTC-USD, ETH-USD, SOL-USD, BNB-USD';
 /** Typical perpetual funding rate (≈ 11% a year). */
 export const DEFAULT_FUNDING_PCT_8H = 0.01;
 /** Retail borrow cost of shorting stocks and ETFs, in percent per year. */
@@ -85,6 +94,7 @@ export const DEFAULT_CONFIG: RunConfig = {
     { id: 2, symbol: 'ETH-USD', weight: 30 },
     { id: 3, symbol: 'NVDA', weight: 20 },
   ],
+  pool: DEFAULT_POOL,
   interval: '1d',
   range: '5y',
   capital: 10_000,
@@ -131,6 +141,14 @@ export type ResolvedUniverse = { ok: true; symbols: string[] } | { ok: false; er
  * rest of the list. Returns an empty list when the mode is off (or a basket is traded).
  */
 export function resolveUniverse(config: RunConfig, primary: string): ResolvedUniverse {
+  if (config.assetMode === 'pool') {
+    const symbols = parseUniverse(config.pool);
+    const invalid = symbols.find((symbol) => !TICKER_PATTERN.test(symbol));
+    if (invalid) return { ok: false, error: `"${invalid}" in the asset pool is not a valid ticker.` };
+    if (symbols.length < 2) return { ok: false, error: 'An asset pool needs at least two tickers.' };
+    if (symbols.length > MAX_UNIVERSE_ASSETS) return { ok: false, error: `An asset pool can hold at most ${MAX_UNIVERSE_ASSETS} assets.` };
+    return { ok: true, symbols };
+  }
   if (!config.robustUniverse || config.assetMode !== 'single') return { ok: true, symbols: [] };
   const listed = parseUniverse(config.universe);
   const invalid = listed.find((symbol) => !TICKER_PATTERN.test(symbol));
@@ -147,6 +165,12 @@ export type ResolvedAssets = { ok: true; components: BasketComponent[] } | { ok:
 
 /** Validate the asset selection and return normalised basket components. */
 export function resolveAssets(config: RunConfig): ResolvedAssets {
+  if (config.assetMode === 'pool') {
+    // The first pool ticker is the chart's reference asset; every pool asset is traded.
+    const first = parseUniverse(config.pool)[0];
+    if (!first || !TICKER_PATTERN.test(first)) return { ok: false, error: 'Enter at least two valid tickers for the asset pool.' };
+    return { ok: true, components: [{ symbol: first, weight: 1 }] };
+  }
   if (config.assetMode === 'single') {
     const symbol = config.symbol.trim().toUpperCase();
     if (!TICKER_PATTERN.test(symbol)) return { ok: false, error: 'Enter a valid ticker, for example BTC-USD or NVDA.' };
@@ -163,7 +187,11 @@ export function resolveAssets(config: RunConfig): ResolvedAssets {
 /** True when every traded instrument is a crypto pair (a crypto basket counts; a mixed basket does not). */
 export function tradesCrypto(config: RunConfig): boolean {
   const symbols =
-    config.assetMode === 'single' ? [config.symbol] : config.basket.filter((row) => row.symbol.trim() !== '' && row.weight > 0).map((row) => row.symbol);
+    config.assetMode === 'pool'
+      ? parseUniverse(config.pool)
+      : config.assetMode === 'single'
+        ? [config.symbol]
+        : config.basket.filter((row) => row.symbol.trim() !== '' && row.weight > 0).map((row) => row.symbol);
   return symbols.length > 0 && symbols.every(isCrypto);
 }
 
@@ -190,6 +218,7 @@ export function settingsFrom(config: RunConfig): BacktestSettings {
     slippagePct: config.slippagePct,
     slippageAtrMult: config.slippageAtrMult,
     tradeMode: config.tradeMode,
+    poolAssets: config.assetMode === 'pool',
     sizing: {
       mode: config.sizingMode === 'full' ? 'full' : 'risk',
       riskPct: config.riskPct,

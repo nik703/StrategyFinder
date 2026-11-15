@@ -13,7 +13,7 @@ import type { ReactNode } from 'react';
 import type { RunContext } from '../lib/config';
 import type { BudgetStatus } from '../lib/trialLedger';
 import { fmtDate, fmtDuration, fmtInt, fmtNum, fmtPct } from '../lib/format';
-import { DSR_PATIENCE, type EngineStatus, type ProgressSnapshot, type StopReason } from '../types/trading';
+import { FITNESS_PATIENCE, type EngineStatus, type ProgressSnapshot, type StopReason } from '../types/trading';
 import { cx, Panel } from './ui';
 
 interface TelemetryStripProps {
@@ -42,7 +42,7 @@ const BUDGET_TEXT: Record<BudgetStatus['level'], { label: string; tone: string; 
   fresh: { label: 'Fresh data', tone: 'text-up', bar: 'bg-accent' },
   degrading: { label: 'Significance degrading', tone: 'text-warn', bar: 'bg-warn' },
   critical: { label: 'Nearly spent', tone: 'text-down', bar: 'bg-down' },
-  exhausted: { label: 'Spent – search disabled', tone: 'text-down', bar: 'bg-down' },
+  exhausted: { label: 'Spent – extend to continue', tone: 'text-down', bar: 'bg-down' },
 };
 
 const STATUS: Record<EngineStatus, { label: string; className: string; icon: ReactNode }> = {
@@ -137,7 +137,7 @@ export default function TelemetryStrip({
           <span className="num text-sm text-ink-3">/ {fmtInt(maxEvaluations)}</span>
         </div>
         <div className="num mt-1 text-xs leading-snug text-ink-3" title="Repeated genomes and repeated trade logs are skipped: they are not new trials.">
-          {fmtInt(telemetry.duplicates)} duplicates skipped · early stop {fmtInt(Math.min(telemetry.dsrStall, DSR_PATIENCE))}/{fmtInt(DSR_PATIENCE)}
+          {fmtInt(telemetry.duplicates)} duplicates skipped · early stop {fmtInt(Math.min(telemetry.fitnessStall, FITNESS_PATIENCE))}/{fmtInt(FITNESS_PATIENCE)}
         </div>
       </Tile>
 
@@ -159,6 +159,11 @@ export default function TelemetryStrip({
             >
               <div className={cx('h-full rounded-full transition-[width] duration-150 ease-linear', level.bar)} style={{ width: `${budget.status.share * 100}%` }} />
             </div>
+            {budget.status.extensions > 0 && (
+              <div className="mt-1 text-xs font-semibold text-warn" role="note">
+                Extended {budget.status.extensions}× beyond the default budget – multiple-testing significance is degraded
+              </div>
+            )}
             <div
               className="num mt-1 truncate text-xs text-ink-3"
               title="Annualised Sharpe the luckiest of that many skill-less strategies is expected to show over this search period by chance alone. Every trial on overlapping data – any run, any session – counts."

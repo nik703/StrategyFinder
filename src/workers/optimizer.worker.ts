@@ -31,9 +31,7 @@ import {
   holdoutMetrics,
   holdoutShortfalls,
   median,
-  MIN_TRADES,
-  MIN_TRADES_PER_YEAR,
-  MIN_VALIDATION_TRADES,
+  passesTradeGates,
   runBacktest,
   segmentMetrics,
   UNFIT,
@@ -47,6 +45,7 @@ import {
   sampleCurve,
   scoreAssets,
   scoreNeighbours,
+  sampleOf,
   tradesPerYear,
   type Asset,
   type AssetScore,
@@ -77,7 +76,7 @@ import {
 import { expectedMaxSharpe, haircutSharpe, RunningStats } from '../lib/stats';
 import {
   DEFAULT_RUN_EVALUATIONS,
-  DSR_PATIENCE,
+  FITNESS_PATIENCE,
   EXHAUSTION_LIMIT,
   HYPOTHESIS_IDS,
   LEADERBOARD_SIZE,
@@ -131,8 +130,8 @@ const CLONE_CORRELATION = 0.9;
 const ROUNDS_PER_EVALUATOR = 4;
 /** Pure random search until the leaderboard holds this many strategies. */
 const SEED_POPULATION = 10;
-/** A candidate must beat the board's best deflated Sharpe by this much to reset the early-stopping clock. */
-const DSR_MIN_GAIN = 0.001;
+/** A candidate must beat the board's best fitness by this much to reset the early-stopping clock. */
+const FITNESS_MIN_GAIN = 0.001;
 /** The stability map spans this many grid steps either side of the chosen value. */
 const STABILITY_RADIUS = 2;
 /** Trades removed by the "top trades" robustness test. */
@@ -259,6 +258,12 @@ interface Session extends EvalContext {
   inactive: number;
 }
 
+/** Gates for one asset of a pooled universe: the pooled gates shared out over the assets. */
+function perAssetGates(s: Session): Session['gates'] {
+  const k = Math.max(1, s.assets.length);
+  return { ...s.gates, search: Math.ceil(s.gates.search / k), validation: Math.ceil(s.gates.validation / k), perYear: s.gates.perYear / k };
+}
+
 function addUniverse(s: Session, universe: NamedDataset[]): void {
   const known = new Set([...s.assets, ...s.extra].map((asset) => asset.symbol));
   const fresh = universe.filter((dataset) => !known.has(dataset.symbol));
@@ -319,45 +324,43 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
     maxBarsInTrade,
   });
   const adx = (op: 'gt' | 'lt', level: number): Condition => ({ ind: 'ADX', period: 14, variant: 'strength', op, level });
-  const rsi = (period: number, op: 'lt' | 'cross_above', level: number): Condition => ({ ind: 'RSI', period, op, level });
-  const slowTrend: Condition = { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' };
+  const rsi = (period: number, level: number): Condition => ({ ind: 'RSI', period, op: 'cross_above', level });
+  const emaCross = (fast: number, slow: number): Condition => ({ ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: fast, slowType: 'EMA', slowPeriod: slow, op: 'cross_above' });
+  const donchian = (period: number): Condition => ({ ind: 'DONCHIAN', period, variant: 'upper', op: 'cross_above' });
+  const aboveEma = (period: number): Condition => ({ ind: 'PRICE_MA', maType: 'EMA', period, op: 'gt' });
+  const rising = (period: number): Condition => ({ ind: 'MA_SLOPE', maType: 'EMA', period, op: 'gt' });
+  const lowerBand: Condition = { ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 };
   let seeds: StrategyGenome[];
   switch (h) {
     case 'TREND_FOLLOWING':
       seeds = [
-        // Long-term trend with a trailing ATR stop.
-        seed([{ ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' }], dynamic(3, null, true)),
-        // Medium-term trend entry when trend strength is present, closed when the trend breaks.
-        seed([{ ind: 'PRICE_MA', maType: 'EMA', period: 56, op: 'cross_above' }, adx('gt', 20)], dynamic(2.5, null, true, true)),
-        // Short-term trend with a fixed ATR bracket.
-        seed([{ ind: 'PRICE_MA', maType: 'EMA', period: 20, op: 'cross_above' }], dynamic(2, 4, false)),
+        // 20/56 EMA cross in a long-term uptrend, trailing ATR stop.
+        seed([emaCross(20, 56), aboveEma(200)], dynamic(3, null, true)),
+        // Turtle-style 56-candle breakout while the slow EMA rises and a trend is present, closed on the opposite breakout.
+        seed([donchian(56), rising(112), adx('gt', 20)], dynamic(2.5, null, true, true)),
+        // MACD signal cross above the 200 EMA with a fixed ATR bracket.
+        seed([{ ind: 'MACD', fast: 14, slow: 28, signal: 10, variant: 'signal', op: 'cross_above' }, aboveEma(200)], dynamic(2, 4, false)),
       ];
       break;
     case 'VOL_BREAKOUT':
       seeds = [
-        seed([{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }], dynamic(2, 4, false)),
-        seed(
-          [
-            { ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 },
-            { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 },
-          ],
-          dynamic(2.5, null, true),
-        ),
-        seed([{ ind: 'BB', period: 40, mult: 2.5, variant: 'upper', op: 'cross_above', level: 0 }], dynamic(3, 6, false), 20),
+        seed([donchian(20), aboveEma(112)], dynamic(2, 4, false)),
+        seed([{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }, rising(112), { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }], dynamic(2.5, null, true)),
+        seed([donchian(40), { ind: 'VOLUME', period: 20, op: 'gt', level: 1.25 }], dynamic(3, 6, false), 20),
       ];
       break;
     case 'DIP_IN_UPTREND':
       seeds = [
-        seed([rsi(14, 'lt', 30), slowTrend], { mode: 'static', stopLossPct: 5, takeProfitPct: 10 }),
-        seed([rsi(7, 'cross_above', 20), { ...slowTrend, period: 160 }], dynamic(2, 3, false), 10),
-        seed([rsi(5, 'lt', 15), slowTrend], { mode: 'static', stopLossPct: 4, takeProfitPct: 7.5 }, 5),
+        seed([rsi(14, 30), aboveEma(200)], { mode: 'static', stopLossPct: 5, takeProfitPct: 10 }),
+        seed([rsi(7, 20), rising(112)], dynamic(2, 3, false), 10),
+        seed([lowerBand, aboveEma(160), adx('gt', 20)], dynamic(2, 3, false, true), 20),
       ];
       break;
     case 'RANGE_REVERSION':
       seeds = [
-        seed([rsi(14, 'lt', 30)], { mode: 'static', stopLossPct: 4, takeProfitPct: 7.5 }),
-        seed([rsi(14, 'lt', 30), adx('lt', 20)], dynamic(2, 3, false), 20),
-        seed([rsi(7, 'cross_above', 25), adx('lt', 25)], { mode: 'static', stopLossPct: 3, takeProfitPct: 5 }, 10),
+        seed([rsi(14, 30)], { mode: 'static', stopLossPct: 4, takeProfitPct: 7.5 }),
+        seed([rsi(14, 30), adx('lt', 20)], dynamic(2, 3, false, true), 20),
+        seed([lowerBand, adx('lt', 25)], { mode: 'static', stopLossPct: 3, takeProfitPct: 5 }, 10),
       ];
       break;
   }
@@ -472,8 +475,13 @@ function stabilityGrid(s: Session, genome: StrategyGenome): StabilityGrid | null
     const m = evaluateSearch(primary.ind, g, s.settings, primary.ws, primary.split, primary.periodsPerYear);
     return {
       sharpe: m.search.sharpe,
-      undersampled:
-        m.search.trades < MIN_TRADES || m.validation.trades < MIN_VALIDATION_TRADES || tradesPerYear(s, 0, m) < MIN_TRADES_PER_YEAR,
+      // The map reads the primary asset alone, so it is gated per asset even in a pooled run.
+      undersampled: !passesTradeGates({
+        trades: m.search.trades,
+        validationTrades: m.validation.trades,
+        tradesPerYear: tradesPerYear(s, 0, m),
+        gates: s.pooled ? perAssetGates(s) : s.gates,
+      }),
     };
   };
   const base = measure(genome).sharpe;
@@ -541,7 +549,7 @@ function stabilityGrid(s: Session, genome: StrategyGenome): StabilityGrid | null
  *             • deflated Sharpe of the validation segment ≥ 95%;
  *             • holdout Sharpe 95% confidence interval entirely above zero;
  *             • holdout Sharpe above Buy & Hold's holdout Sharpe (risk-adjusted, not raw return);
- *             • at least `MIN_HOLDOUT_TRADES` holdout trades;
+ *             • at least `gates.holdout` holdout trades (summed over the assets when pooled);
  *             • ±20% parameter sensitivity, top-trade removal and cross-asset tests all pass;
  *             • the holdout period had never been revealed before (untouched data);
  *             • the run used live market data, not the simulated fallback.
@@ -561,7 +569,9 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
 
   const notes: string[] = [];
   if (result.dsr < 0.95) notes.push(`Deflated Sharpe ${pct(result.dsr)} is under 95%: not distinguishable from the luckiest of the strategies tried.`);
-  notes.push(...holdoutShortfalls(holdout, finalBenchmark(s).holdout, s.assets[0].periodsPerYear));
+  // With a pooled universe the holdout sample is pooled too.
+  const holdoutTrades = result.sample?.holdoutTrades ?? holdout.trades;
+  notes.push(...holdoutShortfalls(holdout, finalBenchmark(s).holdout, s.assets[0].periodsPerYear, s.gates.holdout, holdoutTrades));
   if (report.sensitivity.fragile) notes.push('A ±20% change of one parameter costs more than half of the return.');
   if (!report.topTrades.profitable) notes.push(`Unprofitable without its ${report.topTrades.removed} best trades.`);
   if (report.crossAsset !== null && report.crossAsset.share < 2 / 3 - 1e-9) {
@@ -614,6 +624,10 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     equity,
     assets,
   };
+  if (result.sample) {
+    const holdoutTrades = s.pooled ? assets.reduce((sum, asset) => sum + (asset.holdout?.trades ?? 0), 0) : (primary.holdout?.trades ?? 0);
+    result.sample = { ...result.sample, holdoutTrades };
+  }
   const robustness = analyze(s, base.genome);
   const { verdict, notes } = judge(s, robustness, result);
   return { ...result, robustness, verdict, verdictNotes: notes };
@@ -792,6 +806,8 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     benchmark: sealedBenchmark(s),
     axis,
     barsPerYear: primary.periodsPerYear,
+    gates: s.gates,
+    pooled: s.pooled,
   });
 
   const seen = new Set<string>();
@@ -802,11 +818,9 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   /** Unique, trading strategies evaluated by this run: its trials. */
   let evaluations = 0;
   /** Evaluations since a candidate last beat the best deflated Sharpe on the board. */
-  let dsrStall = 0;
+  let fitnessStall = 0;
   /** Proposals since the last new (non-duplicate, trading) evaluation. */
   let sinceNew = 0;
-  /** Best deflated Sharpe on the board, against the round's frozen hurdle. */
-  let bestDsr = -Infinity;
   /** Trade-log fingerprints registered since the last batch was sent to the evaluators. */
   let knownDelta: string[] = [];
   let boardDirty = false;
@@ -823,7 +837,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       stagnation,
       evaluations,
       windowTrials: prior.count + evaluations,
-      dsrStall,
+      fitnessStall,
       duplicates: s.duplicates,
       runTrials: { count: s.runTrials.count, mean: s.runTrials.mean, m2: s.runTrials.m2 },
       bestFitness: board.length > 0 ? board[0].result.fitness : null,
@@ -848,7 +862,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const propose = (): StrategyGenome => {
     if (seeds.length > 0) return seeds.shift() as StrategyGenome;
     if (board.length < SEED_POPULATION) return randomGenome(rng, mode, limits, hypothesis);
-    const progress = Math.min(1, dsrStall / DSR_PATIENCE);
+    const progress = Math.min(1, fitnessStall / FITNESS_PATIENCE);
     const r = rng();
     // Exploration grows from 10% to 25% of proposals as the search stalls.
     const explore = 0.1 + 0.15 * progress;
@@ -866,11 +880,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   };
 
   /** True when a fully scored candidate fails a hard minimum-trade gate. */
-  const isUndersampled = (scores: AssetScore[]): boolean => {
-    const primaryMetrics = scores[0].metrics;
-    if (primaryMetrics.search.trades < MIN_TRADES || primaryMetrics.validation.trades < MIN_VALIDATION_TRADES) return true;
-    return scores.some((score, a) => tradesPerYear(s, a, score.metrics) < MIN_TRADES_PER_YEAR);
-  };
+  const isUndersampled = (scores: AssetScore[]): boolean => !passesTradeGates({ ...sampleOf(s, scores), gates: s.gates });
 
   interface Outcome {
     /** False when the candidate was not a trial: it never traded, or repeated a known trade log. */
@@ -878,9 +888,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     /** The top fitness improved. */
     improvedFitness: boolean;
     /** The candidate entered the board with a deflated Sharpe above the board's best. */
-    improvedDsr: boolean;
+    /** The top fitness improved by at least `FITNESS_MIN_GAIN` (resets the early-stopping clock). */
+    improvedMeaningfully: boolean;
   }
-  const NOT_A_TRIAL: Outcome = { trial: false, improvedFitness: false, improvedDsr: false };
+  const NOT_A_TRIAL: Outcome = { trial: false, improvedFitness: false, improvedMeaningfully: false };
 
   /** Register an evaluated candidate and insert it into the leaderboard if it qualifies. */
   const consider = (genome: StrategyGenome, evaluated: CandidateResult): Outcome => {
@@ -903,7 +914,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // Every new, trading strategy is a trial, whether or not it makes the leaderboard.
     s.trials.push(primaryMetrics.validation.sharpeRaw);
     s.runTrials.push(primaryMetrics.validation.sharpeRaw * annualiser);
-    const trialOnly: Outcome = { trial: true, improvedFitness: false, improvedDsr: false };
+    const trialOnly: Outcome = { trial: true, improvedFitness: false, improvedMeaningfully: false };
     if (!complete) return trialOnly;
     if (fitness <= UNFIT) {
       if (isUndersampled(scores)) s.undersampled++;
@@ -971,6 +982,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         haircutSharpe: haircut.sharpe,
         haircut: haircut.haircut,
         params: countParameters(genome, limits),
+        sample: { ...sampleOf(s, scores), holdoutTrades: null, gates: s.gates, pooled: s.pooled },
         search: primaryMetrics.search,
         train: primaryMetrics.train,
         validation: primaryMetrics.validation,
@@ -991,9 +1003,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     if (board.length > LEADERBOARD_SIZE) board.length = LEADERBOARD_SIZE;
     boardDirty = true;
     const onBoard = board.includes(entry);
-    const improvedDsr = onBoard && dsr > bestDsr + DSR_MIN_GAIN;
-    if (onBoard && dsr > bestDsr) bestDsr = dsr;
-    return { trial: true, improvedFitness: fitness > best + 1e-9, improvedDsr };
+    return { trial: true, improvedFitness: onBoard && fitness > best + 1e-9, improvedMeaningfully: onBoard && fitness > best + FITNESS_MIN_GAIN };
   };
 
   /** Propose a candidate the search has not proposed before (a few retries, then accept the repeat). */
@@ -1045,7 +1055,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   /** Why the run must end now, or null to carry on. */
   const stopReason = (): StopReason | null => {
     if (evaluations >= maxEvaluations) return prior.count + evaluations >= windowBudget ? 'window-budget' : 'budget';
-    if (dsrStall >= DSR_PATIENCE) return 'converged';
+    if (fitnessStall >= FITNESS_PATIENCE) return 'converged';
     if (sinceNew >= EXHAUSTION_LIMIT) return 'exhausted';
     return null;
   };
@@ -1054,7 +1064,6 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // The selection-bias hurdle and the leaderboard floor are frozen for the round, so every
     // candidate in it is judged like for like whichever evaluator scores it.
     rescoreBoard(s);
-    bestDsr = board.reduce((max, entry) => Math.max(max, entry.result.dsr), -Infinity);
     const floor = board.length >= LEADERBOARD_SIZE ? board[board.length - 1].result.fitness : -Infinity;
     const batch: { genome: StrategyGenome; duplicate: boolean }[] = [];
     for (let k = 0; k < batchSize; k++) batch.push(proposeUnique());
@@ -1081,7 +1090,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       if (outcome.trial) {
         evaluations++;
         sinceNew = 0;
-        dsrStall = outcome.improvedDsr ? 0 : dsrStall + 1;
+        fitnessStall = outcome.improvedMeaningfully ? 0 : fitnessStall + 1;
       } else {
         sinceNew++;
       }

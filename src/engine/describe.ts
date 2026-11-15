@@ -4,6 +4,7 @@
  */
 
 import { conditionRole } from './genome';
+import { SLOPE_LAG } from '../types/trading';
 import type {
   Archetype,
   BacktestSettings,
@@ -76,6 +77,10 @@ export function conditionOperands(c: Condition): { left: string; right: string }
       return { left: 'Close', right: `Supertrend(${c.period},${mult(c.mult)})` };
     case 'CCI':
       return { left: `CCI(${c.period})`, right: String(c.level) };
+    case 'DONCHIAN':
+      return { left: 'Close', right: c.variant === 'upper' ? `Highest_High(${c.period})[1]` : `Lowest_Low(${c.period})[1]` };
+    case 'MA_SLOPE':
+      return { left: `${c.maType}(${c.period})`, right: `${c.maType}(${c.period})[${SLOPE_LAG}]` };
   }
   return { left: '?', right: '?' };
 }
@@ -220,6 +225,12 @@ export function conditionSentence(c: Condition): string {
       )}`;
     case 'CCI':
       return `${c.period}-period CCI ${generic(c.op)} ${c.level}`;
+    case 'DONCHIAN':
+      return c.variant === 'upper'
+        ? `Close ${generic(c.op)} the highest high of the previous ${c.period} candles${relation(c.op, '', '', ' (range breakout)', '')}`
+        : `Close ${generic(c.op)} the lowest low of the previous ${c.period} candles${relation(c.op, '', '', '', ' (range breakdown)')}`;
+    case 'MA_SLOPE':
+      return `The ${c.period}-period ${c.maType} ${relation(c.op, 'is rising', 'is falling', 'turns up', 'turns down')} (vs. ${SLOPE_LAG} candles earlier)`;
   }
   return conditionFormula(c);
 }
@@ -232,13 +243,15 @@ export interface RuleDescription {
 
 /** Label for the job a condition does inside its entry. */
 function conditionJob(c: Condition, index: number): string {
-  if (index === 0) return 'Trigger';
-  return conditionRole(c) === 'FILTER' ? 'Filter' : 'Regime filter';
+  if (index === 0) return 'Entry trigger';
+  return conditionRole(c) === 'FILTER' ? 'Confirmation filter' : 'Regime filter';
 }
 
 function describeGroup(group: RuleGroup, action: string, labelled = true): RuleDescription {
   const quantifier =
-    group.conditions.length > 1
+    group.conditions.length > 2
+      ? 'when ALL of the following are true on the close of the same candle:'
+      : group.conditions.length > 1
       ? 'when BOTH of the following are true on the close of the same candle:'
       : 'when, on the close of a candle:';
   return {
@@ -360,7 +373,7 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
         text: `No fixed target – winners run until ${
           [
             exit.trailing ? 'the trailing stop' : null,
-            exit.longExit ? 'the trigger reversal' : null,
+            exit.longExit ? 'the opposite signal' : null,
             genome.maxBarsInTrade !== null ? 'the time stop' : null,
           ]
             .filter((part): part is string => part !== null)
@@ -372,8 +385,8 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
       longSignalExit = describeGroup(exit.longExit, "Close the long at the next candle's open", false);
       if (exit.shortExit) shortSignalExit = describeGroup(exit.shortExit, "Cover the short at the next candle's open", false);
       bullets.push({
-        title: 'Trigger-reversal exit',
-        text: 'A trade is also closed when its own entry trigger flips to the opposite side (rule listed below).',
+        title: 'Opposite-signal exit',
+        text: "A trade is also closed when the opposite side's entry trigger fires (rule listed below).",
       });
     }
   }
@@ -464,7 +477,7 @@ export function exitTags(genome: StrategyGenome): string[] {
   const tags: string[] = [];
   if (genome.exit.mode === 'dynamic') {
     if (genome.exit.trailing) tags.push('Trailing');
-    if (genome.exit.longExit) tags.push('Reversal exit');
+    if (genome.exit.longExit) tags.push('Opposite-signal exit');
     if (genome.exit.takeProfitAtrMult === null) tags.push('No target');
   }
   if (genome.maxBarsInTrade !== null) tags.push(`${genome.maxBarsInTrade}-bar time stop`);
@@ -495,6 +508,10 @@ function badgeFor(c: Condition): string[] {
       return ['Supertrend'];
     case 'CCI':
       return ['CCI'];
+    case 'DONCHIAN':
+      return ['Donchian'];
+    case 'MA_SLOPE':
+      return [c.maType];
   }
 }
 
@@ -508,7 +525,7 @@ function allGroups(genome: StrategyGenome): { group: RuleGroup; role: string }[]
   return groups;
 }
 
-const BADGE_ORDER = ['RSI', 'MACD', 'EMA', 'SMA', 'BB', 'Stoch', 'ADX', 'Volume', 'Supertrend', 'CCI', 'ATR'];
+const BADGE_ORDER = ['RSI', 'MACD', 'EMA', 'SMA', 'Donchian', 'BB', 'Stoch', 'ADX', 'Volume', 'Supertrend', 'CCI', 'ATR'];
 
 /** Unique indicator names used anywhere in the strategy, in a stable order. */
 export function indicatorBadges(genome: StrategyGenome): string[] {
@@ -560,6 +577,10 @@ function usageFor(c: Condition): { name: string; params: string }[] {
       return [{ name: 'Supertrend', params: `ATR period ${c.period} · multiplier ${mult(c.mult)}` }];
     case 'CCI':
       return [{ name: 'CCI', params: `period ${c.period}` }];
+    case 'DONCHIAN':
+      return [{ name: 'Donchian channel', params: `previous ${c.period} candles` }];
+    case 'MA_SLOPE':
+      return [{ name: c.maType, params: `period ${c.period} · slope over ${SLOPE_LAG} candles` }];
   }
 }
 

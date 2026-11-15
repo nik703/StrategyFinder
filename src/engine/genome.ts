@@ -2,17 +2,21 @@
  * Strategy genome: market hypotheses, parameter grids, random generation,
  * mutation, crossover and repair.
  *
- * The search space is deliberately small and coherent, so the optimiser cannot
- * assemble a pile of unrelated, finely tuned rules:
+ * The search space is coherent but expressive enough to hold real multi-condition strategies:
  *
- *   • every run tests ONE market hypothesis (see `HYPOTHESES`): it fixes the
- *     single trigger primitive, the filter and the filter's direction. Collinear
- *     indicators are not separate ideas – RSI, Stochastic, CCI and %B all measure
- *     "short-horizon oversold", and Supertrend, MA crosses and MACD all measure
- *     "trend" – so each idea is expressed by one primitive and the search only
- *     tunes its numbers;
+ *   • every run tests ONE market hypothesis (see `HYPOTHESES`), which lists the
+ *     primitives each slot of an entry may use and fixes their direction;
+ *   • an entry has up to three slots, combined with AND:
+ *       1. a required ENTRY TRIGGER – a discrete event (a crossover, a channel
+ *          breakout, an oscillator crossing back out of its extreme zone). It
+ *          fires once per setup, so a strategy cannot re-enter the same trend
+ *          leg on every candle after a stop or target is hit;
+ *       2. an optional REGIME filter – a state (price above a slow EMA, a rising
+ *          slow EMA) that says which market the trigger is meant for;
+ *       3. an optional CONFIRMATION filter – a state (trend strength, volume);
+ *   • exits: fixed or ATR brackets, a trailing stop, a time stop and an
+ *     opposite-signal exit (the mirrored trigger closes the trade);
  *   • every strategy follows its hypothesis's archetype (TREND or MEAN_REVERSION);
- *   • an entry is ONE trigger plus at most ONE filter, combined with AND;
  *   • short rules are always the mirror image of the long rules;
  *   • every number comes from a coarse, round-number grid;
  *   • a strategy may tune at most `MAX_PARAMETERS` numbers in total;
@@ -115,17 +119,19 @@ export const GRIDS = {
   volumeRatio: [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3],
 } as const;
 
-/** One trigger + one filter per entry. */
-export const MAX_CONDITIONS = 2;
+/** Trigger + regime filter + confirmation filter. */
+export const MAX_CONDITIONS = 3;
 /** Indicator-reversal exits are a single condition. */
 export const MAX_EXIT_CONDITIONS = 1;
 /** Hard cap on the number of tunable numbers in a strategy. */
-export const MAX_PARAMETERS = 8;
+export const MAX_PARAMETERS = 10;
 /** Parameters above this count cost fitness. */
-export const FREE_PARAMETERS = 4;
+export const FREE_PARAMETERS = 6;
 /** "Short-term" triggers look back at most this many bars; regime filters at least `SLOW_LOOKBACK`. */
 export const SHORT_LOOKBACK = 30;
 export const SLOW_LOOKBACK = 100;
+/** Shortest EMA whose slope may serve as a regime filter. */
+export const MIN_SLOPE_LOOKBACK = 56;
 
 /** Stochastic smoothing is fixed at the textbook 3 / 3 so it is not a tunable parameter. */
 const STOCH_SMOOTH = 3;
@@ -255,6 +261,10 @@ export function mirrorCondition(c: Condition): Condition {
     case 'ATR':
     case 'VOLUME':
       return { ...c };
+    case 'DONCHIAN':
+      return { ...c, variant: c.variant === 'upper' ? 'lower' : 'upper', op: flipOp(c.op) };
+    case 'MA_SLOPE':
+      return { ...c, op: flipOp(c.op) };
   }
 }
 
@@ -351,6 +361,10 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
         ['period', lookbacks(10, 50, limits)],
         ['level', c.level < 0 ? GRIDS.cciLow : GRIDS.cciHigh],
       ];
+    case 'DONCHIAN':
+      return [['period', lookbacks(10, 112, limits)]];
+    case 'MA_SLOPE':
+      return [['period', lookbacks(MIN_SLOPE_LOOKBACK, 200, limits)]];
   }
 }
 
@@ -372,7 +386,7 @@ function normalizeCondition(input: Condition, slot: Slot, limits: GenomeLimits):
       const low = (fields.level as number) < mid;
       if (low && c.op === 'gt') c.op = 'lt';
       if (!low && c.op === 'lt') c.op = 'gt';
-    } else if (c.ind === 'BB') {
+    } else if (c.ind === 'BB' || c.ind === 'DONCHIAN') {
       if (c.variant === 'lower' && c.op === 'gt') c.op = 'lt';
       if (c.variant === 'upper' && c.op === 'lt') c.op = 'gt';
     }
@@ -418,7 +432,7 @@ function isValidSecond(c: Condition, archetype: Archetype, limits: GenomeLimits)
   if (archetype === 'TREND') return false;
   // Mean reversion may be gated by a slow up-trend regime.
   return (
-    (c.ind === 'PRICE_MA' || c.ind === 'MA_CROSS') &&
+    (c.ind === 'PRICE_MA' || c.ind === 'MA_CROSS' || c.ind === 'MA_SLOPE') &&
     c.op === 'gt' &&
     conditionLookback(c) >= SLOW_LOOKBACK &&
     limits.maxLookback >= SLOW_LOOKBACK
@@ -434,7 +448,7 @@ export function isCoherent(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIM
   const { conditions } = g.longEntry;
   if (conditions.length < 1 || conditions.length > MAX_CONDITIONS) return false;
   if (!isValidTrigger(conditions[0], g.archetype, limits)) return false;
-  return conditions.length === 1 || isValidSecond(conditions[1], g.archetype, limits);
+  return conditions.slice(1).every((c) => isValidSecond(c, g.archetype, limits));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -449,23 +463,126 @@ export interface HypothesisInfo {
   archetype: Archetype;
   /** Why the effect should exist at all. */
   rationale: string;
-  /** The one trigger primitive the search tunes. */
+  /** The entry-trigger events the search may use. */
   trigger: string;
-  /** The filter (and its fixed direction), or why there is none. */
+  /** The regime and confirmation filters (and their fixed direction). */
   filter: string;
+  /** True when every strategy must carry a regime filter. */
   filterRequired: boolean;
-  /** The indicators this hypothesis replaces – they measure the same thing. */
+  /** What the slots replace – collinear indicators that measure the same thing. */
   replaces: string;
 }
 
+/** Entry slot a primitive fills. */
+export type EntrySlot = 'trigger' | 'regime' | 'confirm';
+
+/** One building block of an entry: a template the search tunes, and the test that recognises it. */
+interface Primitive {
+  id: string;
+  slot: EntrySlot;
+  /** Template condition (its numbers are redrawn from the grids), or null when the data cannot support it. */
+  template: (limits: GenomeLimits) => Condition | null;
+  matches: (c: Condition, limits: GenomeLimits) => boolean;
+}
+
+const hasGrid = (min: number, max: number, limits: GenomeLimits): boolean => lookbacks(min, max, limits).length > 0;
+
+const PRIMITIVES = {
+  // ---- Entry triggers: discrete events ----------------------------------------------------------
+  EMA_CROSS: {
+    id: 'EMA_CROSS',
+    slot: 'trigger',
+    template: () => ({ ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: 20, slowType: 'EMA', slowPeriod: 56, op: 'cross_above' }),
+    matches: (c) => c.ind === 'MA_CROSS' && c.fastType === 'EMA' && c.slowType === 'EMA' && c.op === 'cross_above',
+  },
+  DONCHIAN_BREAKOUT: {
+    id: 'DONCHIAN_BREAKOUT',
+    slot: 'trigger',
+    template: () => ({ ind: 'DONCHIAN', period: 20, variant: 'upper', op: 'cross_above' }),
+    matches: (c) => c.ind === 'DONCHIAN' && c.variant === 'upper' && c.op === 'cross_above',
+  },
+  MACD_CROSS: {
+    id: 'MACD_CROSS',
+    slot: 'trigger',
+    template: () => ({ ind: 'MACD', fast: 14, slow: 28, signal: 10, variant: 'signal', op: 'cross_above' }),
+    matches: (c) => c.ind === 'MACD' && c.variant === 'signal' && c.op === 'cross_above',
+  },
+  BB_BREAKOUT: {
+    id: 'BB_BREAKOUT',
+    slot: 'trigger',
+    template: () => ({ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }),
+    matches: (c) => c.ind === 'BB' && c.variant === 'upper' && c.op === 'cross_above',
+  },
+  RSI_REJECTION: {
+    id: 'RSI_REJECTION',
+    slot: 'trigger',
+    template: () => ({ ind: 'RSI', period: 14, op: 'cross_above', level: 30 }),
+    matches: (c) => c.ind === 'RSI' && c.op === 'cross_above' && c.level < 50,
+  },
+  BB_REJECTION: {
+    id: 'BB_REJECTION',
+    slot: 'trigger',
+    template: () => ({ ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 }),
+    matches: (c) => c.ind === 'BB' && c.variant === 'lower' && c.op === 'cross_above',
+  },
+  // ---- Regime filters: slow states ---------------------------------------------------------------
+  ABOVE_SLOW_EMA: {
+    id: 'ABOVE_SLOW_EMA',
+    slot: 'regime',
+    template: (limits) => (hasGrid(SLOW_LOOKBACK, 200, limits) ? { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' } : null),
+    matches: (c) => c.ind === 'PRICE_MA' && c.maType === 'EMA' && c.op === 'gt' && c.period >= SLOW_LOOKBACK,
+  },
+  SLOW_EMA_RISING: {
+    id: 'SLOW_EMA_RISING',
+    slot: 'regime',
+    template: (limits) => (hasGrid(MIN_SLOPE_LOOKBACK, 200, limits) ? { ind: 'MA_SLOPE', maType: 'EMA', period: 112, op: 'gt' } : null),
+    matches: (c) => c.ind === 'MA_SLOPE' && c.maType === 'EMA' && c.op === 'gt' && c.period >= MIN_SLOPE_LOOKBACK,
+  },
+  // ---- Confirmation filters: fast states ---------------------------------------------------------
+  ADX_TRENDING: {
+    id: 'ADX_TRENDING',
+    slot: 'confirm',
+    template: () => ({ ind: 'ADX', period: 14, variant: 'strength', op: 'gt', level: 20 }),
+    matches: (c) => c.ind === 'ADX' && c.variant === 'strength' && c.op === 'gt',
+  },
+  ADX_RANGING: {
+    id: 'ADX_RANGING',
+    slot: 'confirm',
+    template: () => ({ ind: 'ADX', period: 14, variant: 'strength', op: 'lt', level: 20 }),
+    matches: (c) => c.ind === 'ADX' && c.variant === 'strength' && c.op === 'lt',
+  },
+  VOLUME_SURGE: {
+    id: 'VOLUME_SURGE',
+    slot: 'confirm',
+    template: (limits) => (limits.hasVolume ? { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 } : null),
+    matches: (c, limits) => c.ind === 'VOLUME' && c.op === 'gt' && limits.hasVolume,
+  },
+} satisfies Record<string, Primitive>;
+
+type PrimitiveId = keyof typeof PRIMITIVES;
+
+interface HypothesisSlots {
+  triggers: readonly PrimitiveId[];
+  regimes: readonly PrimitiveId[];
+  confirms: readonly PrimitiveId[];
+}
+
+/** The primitives each hypothesis may put in each entry slot. */
+const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
+  TREND_FOLLOWING: { triggers: ['EMA_CROSS', 'DONCHIAN_BREAKOUT', 'MACD_CROSS'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['ADX_TRENDING'] },
+  VOL_BREAKOUT: { triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['VOLUME_SURGE'] },
+  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['ADX_TRENDING'] },
+  RANGE_REVERSION: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: [], confirms: ['ADX_RANGING'] },
+};
+
 /**
- * The market hypotheses a run can test. Each one is a distinct, economically motivated idea,
- * expressed by exactly one trigger primitive and one filter whose direction is part of the idea:
+ * The market hypotheses a run can test. Each is a distinct, economically motivated idea; its
+ * slots list the event triggers that express it and the state filters that say when it applies:
  *
- *   TREND_FOLLOWING  close vs. its EMA                          + optional ADX above a level
- *   VOL_BREAKOUT     close crosses above the upper Bollinger band + optional volume above average
- *   DIP_IN_UPTREND   RSI oversold                               + REQUIRED close above a slow EMA
- *   RANGE_REVERSION  RSI oversold                               + optional ADX below a level
+ *   TREND_FOLLOWING  EMA cross · Donchian breakout · MACD cross  | close > slow EMA · slow EMA rising | ADX > level
+ *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | close > slow EMA · slow EMA rising | volume surge
+ *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA or slow EMA rising | ADX > level
+ *   RANGE_REVERSION  RSI back above oversold · back inside lower band | –                                  | ADX < level
  */
 export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
   TREND_FOLLOWING: {
@@ -475,10 +592,10 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     archetype: 'TREND',
     rationale:
       'Time-series momentum: markets that have been rising tend to keep rising for a while, because information spreads slowly and money chases performance.',
-    trigger: 'Close above its EMA (a state) or crossing above it (an event).',
-    filter: 'Optional: ADX above a level – only trade when a trend is actually present.',
+    trigger: 'An EMA crossover, a Donchian-channel breakout or a MACD signal cross (one event per setup).',
+    filter: 'Optional regime: close above a slow EMA or a rising slow EMA. Optional confirmation: ADX above a level.',
     filterRequired: false,
-    replaces: 'Supertrend, moving-average crosses, MACD and +DI/−DI, which all measure the same trend.',
+    replaces: 'Supertrend, +DI/−DI and price-vs-MA states, which all measure the same trend.',
   },
   VOL_BREAKOUT: {
     id: 'VOL_BREAKOUT',
@@ -486,9 +603,9 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     short: 'Breakout',
     archetype: 'TREND',
     rationale:
-      'A close beyond the recent volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
-    trigger: 'Close crosses above the upper Bollinger band.',
-    filter: 'Optional: volume above its average – participation confirms the breakout.',
+      'A close beyond the recent range or volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
+    trigger: 'Close breaks above the prior Donchian high or the upper Bollinger band.',
+    filter: 'Optional regime: close above a slow EMA or a rising slow EMA. Optional confirmation: volume above its average.',
     filterRequired: false,
     replaces: 'Band-width and ATR "squeeze" filters, which describe the same volatility state.',
   },
@@ -499,10 +616,10 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     archetype: 'MEAN_REVERSION',
     rationale:
       'Short-term overreaction: sharp pullbacks inside a long-term uptrend tend to be partly reversed, as buyers are paid to absorb forced selling.',
-    trigger: 'RSI oversold – below a level, or crossing back above it.',
-    filter: 'Required: close above a slow EMA (100+ bars) – the long-term trend must be up.',
+    trigger: 'Pullback rejection: RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
+    filter: 'Required regime: close above a slow EMA or a rising slow EMA. Optional confirmation: ADX above a level.',
     filterRequired: true,
-    replaces: 'Stochastic, CCI, %B and lower-band touches, which all measure "short-horizon oversold".',
+    replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
   },
   RANGE_REVERSION: {
     id: 'RANGE_REVERSION',
@@ -510,97 +627,87 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     short: 'Range',
     archetype: 'MEAN_REVERSION',
     rationale: 'In trendless markets prices oscillate around a mean, so oversold readings tend to revert.',
-    trigger: 'RSI oversold – below a level, or crossing back above it.',
-    filter: 'Optional: ADX below a level – only trade when no trend is present.',
+    trigger: 'RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
+    filter: 'Optional confirmation: ADX below a level – only trade when no trend is present.',
     filterRequired: false,
-    replaces: 'Stochastic, CCI, %B and lower-band touches, which all measure "short-horizon oversold".',
+    replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
   },
 };
 
-/** Operators the trigger of each hypothesis may use. */
-const TRIGGER_OPS: Readonly<Record<Hypothesis, readonly CmpOp[]>> = {
-  TREND_FOLLOWING: ['gt', 'cross_above'],
-  VOL_BREAKOUT: ['cross_above'],
-  DIP_IN_UPTREND: ['lt', 'cross_above'],
-  RANGE_REVERSION: ['lt', 'cross_above'],
-};
-
-/** Only trend following may close on a reversal of its trigger (for a breakout or an oscillator it has no meaning). */
+/** Every hypothesis may close a trade on the opposite signal (the mirrored trigger); hand-built MEAN_REVERSION genomes may not. */
 export function allowsReversalExit(h: Hypothesis | undefined, archetype: Archetype): boolean {
-  return h === undefined ? archetype === 'TREND' : h === 'TREND_FOLLOWING';
+  return h === undefined ? archetype === 'TREND' : true;
 }
 
 /** Why `h` cannot be tested on data with these limits, or null when it can. */
 export function hypothesisUnsupported(h: Hypothesis, limits: GenomeLimits): string | null {
-  if (h === 'DIP_IN_UPTREND' && lookbacks(SLOW_LOOKBACK, 200, limits).length === 0) {
-    return 'Buy the dip in an uptrend needs a slow trend filter of 100+ candles, which needs at least about 560 candles of history.';
+  if (HYPOTHESES[h].filterRequired && SLOTS[h].regimes.every((id) => PRIMITIVES[id].template(limits) === null)) {
+    return `${HYPOTHESES[h].label} needs a slow trend filter of ${MIN_SLOPE_LOOKBACK}+ candles, which needs at least about ${MIN_SLOPE_LOOKBACK * 5} candles of history.`;
   }
   return null;
 }
 
-/** True when `c` is the trigger primitive of `h`. */
-export function triggerConforms(c: Condition, h: Hypothesis): boolean {
-  if (!TRIGGER_OPS[h].includes(c.op)) return false;
-  switch (h) {
-    case 'TREND_FOLLOWING':
-      return c.ind === 'PRICE_MA' && c.maType === 'EMA';
-    case 'VOL_BREAKOUT':
-      return c.ind === 'BB' && c.variant === 'upper';
-    case 'DIP_IN_UPTREND':
-    case 'RANGE_REVERSION':
-      return c.ind === 'RSI' && c.level < 50;
-  }
+function slotPrimitive(c: Condition, ids: readonly PrimitiveId[], limits: GenomeLimits): PrimitiveId | null {
+  return ids.find((id) => PRIMITIVES[id].matches(c, limits)) ?? null;
 }
 
-/** True when `c` is the filter of `h`, pointing in the hypothesis's direction. */
+/** True when `c` is one of the entry-trigger events of `h`. */
+export function triggerConforms(c: Condition, h: Hypothesis, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
+  return slotPrimitive(c, SLOTS[h].triggers, limits) !== null;
+}
+
+/** The filter slot `c` fills in `h` (regime or confirmation), or null when it is not one of its filters. */
+export function filterSlot(c: Condition, h: Hypothesis, limits: GenomeLimits): 'regime' | 'confirm' | null {
+  if (slotPrimitive(c, SLOTS[h].regimes, limits) !== null) return 'regime';
+  if (slotPrimitive(c, SLOTS[h].confirms, limits) !== null) return 'confirm';
+  return null;
+}
+
+/** True when `c` is a regime or confirmation filter of `h`, pointing in the hypothesis's direction. */
 export function filterConforms(c: Condition, h: Hypothesis, limits: GenomeLimits): boolean {
-  switch (h) {
-    case 'TREND_FOLLOWING':
-      return c.ind === 'ADX' && c.variant === 'strength' && c.op === 'gt';
-    case 'VOL_BREAKOUT':
-      return c.ind === 'VOLUME' && c.op === 'gt' && limits.hasVolume;
-    case 'DIP_IN_UPTREND':
-      return c.ind === 'PRICE_MA' && c.maType === 'EMA' && c.op === 'gt' && c.period >= SLOW_LOOKBACK;
-    case 'RANGE_REVERSION':
-      return c.ind === 'ADX' && c.variant === 'strength' && c.op === 'lt';
-  }
+  return filterSlot(c, h, limits) !== null;
 }
 
-/** True when a genome is built exactly from its hypothesis's primitives. */
+/** True when a genome is built exactly from its hypothesis's slots: trigger, then at most one regime and one confirmation filter. */
 export function conformsTo(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
   const h = g.hypothesis;
   if (h === undefined) return false;
   const spec = HYPOTHESES[h];
   const { conditions } = g.longEntry;
   if (g.archetype !== spec.archetype || conditions.length < 1 || conditions.length > MAX_CONDITIONS) return false;
-  if (!triggerConforms(conditions[0], h)) return false;
-  if (conditions.length > 1 && !filterConforms(conditions[1], h, limits)) return false;
-  if (conditions.length === 1 && spec.filterRequired) return false;
+  if (!triggerConforms(conditions[0], h, limits)) return false;
+  const slots = conditions.slice(1).map((c) => filterSlot(c, h, limits));
+  if (slots.some((slot) => slot === null)) return false;
+  // Canonical order: regime before confirmation, one of each at most.
+  const order = slots.map((slot) => (slot === 'regime' ? 0 : 1));
+  for (let k = 1; k < order.length; k++) if (order[k] <= order[k - 1]) return false;
+  if (spec.filterRequired && !slots.includes('regime')) return false;
   if (g.exit.mode === 'dynamic' && g.exit.reversalExit && !allowsReversalExit(h, g.archetype)) return false;
   return true;
 }
 
 /**
  * The hypothesis a hand-built genome (one without `hypothesis`) belongs to: the first one of its
- * archetype whose trigger it already uses, else the archetype's default.
+ * archetype whose triggers it already uses, else the archetype's default.
  */
 export function inferHypothesis(g: StrategyGenome): Hypothesis {
   const trigger = g.longEntry.conditions[0];
+  const filters = g.longEntry.conditions.slice(1);
   const candidates: Hypothesis[] =
     g.archetype === 'TREND' ? ['TREND_FOLLOWING', 'VOL_BREAKOUT'] : ['DIP_IN_UPTREND', 'RANGE_REVERSION'];
   if (trigger) {
     for (const h of candidates) {
       if (!triggerConforms(trigger, h)) continue;
-      // An oscillator dip inside a slow uptrend filter is the dip-buy idea.
-      if (h === 'DIP_IN_UPTREND' && !(g.longEntry.conditions[1] && filterConforms(g.longEntry.conditions[1], h, DEFAULT_LIMITS))) continue;
+      // An oversold rejection inside a slow uptrend filter is the dip-buy idea.
+      if (h === 'DIP_IN_UPTREND' && !filters.some((c) => filterSlot(c, h, DEFAULT_LIMITS) === 'regime')) continue;
       return h;
     }
   }
   if (g.archetype === 'TREND') return 'TREND_FOLLOWING';
   // A mean-reversion entry gated by a slow up-trend is the dip-buy idea, whatever oscillator it used.
-  const second = g.longEntry.conditions[1];
-  const slowUptrend =
-    second !== undefined && (second.ind === 'PRICE_MA' || second.ind === 'MA_CROSS') && second.op === 'gt' && conditionLookback(second) >= SLOW_LOOKBACK;
+  const slowUptrend = filters.some(
+    (c) => (c.ind === 'PRICE_MA' || c.ind === 'MA_CROSS' || c.ind === 'MA_SLOPE') && c.op === 'gt' && conditionLookback(c) >= SLOW_LOOKBACK,
+  );
   return slowUptrend ? 'DIP_IN_UPTREND' : 'RANGE_REVERSION';
 }
 
@@ -613,34 +720,56 @@ function randomizeParams(rng: Rng, c: Condition, slot: Slot, limits: GenomeLimit
   return normalizeCondition(c, slot, limits);
 }
 
-/** A random instance of the trigger primitive of `h`. */
-export function hypothesisTrigger(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition {
-  const op = pick(rng, TRIGGER_OPS[h]);
-  switch (h) {
-    case 'TREND_FOLLOWING':
-      return randomizeParams(rng, { ind: 'PRICE_MA', maType: 'EMA', period: 56, op }, 'trend-trigger', limits);
-    case 'VOL_BREAKOUT':
-      return randomizeParams(rng, { ind: 'BB', period: 20, mult: 2, variant: 'upper', op, level: 0 }, 'trend-trigger', limits);
-    case 'DIP_IN_UPTREND':
-    case 'RANGE_REVERSION':
-      return randomizeParams(rng, { ind: 'RSI', period: 14, op, level: 30 }, 'reversion-trigger', limits);
+/** A random instance of primitive `id` with its numbers drawn from the grids, or null when the data cannot support it. */
+function drawPrimitive(rng: Rng, id: PrimitiveId, archetype: Archetype, limits: GenomeLimits): Condition | null {
+  const primitive: Primitive = PRIMITIVES[id];
+  const template = primitive.template(limits);
+  if (template === null) return null;
+  const slot: Slot = primitive.slot === 'trigger' ? (archetype === 'TREND' ? 'trend-trigger' : 'reversion-trigger') : primitive.slot === 'regime' ? 'regime' : 'filter';
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const c = randomizeParams(rng, { ...template } as Condition, slot, limits);
+    if (primitive.matches(c, limits)) return c;
   }
+  return normalizeCondition(template, slot, limits);
 }
 
-/** A random instance of the filter of `h`, or null when the data cannot support it. */
-export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition | null {
-  switch (h) {
-    case 'TREND_FOLLOWING':
-      return randomizeParams(rng, { ind: 'ADX', period: 14, variant: 'strength', op: 'gt', level: 20 }, 'filter', limits);
-    case 'VOL_BREAKOUT':
-      return limits.hasVolume ? randomizeParams(rng, { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }, 'filter', limits) : null;
-    case 'DIP_IN_UPTREND':
-      return hypothesisUnsupported(h, limits) === null
-        ? randomizeParams(rng, { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' }, 'regime', limits)
-        : null;
-    case 'RANGE_REVERSION':
-      return randomizeParams(rng, { ind: 'ADX', period: 14, variant: 'strength', op: 'lt', level: 20 }, 'filter', limits);
+/** A random entry trigger of `h` (optionally a different primitive from `avoid`). */
+export function hypothesisTrigger(rng: Rng, h: Hypothesis, limits: GenomeLimits, avoid: Condition | null = null): Condition {
+  const archetype = HYPOTHESES[h].archetype;
+  let ids = SLOTS[h].triggers;
+  if (avoid !== null && ids.length > 1) {
+    const current = slotPrimitive(avoid, ids, limits);
+    ids = ids.filter((id) => id !== current);
   }
+  const shuffled = [...ids].sort(() => rng() - 0.5);
+  for (const id of shuffled) {
+    const c = drawPrimitive(rng, id, archetype, limits);
+    if (c) return c;
+  }
+  throw new Error(`No entry trigger of ${h} fits this data.`);
+}
+
+/** A random filter of `h` for `slot`, or null when the hypothesis has none (or the data cannot support it). */
+export function hypothesisSlotFilter(rng: Rng, h: Hypothesis, slot: 'regime' | 'confirm', limits: GenomeLimits): Condition | null {
+  const ids = slot === 'regime' ? SLOTS[h].regimes : SLOTS[h].confirms;
+  const shuffled = [...ids].sort(() => rng() - 0.5);
+  for (const id of shuffled) {
+    const c = drawPrimitive(rng, id, HYPOTHESES[h].archetype, limits);
+    if (c) return c;
+  }
+  return null;
+}
+
+/** A random filter of `h`: its regime filter when one is required, otherwise either kind. */
+export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition | null {
+  if (HYPOTHESES[h].filterRequired) return hypothesisSlotFilter(rng, h, 'regime', limits);
+  const first: 'regime' | 'confirm' = SLOTS[h].regimes.length > 0 && rng() < 0.5 ? 'regime' : 'confirm';
+  return hypothesisSlotFilter(rng, h, first, limits) ?? hypothesisSlotFilter(rng, h, first === 'regime' ? 'confirm' : 'regime', limits);
+}
+
+/** The primitives of every slot of `h` (for the UI and tests). */
+export function hypothesisPrimitives(h: Hypothesis): HypothesisSlots {
+  return SLOTS[h];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -759,9 +888,21 @@ const KEY_NAMES: Record<string, string> = {
 /** "RSI level", "EMA period", "Filter ADX level", … */
 function parameterLabel(c: Condition, key: string, index: number): string {
   const name =
-    c.ind === 'PRICE_MA' ? c.maType : c.ind === 'BB' ? 'Band' : c.ind === 'VOLUME' ? 'Volume' : c.ind === 'MA_CROSS' ? 'MA' : c.ind;
+    c.ind === 'PRICE_MA'
+      ? c.maType
+      : c.ind === 'MA_SLOPE'
+        ? `${c.maType} slope`
+        : c.ind === 'DONCHIAN'
+          ? 'Channel'
+          : c.ind === 'BB'
+            ? 'Band'
+            : c.ind === 'VOLUME'
+              ? 'Volume'
+              : c.ind === 'MA_CROSS'
+                ? 'MA'
+                : c.ind;
   const what = c.ind === 'VOLUME' && key === 'level' ? 'ratio' : (KEY_NAMES[key] ?? key);
-  return `${index > 0 ? 'Filter ' : ''}${name} ${what}`;
+  return `${index > 0 ? (isFilter(c) ? 'Confirm ' : 'Regime ') : ''}${name} ${what}`;
 }
 
 /** One tunable parameter of a genome: its name, its grid and its current value. */
@@ -899,33 +1040,52 @@ export function repairGenome(g: StrategyGenome, mode: TradeMode, limits: GenomeL
   const spec = HYPOTHESES[hypothesis];
   let genome = normalizeGenome({ ...g, hypothesis, archetype: spec.archetype }, mode, limits);
   const { conditions } = genome.longEntry;
-  let changed = false;
-  if (conditions.length === 0 || !triggerConforms(conditions[0], hypothesis)) {
-    conditions[0] = hypothesisTrigger(rng, hypothesis, limits);
-    changed = true;
+  const { trigger, regime, confirm } = entrySlots(genome, limits);
+  const slots = {
+    trigger: trigger ?? hypothesisTrigger(rng, hypothesis, limits),
+    regime: regime ?? (spec.filterRequired ? hypothesisSlotFilter(rng, hypothesis, 'regime', limits) : null),
+    confirm,
+  };
+  const next = [slots.trigger, slots.regime, slots.confirm].filter((c): c is Condition => c !== null);
+  if (next.length !== conditions.length || next.some((c, k) => c !== conditions[k])) {
+    genome.longEntry = { logic: 'AND', conditions: next };
+    genome = normalizeGenome(genome, mode, limits);
   }
-  if (conditions.length > 1 && !filterConforms(conditions[1], hypothesis, limits)) {
-    conditions.length = 1;
-    changed = true;
-  }
-  if (spec.filterRequired && conditions.length === 1) {
-    const filter = hypothesisFilter(rng, hypothesis, limits);
-    if (filter) {
-      conditions.push(filter);
-      changed = true;
-    }
-  }
-  if (changed) genome = normalizeGenome(genome, mode, limits);
   return genome;
 }
 
-/** A random strategy built from the primitives of hypothesis `h`. */
+/**
+ * The entry slots of a genome built from a hypothesis: its trigger (when it is one of the
+ * hypothesis's events) and its first regime and confirmation filter. Anything else is dropped.
+ */
+export function entrySlots(g: StrategyGenome, limits: GenomeLimits): { trigger: Condition | null; regime: Condition | null; confirm: Condition | null } {
+  const h = g.hypothesis ?? inferHypothesis(g);
+  const [first, ...rest] = g.longEntry.conditions;
+  let regime: Condition | null = null;
+  let confirm: Condition | null = null;
+  for (const c of rest) {
+    const slot = filterSlot(c, h, limits);
+    if (slot === 'regime' && regime === null) regime = c;
+    else if (slot === 'confirm' && confirm === null) confirm = c;
+  }
+  return { trigger: first !== undefined && triggerConforms(first, h, limits) ? first : null, regime, confirm };
+}
+
+/** Probability that a random strategy carries a regime filter / a confirmation filter (when optional). */
+const REGIME_RATE = 0.6;
+const CONFIRM_RATE = 0.4;
+
+/** A random strategy built from the slots of hypothesis `h`. */
 export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h: Hypothesis): StrategyGenome {
   const spec = HYPOTHESES[h];
   const conditions = [hypothesisTrigger(rng, h, limits)];
-  if (spec.filterRequired || rng() < 0.5) {
-    const filter = hypothesisFilter(rng, h, limits);
-    if (filter) conditions.push(filter);
+  if (spec.filterRequired || rng() < REGIME_RATE) {
+    const regime = hypothesisSlotFilter(rng, h, 'regime', limits);
+    if (regime) conditions.push(regime);
+  }
+  if (rng() < CONFIRM_RATE) {
+    const confirm = hypothesisSlotFilter(rng, h, 'confirm', limits);
+    if (confirm) conditions.push(confirm);
   }
   const genome: StrategyGenome = {
     archetype: spec.archetype,
@@ -943,18 +1103,18 @@ export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h:
 /* -------------------------------------------------------------------------- */
 
 /**
- * Mutations stay inside the hypothesis: they tune numbers, switch the trigger between its state
- * and event form, add / drop / redraw the hypothesis's filter, or change the exit. They never swap
- * the indicator family, flip a filter's direction or change the archetype.
+ * Mutations stay inside the hypothesis: they tune numbers, swap or redraw the entry trigger, add /
+ * drop / swap the regime or confirmation filter, or change the exit. They never flip a filter's
+ * direction or change the archetype.
  */
-type MutationKind = 'tweak' | 'operator' | 'redraw' | 'filter' | 'exit' | 'time';
+type MutationKind = 'tweak' | 'trigger' | 'regime' | 'confirm' | 'exit' | 'time';
 
 const MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [
-  ['tweak', 0.5],
-  ['operator', 0.1],
-  ['redraw', 0.05],
-  ['filter', 0.13],
-  ['exit', 0.14],
+  ['tweak', 0.45],
+  ['trigger', 0.1],
+  ['regime', 0.12],
+  ['confirm', 0.1],
+  ['exit', 0.15],
   ['time', 0.08],
 ];
 
@@ -990,30 +1150,36 @@ function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean): void {
 
 function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: GenomeLimits): void {
   const kind = pickWeighted(rng, MUTATION_WEIGHTS);
-  const { conditions } = g.longEntry;
   const spec = HYPOTHESES[h];
+  const slots = entrySlots(g, limits);
+  const rebuild = (): void => {
+    const trigger = slots.trigger ?? hypothesisTrigger(rng, h, limits);
+    g.longEntry = { logic: 'AND', conditions: [trigger, slots.regime, slots.confirm].filter((c): c is Condition => c !== null) };
+  };
   switch (kind) {
     case 'tweak':
       tweak(rng, g, limits);
       return;
-    case 'operator': {
-      // State ↔ event form of the trigger (e.g. "close above EMA" ↔ "close crosses above EMA").
-      const others = TRIGGER_OPS[h].filter((op) => op !== conditions[0].op);
-      if (others.length > 0) conditions[0].op = pick(rng, others);
-      else tweak(rng, g, limits);
+    case 'trigger':
+      // Half the time another event of the hypothesis, otherwise fresh numbers for any of them.
+      slots.trigger = hypothesisTrigger(rng, h, limits, rng() < 0.5 ? slots.trigger : null);
+      rebuild();
       return;
-    }
-    case 'redraw':
-      conditions[0] = hypothesisTrigger(rng, h, limits);
-      return;
-    case 'filter': {
-      if (!spec.filterRequired && conditions.length > 1 && rng() < 0.5) {
-        conditions.length = 1;
-        return;
+    case 'regime':
+    case 'confirm': {
+      const slot = kind;
+      const required = slot === 'regime' && spec.filterRequired;
+      if (slots[slot] !== null && !required && rng() < 0.4) {
+        slots[slot] = null;
+      } else {
+        const filter = hypothesisSlotFilter(rng, h, slot, limits);
+        if (filter === null) {
+          tweak(rng, g, limits);
+          return;
+        }
+        slots[slot] = filter;
       }
-      const filter = hypothesisFilter(rng, h, limits);
-      if (filter) conditions[1] = filter;
-      else tweak(rng, g, limits);
+      rebuild();
       return;
     }
     case 'exit':

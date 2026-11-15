@@ -392,6 +392,36 @@ export function cci(high: Float64Array, low: Float64Array, close: Float64Array, 
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Donchian channel of the PRIOR `period` candles: the highest high (upper) or lowest low (lower)
+ * of bars `i - period .. i - 1`. The current candle is excluded so "close above the channel"
+ * is a genuine breakout of the earlier range – Pine: `ta.highest(high, period)[1]`.
+ */
+export function donchian(src: Float64Array, period: number, upper: boolean): Float64Array {
+  const n = src.length;
+  const out = nanArray(n);
+  // Monotonic deque of indices over the window [i - period, i - 1].
+  const dq = new Int32Array(n);
+  let head = 0;
+  let tail = 0;
+  for (let i = 0; i < n; i++) {
+    // The deque holds bars up to i − 1; drop those older than the window [i − period, i − 1].
+    while (head < tail && dq[head] < i - period) head++;
+    if (i >= period) out[i] = src[dq[head]];
+    const v = src[i];
+    while (tail > head && (upper ? src[dq[tail - 1]] <= v : src[dq[tail - 1]] >= v)) tail--;
+    dq[tail++] = i;
+  }
+  return out;
+}
+
+/** `src` shifted `lag` bars back (NaN for the first `lag` bars) – Pine: `src[lag]`. */
+export function lagged(src: Float64Array, lag: number): Float64Array {
+  const out = nanArray(src.length);
+  for (let i = lag; i < src.length; i++) out[i] = src[i - lag];
+  return out;
+}
+
+/**
  * Lazily computes and memoises indicator series for one dataset.
  *
  * The optimiser evaluates tens of thousands of strategies that mostly share
@@ -582,5 +612,20 @@ export class IndicatorCache {
 
   cci(period: number): Float64Array {
     return this.memo(`cci:${period}`, () => cci(this.data.h, this.data.l, this.data.c, period));
+  }
+
+  /** Highest high of the previous `period` candles. */
+  donchianUpper(period: number): Float64Array {
+    return this.memo(`dcU:${period}`, () => donchian(this.data.h, period, true));
+  }
+
+  /** Lowest low of the previous `period` candles. */
+  donchianLower(period: number): Float64Array {
+    return this.memo(`dcL:${period}`, () => donchian(this.data.l, period, false));
+  }
+
+  /** Moving average `lag` bars ago (to compare with its current value: the slope's sign). */
+  maLagged(type: MaType, period: number, lag: number): Float64Array {
+    return this.memo(`maLag:${type}:${period}:${lag}`, () => lagged(this.ma(type, period), lag));
   }
 }

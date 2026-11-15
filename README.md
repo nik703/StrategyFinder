@@ -119,32 +119,38 @@ Data is split chronologically: **Train 60% / Validation 20% / Holdout 20%**.
 
 ### Market hypothesis and strategy genome
 
-Every run tests **one market hypothesis**, picked in the control bar before the run starts. A hypothesis
-fixes the single trigger primitive, the filter and the filter's direction; the search only tunes their
-numbers and the exit. Collinear indicators are not separate ideas – RSI, Stochastic, CCI and %B all
-measure "short-horizon oversold", and Supertrend, MA crosses and MACD all measure "trend" – so each idea is
-expressed by one primitive:
+Every run tests **one market hypothesis**, picked in the control bar before the run starts. An entry is
+built from up to three **slots**, joined by `AND`, and the hypothesis lists the primitives each slot may use
+and fixes their direction:
 
-| Hypothesis | Trigger | Filter (direction fixed) |
-|---|---|---|
-| **Trend following** – time-series momentum | Close above its EMA, or crossing above it | optional ADX above a level |
-| **Volatility breakout** – a close beyond the volatility envelope starts a move | Close crosses above the upper Bollinger band | optional volume above average |
-| **Buy the dip in an uptrend** – short-term overreaction | RSI oversold (below a level, or crossing back above it) | **required** close above a slow EMA (100+ candles) |
-| **Range reversion** – trendless prices revert to a mean | RSI oversold | optional ADX below a level |
+1. **Entry trigger** (required) – a discrete **event**: a crossover, a channel breakout, an oscillator
+   crossing back out of its extreme zone. An event fires once per setup, so a strategy cannot re-enter the
+   same trend leg on every candle after a stop or target is hit (a `close > EMA` state trigger did exactly
+   that). Triggers are never states.
+2. **Regime filter** (optional) – a slow **state**: close above a slow EMA (100+ candles), or a rising slow
+   EMA (56+ candles, its value vs. 10 candles earlier).
+3. **Confirmation filter** (optional) – a fast **state**: trend strength (ADX) or volume.
 
-- Mutations stay inside the hypothesis: they tune a number, switch the trigger between its state and
-  event form, add / drop / redraw the filter, or change the exit. They never swap the indicator family,
-  flip a filter's direction or change the archetype. A mutation is **guaranteed to differ** from its parent
-  (it is retried, then falls back to a one-step neighbour).
-- At most 2 conditions per entry, always joined by `AND`. In Long/Short mode the short rules are the exact
-  mirror of the long rules.
+| Hypothesis | Entry triggers (events) | Regime filter | Confirmation |
+|---|---|---|---|
+| **Trend following** – time-series momentum | EMA crossover · Donchian breakout (close above the prior N-candle high) · MACD signal cross | close > slow EMA · slow EMA rising | ADX above a level |
+| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA · slow EMA rising | volume above average |
+| **Buy the dip in an uptrend** – short-term overreaction | pullback rejection: RSI crosses back above an oversold level · close crosses back above the lower band | **required**: close > slow EMA or slow EMA rising | ADX above a level |
+| **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower band | – | ADX below a level |
+
+- Mutations stay inside the hypothesis: they tune a number, swap or redraw the entry trigger, add / drop /
+  swap the regime or confirmation filter, or change the exit. They never flip a filter's direction or
+  change the archetype. A mutation is **guaranteed to differ** from its parent.
+- In Long/Short mode the short rules are the exact mirror of the long rules. An actionable opposite-side
+  entry **reverses** an open position at the next open – also on the open a time stop fires (the time stop
+  only blocks re-entering the same side) – in the backtester and in the Pine export alike.
 - **Round-number grids only.** Lookbacks from the geometric grid {5, 7, 10, 14, 20, 28, 40, 56, 80, 112,
   160, 200} (about √2 per step, no near-duplicates); oscillator levels in steps of 5; band multipliers in
   steps of 0.5; static stop / target from {1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30} %.
-- **At most 8 tunable numbers** per strategy, with a fitness penalty for each one above 4.
+- **At most 10 tunable numbers** per strategy, with a fitness penalty for each one above 6.
 - **Exits:** static % stop and target, or ATR stop (1–4×) with optional ATR target (1.5–8×), trailing stop,
-  trigger-reversal exit (trend following only) and an optional time stop (5, 10, 20 or 40 bars). A trailing
-  stop is only kept when the target sits at least 1 ATR beyond the stop.
+  **opposite-signal exit** (the mirrored trigger closes the trade; any hypothesis) and an optional time
+  stop (5, 10, 20 or 40 bars). A trailing stop is only kept when the target sits at least 1 ATR beyond the stop.
 
 ### Optimiser, trial budget and early stopping
 
@@ -155,15 +161,19 @@ members, or injects a fresh random genome.
 - **Only new bets count.** A candidate whose genome was already proposed, that never trades, or whose
   trade log (entries, exits, direction and PnL on the primary asset) repeats one already evaluated is
   skipped: it is not a trial, uses no budget and cannot enter the leaderboard.
-- **Evaluations per run:** 2,000 by default (settable from 100 to 10,000).
-- **Cumulative trial budget per data window:** at most **10,000** evaluations across every run and session
-  whose search period overlaps (a shared symbol, and at least half of the shorter window in common). The
-  trials are kept in `localStorage`, so reloading the page, a new end date, another range or another
-  timeframe over the same dates never resets them. They also seed the deflated-Sharpe hurdle and the
-  haircut, so every new run on the same data is judged against everything tried on it before. Once the
-  budget is spent, Start is disabled for that window.
-- **Early stopping:** a run ends when 500 evaluations in a row fail to beat the best deflated Sharpe on the
-  leaderboard (or at its evaluation limit, or the window's budget, or when you press **Stop**).
+- **Evaluations per run:** 5,000 by default (settable from 100 to the window's remaining budget).
+- **Cumulative trial budget per data window:** **25,000** evaluations across every run and session whose
+  search period overlaps (a shared symbol, and at least half of the shorter window in common). The trials
+  are kept in `localStorage`, so reloading the page, a new end date, another range or another timeframe over
+  the same dates never resets them. They also seed the deflated-Sharpe hurdle and the haircut, so every new
+  run on the same data is judged against everything tried on it before. Once the budget is spent, search on
+  that window pauses: **Extend Budget (+10,000 trials)** lets you continue knowingly. Extensions are
+  recorded too, every earlier trial still counts, and the meter warns that multiple-testing significance is
+  degraded.
+- **Early stopping:** a run ends when **1,500** evaluations in a row fail to improve the best **composite
+  fitness** on the leaderboard (or at its evaluation limit, or the window's budget, or when you press
+  **Stop**). Early stopping used to watch the deflated Sharpe, which sits at 0% through the first
+  generations and stopped runs before good combinations had evolved.
 - **Haircut Sharpe** (Harvey & Liu): the validation Sharpe's p-value is multiplied by the number of trials on
   the window (Bonferroni) and turned back into the Sharpe that survives. Shown next to the deflated Sharpe.
 
@@ -174,16 +184,27 @@ of that many skill-less strategies is expected to reach. Every strategy carries 
 thin sample 10; always "high" below a 50% deflated Sharpe), and its breakdown shows a **parameter-stability
 heatmap**: the search-period Sharpe over the two parameters whose one-step neighbours move it most.
 
-**Robust universe** (on by default for crypto): the same rules are backtested separately on every asset of
-a universe (default BTC, ETH, SOL, XRP, ADA, DOGE; editable). Fitness is the median per-asset score, trade
-counts are gated per asset (never pooled), and there is a penalty when fewer than 2/3 of the assets are profitable on
-validation. The leaderboard and chart show the primary asset.
+**Asset pool** (asset mode in the control bar, default BTC, ETH, SOL, BNB): every asset is traded
+separately with the same genome, and the **minimum-trade gates apply to the trades pooled over the
+assets** – one strategy must work across the pool rather than fit one asset's price path, and four assets
+supply the sample a single daily chart cannot. Fitness is still the median per-asset score; the reported
+deflated Sharpe is the median over the assets (pooling raises the sample for the gates, not the statistic),
+and the holdout trade count of a locked strategy is pooled too.
 
-The search period (train + validation) is cut into **5 equal, sequential folds**, and every fold is
-scored on its own (0.6 Sortino + 0.4 Sharpe, clamped). Fitness rests on the **25th percentile** of the
-five – the second-worst fold – so one lucky year cannot carry a strategy that fails in the others. Raw
-return over Buy & Hold no longer counts at all: it is a bet on the market's direction, not evidence of an
-edge.
+**Robust universe** (on by default for crypto, single-asset mode): the same rules are backtested
+separately on every asset of a universe (default BTC, ETH, SOL, XRP, ADA, DOGE; editable). Fitness is the
+median per-asset score, trade counts are gated per asset (not pooled), and there is a penalty when fewer
+than 2/3 of the assets are profitable on validation. The leaderboard and chart show the primary asset.
+
+The search period (train + validation) is cut into **5 equal, sequential folds**, and every fold is scored
+on its own (0.6 Sortino + 0.4 Sharpe, clamped). Fitness rests on the **median** fold score, plus a
+**consistency bonus** when at least 3 of the 5 folds made money (and a penalty per profitable fold short of
+that), and a **severe penalty** when any single fold suffers a drawdown beyond 35%. A fold in which the
+strategy never held a position is **flat**: once the strategy was active in at least 3 folds, flat folds
+are left out of the median and the consistency count (60% of the active folds must be profitable), so a
+regime filter that sat out a bear year is not punished for doing its job. Grading the 25th-percentile
+fold, as before, punished trend followers for every sideways year. Raw return over Buy & Hold does not
+count: it is a bet on the market's direction, not evidence of an edge.
 
 Every search-period bar is also labelled, causally, as **bull** or **bear** (sign of the trailing return
 over about a quarter of a year) and, separately, **high volatility** (trailing one-month volatility in the
@@ -196,30 +217,34 @@ Fitness (higher is better), per asset:
 
 ```
 + 3.00 × Deflated Sharpe Ratio of the validation segment (plus a small slice of its z-score as a gradient)
-+ 1.50 × 25th-percentile fold score
-+ 0.25 × median fold score
-− penalty for intrabar drawdowns beyond 20%, steeper beyond 45%
++ 1.50 × median fold score (flat folds set aside, see above)
++ 0.50 when ≥ 3 of 5 folds are profitable, − 0.50 per profitable fold short of that
+− 3 (and more) when any single fold draws down more than 35%
+− penalty for intrabar drawdowns beyond 20% over the search period, steeper beyond 45%
 − 0.75 for every regime slice the strategy collapses in
 ```
 
-then, across assets, after the **hard sample-size gates**: a strategy is disqualified outright with fewer
-than 100 train + validation trades or 60 validation trades on the primary asset, or fewer than 25 trades a
-year on any asset. Daily candles over 1–2 years rarely allow that many trades; use 4h / 1h candles or a
-longer history.
+then, across assets, after the **hard sample-size gates**, which are **calibrated to the timeframe and the
+length of the data**: 15 trades per year of data on daily candles, rising slowly with the number of
+candles per day (≈ 26 on 4h, ≈ 39 on 1h, ≈ 59 on 15m), times the years of the search period and of the
+validation segment, with floors of 30 and 10 trades. On 5 years of daily data that is 60 train + validation
+and 15 validation trades; the holdout gate of a Robust verdict is computed the same way (16). A strategy
+below any gate is disqualified outright. The counts are the primary asset's – or pooled over an asset pool.
 
 ```
   median of the per-asset scores
 − 1.0 when fewer than 2/3 of the universe is profitable on validation
-− 0.15 for each tunable parameter above 4
+− 0.15 for each tunable parameter above 6
 − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
 ```
 
 **Plateaus, not spikes.** A strategy that could enter the leaderboard also has every one-grid-step
 parameter neighbour backtested (each tunable number moved one step down and one step up, everything else
-unchanged). It is ranked by its own fitness **capped at the median fitness of those neighbours**: a
-broad plateau keeps its score, while an isolated spike – great at exactly these values, poor one step
-away – is pulled down to what its neighbourhood supports. The cap only ever lowers a score, so it is
-re-applied whenever the deflated-Sharpe hurdle moves and never lets a strategy jump the leaderboard.
+unchanged). When its neighbours are worse it is ranked by **70% of its own fitness + 30% of their median**
+(a disqualified neighbour counts as at most 3 below the strategy); a plateau keeps its score, a spike loses
+30% of its lead – enough to rank plateaus first without discarding a promising new rule combination the
+moment one neighbour slips under a trade gate. The blend never raises a score, so it is re-applied whenever
+the deflated-Sharpe hurdle moves and never lets a strategy jump the leaderboard.
 
 The **Deflated Sharpe Ratio** (Bailey & López de Prado) is the probability that a Sharpe ratio is real given
 the number of strategies tried so far, the spread of their Sharpe ratios, the sample length, and the
@@ -232,7 +257,7 @@ direct MessageChannels. Results are applied in proposal order, so a seeded run g
 whatever the pool size. With one or two cores, or if an evaluator fails to load, the optimiser scores
 candidates itself. Within each evaluation, the expensive parts are kept small: only the bars inside
 trades are visited when computing metrics, the second condition of an entry is only checked where the
-trigger fired, and in a Robust universe a candidate stops being backtested once it provably cannot
+trigger fired, and in a Robust universe or asset pool a candidate stops being backtested once it provably cannot
 reach the leaderboard (an exact bound on the median, so it never changes the result).
 
 The leaderboard keeps the 25 best behaviourally distinct strategies: two candidates whose equity returns
@@ -274,9 +299,10 @@ data. **Fragile** otherwise; the drawer lists every unmet condition.
   The Robust universe is not available for baskets.
 - **Crypto is tested on the USDT pair.** `XRP-USD` is routed to `XRPUSDT` on Binance; the telemetry tile and
   the drawer show the instrument actually used.
-- **Pine export is a faithful translation, not a guarantee of identical numbers.** It switches on Bar
-  Magnifier (TradingView Premium) to settle candles that touch both stop and target. The code is generated
-  and syntax-tested here but was not run on TradingView.
+- **Pine export is a faithful translation, not a guarantee of identical numbers.** It sets
+  `use_bar_magnifier=false` so it compiles on every TradingView plan; Premium users can switch it to `true`
+  to settle candles that touch both stop and target with lower-timeframe data. The code is generated and
+  syntax-tested here but was not run on TradingView.
 - **Paper trade before going live.** The test window ends at the latest candle, so only new data is unseen.
 
 ## Project layout

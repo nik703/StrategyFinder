@@ -7,7 +7,7 @@
  *   20  parameter spike       how far the strategy's own fitness sits above its one-step neighbours
  *   15  fold inconsistency    share of the five search-period folds that lost money
  *   10  regime collapse       share of the judged market regimes the strategy collapses in
- *   10  thin sample           trades below twice the minimum (100 → full risk, 200+ → none)
+ *   10  thin sample           trades below twice the run's minimum-trade gate (at the gate → full risk, 2× → none)
  *
  * Level: low under 35, moderate under 65, high from 65 – and always high when the deflated Sharpe is
  * under 50% (the same "most likely luck" line at which a locked strategy is rated Overfit).
@@ -15,7 +15,7 @@
  * It summarises – it does not replace – the evidence: the drawer shows every component.
  */
 
-import { collapsedRegimes, MIN_TRADES, testableRegimes } from '../engine/backtester';
+import { collapsedRegimes, MIN_SEARCH_TRADES_FLOOR, testableRegimes } from '../engine/backtester';
 import type { StrategyResult } from '../types/trading';
 
 export type RiskLevel = 'low' | 'moderate' | 'high';
@@ -94,13 +94,14 @@ export function overfittingRisk(s: StrategyResult): OverfittingRisk {
     detail: testable.length > 0 ? `Collapses in ${collapsed.length} of ${testable.length} judged regimes` : 'Too few trades per regime to judge',
   });
 
-  const trades = s.search.trades;
+  const trades = s.sample?.trades ?? s.search.trades;
+  const gate = s.sample?.gates.search ?? MIN_SEARCH_TRADES_FLOOR;
   components.push({
     key: 'sample',
     label: 'Thin sample',
     weight: 10,
-    risk: clamp01((2 * MIN_TRADES - trades) / MIN_TRADES),
-    detail: `${trades} trades over train + validation`,
+    risk: clamp01((2 * gate - trades) / gate),
+    detail: `${trades} trades over train + validation${s.sample?.pooled ? ' (pooled over the assets)' : ''}; the gate is ${gate}`,
   });
 
   const score = Math.round(components.reduce((sum, c) => sum + c.weight * c.risk, 0));

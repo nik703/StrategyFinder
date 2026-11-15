@@ -3,6 +3,8 @@ import { RunningStats } from '../src/lib/stats';
 import {
   budgetStatus,
   estimateSearchWindow,
+  extendWindowBudget,
+  windowBudget,
   MIN_WINDOW_OVERLAP,
   priorTrials,
   recordRunTrials,
@@ -10,7 +12,7 @@ import {
   windowsMatch,
   type TrialWindow,
 } from '../src/lib/trialLedger';
-import { WINDOW_TRIAL_BUDGET } from '../src/types/trading';
+import { BUDGET_EXTENSION, WINDOW_TRIAL_BUDGET } from '../src/types/trading';
 
 /** In-memory stand-in for window.localStorage – it survives "page reloads" because the module re-reads it every call. */
 class MemoryStorage {
@@ -103,15 +105,25 @@ describe('trial ledger', () => {
 
   it('reports the budget level and the luck hurdle, and ignores corrupt storage', () => {
     const window = searchWindowFor(['BTC-USD'], '1d', dailyTimes(1826));
-    expect(WINDOW_TRIAL_BUDGET).toBe(10_000);
+    expect(WINDOW_TRIAL_BUDGET).toBe(25_000);
     expect(budgetStatus(window, 0).level).toBe('fresh');
-    expect(budgetStatus(window, 5_000).level).toBe('degrading');
-    expect(budgetStatus(window, 9_000).level).toBe('critical');
-    const spent = budgetStatus(window, 10_000);
+    expect(budgetStatus(window, 12_500).level).toBe('degrading');
+    expect(budgetStatus(window, 22_500).level).toBe('critical');
+    const spent = budgetStatus(window, 25_000);
     expect(spent).toMatchObject({ level: 'exhausted', remaining: 0, share: 1 });
     // The luck hurdle rises with every trial.
     expect(budgetStatus(window, 2_000).luckSharpe).toBeGreaterThan(budgetStatus(window, 200).luckSharpe);
     expect(budgetStatus(window, 2_000).luckSharpe).toBeGreaterThan(1);
+    // An explicit extension adds 10,000 trials to this window (and every overlapping one) – and is remembered.
+    expect(spent.extensions).toBe(0);
+    extendWindowBudget(window);
+    expect(windowBudget(window)).toBe(WINDOW_TRIAL_BUDGET + BUDGET_EXTENSION);
+    const extended = budgetStatus(window, 25_000);
+    expect(extended).toMatchObject({ level: 'degrading', limit: 35_000, remaining: 10_000, extensions: 1 });
+    expect(windowBudget(searchWindowFor(['BTC-USD'], '1d', dailyTimes(730)))).toBe(35_000); // nested window
+    expect(windowBudget(searchWindowFor(['SPY'], '1d', dailyTimes(1826)))).toBe(WINDOW_TRIAL_BUDGET); // other data
+    storage.setItem('strategyfinder.budgetExtensions.v1', 'garbage');
+    expect(windowBudget(window)).toBe(WINDOW_TRIAL_BUDGET);
     storage.setItem('strategyfinder.trialLedger.v1', '{not json');
     expect(priorTrials(window).count).toBe(0);
     storage.setItem('strategyfinder.trialLedger.v1', JSON.stringify([{ runId: 'x', symbols: ['BTC-USD'], start: 1, end: 0, count: 5 }, null]));
