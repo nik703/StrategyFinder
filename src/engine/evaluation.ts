@@ -14,7 +14,12 @@ import {
   benchmarkSearch,
   combineFitness,
   deflatedTerm,
+  expectancy,
   median,
+  passesFoldGate,
+  passesTradeGates,
+  passesValidationGate,
+  ROBUST_MIN_DSR,
   evaluateSearch,
   isSingleRegime,
   plateauFitness,
@@ -30,7 +35,7 @@ import {
 import { countParameters, rewardToRisk, stepNeighbours, type GenomeLimits } from './genome';
 import { IndicatorCache } from './indicators';
 import { deflatedSharpeAgainst } from '../lib/stats';
-import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, StrategyGenome, TradeGates } from '../types/trading';
+import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, RobustChecks, StrategyGenome, TradeGates } from '../types/trading';
 
 /** Minimum number of candles required for a meaningful three-way split. */
 export const MIN_BARS = 150;
@@ -158,7 +163,18 @@ export function deriveLimits(primary: Asset): GenomeLimits {
     // Lookbacks are capped so indicators are warmed up for most of the training segment.
     maxLookback: Math.max(30, Math.min(200, Math.floor(primary.split.validationStart / 3))),
     hasVolume: withVolume > volume.length * 0.5,
+    barMs: medianBarMs(primary.data.t),
   };
+}
+
+/** Typical candle length: the median gap between consecutive open times (robust to weekends and gaps). */
+function medianBarMs(t: Float64Array): number {
+  const n = Math.min(t.length - 1, 2000);
+  if (n < 1) return 86_400_000;
+  const gaps = new Float64Array(n);
+  for (let i = 0; i < n; i++) gaps[i] = t[t.length - n + i] - t[t.length - n + i - 1];
+  gaps.sort();
+  return gaps[n >> 1];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -334,6 +350,34 @@ export function rankFitness(
   return { fitness, point, neighbourMedian, dsr };
 }
 
+/**
+ * The robustness gates of a fully scored candidate (see `RobustChecks`). With a pooled universe the
+ * validation gate uses the median asset's Sharpe and the pooled net profit, the fold gate must hold on
+ * two thirds of the assets, and the neighbours' expectancy is pooled.
+ * `neighbours` null means "not checked yet": the neighbourhood gate then fails.
+ */
+export function robustChecks(
+  ctx: EvalContext,
+  scores: AssetScore[],
+  dsr: number,
+  neighbours: readonly NeighbourScore[] | null,
+): RobustChecks {
+  const assets = ctx.pooled ? scores : scores.slice(0, 1);
+  const validation = ctx.pooled
+    ? median(assets.map((score) => score.metrics.validation.sharpe)) > 0.3 && assets.reduce((sum, score) => sum + score.metrics.validation.netPnl, 0) > 0
+    : passesValidationGate(assets[0].metrics.validation);
+  const folds = assets.filter((score) => passesFoldGate(score.metrics.folds)).length >= Math.ceil((2 / 3) * assets.length - 1e-9);
+  const pooledExpectancy = (list: AssetScore[]): number => {
+    if (!ctx.pooled) return expectancy(list[0].metrics.search);
+    const trades = list.reduce((sum, score) => sum + score.metrics.search.trades, 0);
+    return trades > 0 ? list.reduce((sum, score) => sum + score.metrics.search.netPnl, 0) / trades : 0;
+  };
+  const neighbourhood =
+    neighbours !== null && neighbours.length > 0 && median(neighbours.map((nb) => pooledExpectancy(nb.scores))) > 0;
+  const significance = passesTradeGates({ ...sampleOf(ctx, scores), gates: ctx.gates }) && dsr >= ROBUST_MIN_DSR;
+  return { validation, folds, neighbours: neighbourhood, significance, passed: validation && folds && neighbourhood && significance };
+}
+
 /** Outcome of evaluating one candidate during the search. */
 export interface CandidateResult {
   scores: AssetScore[];
@@ -363,7 +407,9 @@ export interface CandidateResult {
  * score, so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
  */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
-  const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, floor, true);
+  // Every asset is scored – no pruning against the leaderboard floor: the robustness gates are not
+  // fitness-based, so a candidate that cannot make the leaderboard may still be a robust strategy.
+  const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, -Infinity, true);
   if (!complete) return { scores, complete, tradeHash, skip, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
   const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
   if (!(point > floor) || point <= UNFIT) {

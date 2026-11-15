@@ -119,24 +119,28 @@ Data is split chronologically: **Train 60% / Validation 20% / Holdout 20%**.
 
 ### Market hypothesis and strategy genome
 
-Every run tests **one market hypothesis**, picked in the control bar before the run starts. An entry is
-built from up to three **slots**, joined by `AND`, and the hypothesis lists the primitives each slot may use
-and fixes their direction:
+Every run tests **one market hypothesis**, picked in the control bar before the run starts. Strategies
+are deliberately **parsimonious** – simple rules trade more often and leave less room to fit noise:
 
 1. **Entry trigger** (required) – a discrete **event**: a crossover, a channel breakout, an oscillator
    crossing back out of its extreme zone. An event fires once per setup, so a strategy cannot re-enter the
-   same trend leg on every candle after a stop or target is hit (a `close > EMA` state trigger did exactly
-   that). Triggers are never states.
-2. **Regime filter** (optional) – a slow **state**: close above a slow EMA (100+ candles), or a rising slow
-   EMA (56+ candles, its value vs. 10 candles earlier).
-3. **Confirmation filter** (optional) – a fast **state**: trend strength (ADX) or volume.
+   same trend leg on every candle after a stop or target is hit. Triggers are never states.
+2. **At most one filter** (optional) – a **state**: a slow regime (close above a slow EMA of 100+ candles,
+   or a rising slow EMA of 56+ candles) or a confirmation (ADX trend strength, volume).
 
-| Hypothesis | Entry triggers (events) | Regime filter | Confirmation |
-|---|---|---|---|
-| **Trend following** – time-series momentum | EMA crossover · Donchian breakout (close above the prior N-candle high) · MACD signal cross | close > slow EMA · slow EMA rising | ADX above a level |
-| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA · slow EMA rising | volume above average |
-| **Buy the dip in an uptrend** – short-term overreaction | pullback rejection: RSI crosses back above an oversold level · close crosses back above the lower band | **required**: close > slow EMA or slow EMA rising | ADX above a level |
-| **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower band | – | ADX below a level |
+- **1–2 indicators per entry.** About **60%** of random strategies are the trigger alone and 40% a trigger
+  plus one filter; mutation keeps that mix (a filter mutation drops an existing filter 75% of the time and
+  adds one to a single-indicator strategy 50% of the time).
+- **Orthogonal pairs only.** The filter must come from another indicator family than the trigger
+  (moving averages, oscillators, bands, volatility, trend strength, volume): two moving-average rules or two
+  momentum oscillators never pair, so an EMA-cross or MACD trigger can only be filtered by ADX.
+
+| Hypothesis | Entry triggers (events) | The one optional filter |
+|---|---|---|
+| **Trend following** – time-series momentum | EMA crossover · Donchian breakout (close above the prior N-candle high) · MACD signal cross | ADX above a level, or (breakout trigger only) close > slow EMA / slow EMA rising |
+| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA · slow EMA rising · volume above average |
+| **Buy the dip in an uptrend** – short-term overreaction | RSI crosses back above an oversold level · close crosses back above the lower band | **required**: close > slow EMA or slow EMA rising |
+| **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower band | ADX below a level |
 
 - Mutations stay inside the hypothesis: they tune a number, swap or redraw the entry trigger, add / drop /
   swap the regime or confirmation filter, or change the exit. They never flip a filter's direction or
@@ -146,13 +150,19 @@ and fixes their direction:
   only blocks re-entering the same side) – in the backtester and in the Pine export alike.
 - **Round-number grids only.** Lookbacks from the geometric grid {5, 7, 10, 14, 20, 28, 40, 56, 80, 112,
   160, 200} (about √2 per step, no near-duplicates); oscillator levels in steps of 5; band multipliers in
-  steps of 0.5; static stop / target from {1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30} %.
-- **At most 10 tunable numbers** per strategy, with a fitness penalty for each one above 6.
+  steps of 0.5.
+- **Static stops and targets scale with the timeframe:** 0.5–3.5% stop and 1–10% target on 15m–1h
+  candles, 1–6% / 2–15% on 4h, 1.5–10% / 3–20% on daily. A 10% stop on a 15m chart is never hit, so capital
+  sits in trades nothing closes. ATR-based exits, which scale on their own, are favoured (70% of random
+  strategies).
+- **At most 5 tunable numbers** per strategy, exits included, with a fitness penalty for the 5th. Settings
+  that would add parameters without adding an idea are fixed: the exit ATR period (14, the same ATR that
+  scales slippage), the MACD signal (10), the ADX filter period (14) and the volume average (20).
 - **Exits:** static % stop and target, or ATR stop (1–4×) with optional ATR target (1.5–8×), trailing stop,
   **opposite-signal exit** (the mirrored trigger closes the trade; any hypothesis) and an optional time
   stop (5, 10, 20 or 40 bars). A trailing stop is only kept when the target sits at least 1 ATR beyond the stop.
 
-### Optimiser, trial budget and early stopping
+### Optimiser, trial budget and scanning
 
 Evolutionary hill-climbing with mutation: textbook seeds of the hypothesis and random genomes start the
 population; each iteration mutates the champion or a rank-biased parent, recombines two leaderboard
@@ -161,8 +171,8 @@ members, or injects a fresh random genome.
 - **Only new bets count.** A candidate whose genome was already proposed, that never trades, or whose
   trade log (entries, exits, direction and PnL on the primary asset) repeats one already evaluated is
   skipped: it is not a trial, uses no budget and cannot enter the leaderboard.
-- **Evaluations per run:** 5,000 by default (settable from 100 to the window's remaining budget).
-- **Cumulative trial budget per data window:** **25,000** evaluations across every run and session whose
+- **Evaluations per run:** 25,000 by default, at most 50,000 (the safety ceiling of one run).
+- **Cumulative trial budget per data window:** **50,000** evaluations across every run and session whose
   search period overlaps (a shared symbol, and at least half of the shorter window in common). The trials
   are kept in `localStorage`, so reloading the page, a new end date, another range or another timeframe over
   the same dates never resets them. They also seed the deflated-Sharpe hurdle and the haircut, so every new
@@ -170,10 +180,26 @@ members, or injects a fresh random genome.
   that window pauses: **Extend Budget (+10,000 trials)** lets you continue knowingly. Extensions are
   recorded too, every earlier trial still counts, and the meter warns that multiple-testing significance is
   degraded.
-- **Early stopping:** a run ends when **1,500** evaluations in a row fail to improve the best **composite
-  fitness** on the leaderboard (or at its evaluation limit, or the window's budget, or when you press
-  **Stop**). Early stopping used to watch the deflated Sharpe, which sits at 0% through the first
-  generations and stopped runs before good combinations had evolved.
+- **Scan until robust.** A run keeps scanning until it has found **N robust strategies** ("Stop after N
+  robust": 1, 3 – the default – 5, or *Run Full Budget*), or its budget is spent. A strategy is robust when
+  it passes **all** of these gates on the search period (the holdout stays sealed):
+  1. **Validation:** validation Sharpe above 0.3 and a positive validation net profit after fees and
+     volatility slippage;
+  2. **Folds:** at least 3 of the 5 sequential folds profitable, none beyond the 35% fold drawdown cap;
+  3. **Neighbourhood:** the one-grid-step parameter neighbours keep a positive median expectancy per trade;
+  4. **Significance:** the timeframe-scaled minimum-trade gates, and a deflated Sharpe of at least 50% – the
+     validation Sharpe beats the best a random walk is expected to reach after that many trials.
+  Robust strategies stay listed even when the fitness ranking would push them off the leaderboard, and are
+  re-checked whenever the luck hurdle rises (a strategy can drop out). The target only ends a run after at
+  least 1,000 evaluations. Robust here is a search-period verdict: the holdout of the one strategy you lock
+  decides the final verdict.
+- **Diversity restarts instead of early exit.** When **1,500** evaluations in a row fail to improve the best
+  composite fitness, the run does not stop: it keeps the best 5 strategies in a hall of fame and re-seeds
+  the rest of its parent population with fresh random single- and dual-indicator genomes (a new
+  **population cycle**), so a long scan escapes the local optimum it stalled on.
+- The live scan row shows robust strategies found / target, evaluations / budget with the population cycle,
+  and how many scored candidates cleared each gate (minimum trades, validation Sharpe, 3 of 5 folds, DSR,
+  stable neighbours), so you can see why candidates are being filtered.
 - **Haircut Sharpe** (Harvey & Liu): the validation Sharpe's p-value is multiplied by the number of trials on
   the window (Bonferroni) and turned back into the Sharpe that survives. Shown next to the deflated Sharpe.
 
@@ -257,8 +283,8 @@ direct MessageChannels. Results are applied in proposal order, so a seeded run g
 whatever the pool size. With one or two cores, or if an evaluator fails to load, the optimiser scores
 candidates itself. Within each evaluation, the expensive parts are kept small: only the bars inside
 trades are visited when computing metrics, the second condition of an entry is only checked where the
-trigger fired, and in a Robust universe or asset pool a candidate stops being backtested once it provably cannot
-reach the leaderboard (an exact bound on the median, so it never changes the result).
+trigger fired. Every candidate is backtested on every asset: the robustness gates are not fitness-based,
+so a candidate that cannot make the leaderboard may still be one of the robust strategies a scan is after.
 
 The leaderboard keeps the 25 best behaviourally distinct strategies: two candidates whose equity returns
 correlate above 0.9 count as the same idea and only the fitter one is listed.

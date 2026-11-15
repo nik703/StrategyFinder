@@ -1506,6 +1506,35 @@ export function passesTradeGates(f: Pick<FitnessInputs, 'trades' | 'validationTr
   return f.trades >= f.gates.search && f.validationTrades >= f.gates.validation && f.tradesPerYear >= f.gates.perYear - 1e-9;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Robustness gates (search period only – see `RobustChecks`)                */
+/* -------------------------------------------------------------------------- */
+
+/** Validation Sharpe a robust strategy must exceed. */
+export const ROBUST_MIN_VALIDATION_SHARPE = 0.3;
+/**
+ * Deflated Sharpe a robust strategy must reach: 50% means the validation Sharpe beats the Sharpe the
+ * luckiest of that many skill-less (random-walk) strategies is expected to show.
+ */
+export const ROBUST_MIN_DSR = 0.5;
+
+/** Out-of-sample validation pass: Sharpe above 0.3 and a net profit after every cost. */
+export function passesValidationGate(validation: PerformanceMetrics): boolean {
+  return validation.sharpe > ROBUST_MIN_VALIDATION_SHARPE && validation.netPnl > 0;
+}
+
+/** Multi-fold consistency: at least 3 of the 5 folds profitable and no fold beyond the drawdown cap. */
+export function passesFoldGate(folds: readonly PerformanceMetrics[]): boolean {
+  if (folds.length === 0) return false;
+  const profitable = folds.filter((fold) => fold.roi > 0).length;
+  return profitable >= CONSISTENT_FOLDS && folds.every((fold) => fold.maxDrawdown <= 100 * CATASTROPHIC_FOLD_DRAWDOWN);
+}
+
+/** Net profit per trade (0 without trades). */
+export function expectancy(m: PerformanceMetrics): number {
+  return m.trades > 0 ? m.netPnl / m.trades : 0;
+}
+
 export function median(values: readonly number[]): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);

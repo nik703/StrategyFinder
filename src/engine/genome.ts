@@ -6,14 +6,17 @@
  *
  *   • every run tests ONE market hypothesis (see `HYPOTHESES`), which lists the
  *     primitives each slot of an entry may use and fixes their direction;
- *   • an entry has up to three slots, combined with AND:
- *       1. a required ENTRY TRIGGER – a discrete event (a crossover, a channel
- *          breakout, an oscillator crossing back out of its extreme zone). It
- *          fires once per setup, so a strategy cannot re-enter the same trend
- *          leg on every candle after a stop or target is hit;
- *       2. an optional REGIME filter – a state (price above a slow EMA, a rising
- *          slow EMA) that says which market the trigger is meant for;
- *       3. an optional CONFIRMATION filter – a state (trend strength, volume);
+ *   • PARSIMONY: an entry is ONE required ENTRY TRIGGER – a discrete event (a
+ *     crossover, a channel breakout, an oscillator crossing back out of its
+ *     extreme zone) that fires once per setup, so a strategy cannot re-enter
+ *     the same trend leg on every candle – plus at most ONE filter, a state:
+ *     a slow regime (price above a slow EMA, a rising slow EMA) or a
+ *     confirmation (trend strength, volume). About 60% of random strategies
+ *     are the trigger alone. The filter must come from a different indicator
+ *     family than the trigger (no two moving-average rules, no two oscillators);
+ *   • at most 5 tunable numbers in total, exits included – ATR period, MACD
+ *     signal and filter periods are fixed at textbook values; static stop /
+ *     target grids are scaled to the candle timeframe;
  *   • exits: fixed or ATR brackets, a trailing stop, a time stop and an
  *     opposite-signal exit (the mirrored trigger closes the trade);
  *   • every strategy follows its hypothesis's archetype (TREND or MEAN_REVERSION);
@@ -85,8 +88,34 @@ function pickWeighted<T>(rng: Rng, items: readonly (readonly [T, number])[]): T 
  * grid step is the same relative change everywhere and no two values are near-duplicates.
  */
 export const LOOKBACK_GRID: readonly number[] = [5, 7, 10, 14, 20, 28, 40, 56, 80, 112, 160, 200];
-/** Static stop-loss / take-profit percentages. */
-export const STATIC_PCT_GRID: readonly number[] = [1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30];
+/**
+ * Static stop-loss / take-profit percentages, scaled to the candle timeframe: a 10% stop on a 15m
+ * chart is never hit, so the trade is closed by something else and the capital sits idle.
+ *
+ *   intraday (≤ 1h candles)  stop 0.5–3.5%   target 1–10%
+ *   swing    (≤ 4h candles)  stop 1–6%       target 2–15%
+ *   daily                    stop 1.5–10%    target 3–20%
+ */
+export type StaticTier = 'intraday' | 'swing' | 'daily';
+export const STATIC_GRIDS: Readonly<Record<StaticTier, { stopLossPct: readonly number[]; takeProfitPct: readonly number[] }>> = {
+  intraday: { stopLossPct: [0.5, 0.75, 1, 1.5, 2, 2.5, 3, 3.5], takeProfitPct: [1, 1.5, 2, 3, 4, 5, 7.5, 10] },
+  swing: { stopLossPct: [1, 1.5, 2, 3, 4, 5, 6], takeProfitPct: [2, 3, 4, 5, 7.5, 10, 15] },
+  daily: { stopLossPct: [1.5, 2, 3, 4, 5, 7.5, 10], takeProfitPct: [3, 4, 5, 7.5, 10, 15, 20] },
+};
+/** Every static stop / target value of any tier. */
+export const STATIC_PCT_GRID: readonly number[] = [...new Set(Object.values(STATIC_GRIDS).flatMap((g) => [...g.stopLossPct, ...g.takeProfitPct]))].sort((a, b) => a - b);
+
+/** The static-exit tier of candles `barMs` long. */
+export function staticTier(barMs: number): StaticTier {
+  if (barMs <= 3_600_000 + 1) return 'intraday';
+  if (barMs <= 4 * 3_600_000 + 1) return 'swing';
+  return 'daily';
+}
+
+/** Static stop / target grids for the data's timeframe. */
+export function staticGrids(limits: GenomeLimits): { stopLossPct: readonly number[]; takeProfitPct: readonly number[] } {
+  return STATIC_GRIDS[staticTier(limits.barMs ?? 86_400_000)];
+}
 export const TIME_STOP_GRID: readonly number[] = [5, 10, 20, 40];
 
 const range = (from: number, to: number, step: number): number[] => {
@@ -95,10 +124,14 @@ const range = (from: number, to: number, step: number): number[] => {
   return out;
 };
 
+/** Fixed (non-tunable) settings: they would add parameters without adding an idea. */
+export const FIXED_ATR_PERIOD = 14;
+export const FIXED_MACD_SIGNAL = 10;
+export const FIXED_FILTER_PERIOD = { ADX: 14, VOLUME: 20 } as const;
+
 export const GRIDS = {
-  stopLossPct: STATIC_PCT_GRID.filter((v) => v <= 15),
-  takeProfitPct: STATIC_PCT_GRID,
-  atrPeriod: [7, 10, 14, 20, 28],
+  /** The exit ATR period is fixed – one ATR, the same that scales slippage. */
+  atrPeriod: [FIXED_ATR_PERIOD],
   stopAtrMult: range(1, 4, 0.5),
   takeProfitAtrMult: range(1.5, 8, 0.5),
   macdSignal: [5, 7, 10, 14],
@@ -119,14 +152,14 @@ export const GRIDS = {
   volumeRatio: [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3],
 } as const;
 
-/** Trigger + regime filter + confirmation filter. */
-export const MAX_CONDITIONS = 3;
+/** One entry trigger plus at most ONE filter. */
+export const MAX_CONDITIONS = 2;
 /** Indicator-reversal exits are a single condition. */
 export const MAX_EXIT_CONDITIONS = 1;
 /** Hard cap on the number of tunable numbers in a strategy. */
-export const MAX_PARAMETERS = 10;
+export const MAX_PARAMETERS = 5;
 /** Parameters above this count cost fitness. */
-export const FREE_PARAMETERS = 6;
+export const FREE_PARAMETERS = 4;
 /** "Short-term" triggers look back at most this many bars; regime filters at least `SLOW_LOOKBACK`. */
 export const SHORT_LOOKBACK = 30;
 export const SLOW_LOOKBACK = 100;
@@ -143,9 +176,11 @@ export interface GenomeLimits {
   maxLookback: number;
   /** False when the dataset has no usable volume (volume conditions are then excluded). */
   hasVolume: boolean;
+  /** Candle length in ms – sets the static stop / target grids (default: daily). */
+  barMs?: number;
 }
 
-export const DEFAULT_LIMITS: GenomeLimits = { maxLookback: 200, hasVolume: true };
+export const DEFAULT_LIMITS: GenomeLimits = { maxLookback: 200, hasVolume: true, barMs: 86_400_000 };
 
 function lookbacks(min: number, max: number, limits: GenomeLimits): number[] {
   const cap = Math.min(max, Math.max(SHORT_LOOKBACK, limits.maxLookback));
@@ -308,7 +343,6 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
         ['fast', lookbacks(5, 26, limits)],
         ['slow', slowGrid],
       ];
-      if (c.variant !== 'zero') specs.push(['signal', GRIDS.macdSignal]);
       return specs;
     }
     case 'PRICE_MA': {
@@ -341,16 +375,11 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
       if (c.variant === 'level') specs.push(['level', c.level < 50 ? GRIDS.stochLow : GRIDS.stochHigh]);
       return specs;
     }
-    case 'ADX': {
-      const specs: Spec[] = [['period', lookbacks(7, 30, limits)]];
-      if (c.variant === 'strength') specs.push(['level', GRIDS.adxLevel]);
-      return specs;
-    }
+    case 'ADX':
+      // As a filter only the level is tuned; the period is the textbook 14.
+      return c.variant === 'strength' ? [['level', GRIDS.adxLevel]] : [['period', lookbacks(7, 30, limits)]];
     case 'VOLUME':
-      return [
-        ['period', lookbacks(10, 50, limits)],
-        ['level', GRIDS.volumeRatio],
-      ];
+      return [['level', GRIDS.volumeRatio]];
     case 'SUPERTREND':
       return [
         ['period', lookbacks(7, 21, limits)],
@@ -401,7 +430,9 @@ function normalizeCondition(input: Condition, slot: Slot, limits: GenomeLimits):
   }
   if (c.ind === 'BB' && (c.variant === 'upper' || c.variant === 'lower')) c.level = 0;
   if (c.ind === 'ADX' && c.variant === 'di') c.level = 25;
-  if (c.ind === 'MACD' && c.variant === 'zero') c.signal = 10;
+  if (c.ind === 'MACD') c.signal = FIXED_MACD_SIGNAL;
+  if (c.ind === 'ADX' && c.variant === 'strength') c.period = FIXED_FILTER_PERIOD.ADX;
+  if (c.ind === 'VOLUME') c.period = FIXED_FILTER_PERIOD.VOLUME;
 
   for (const [key, grid] of conditionSpecs(c, slot, limits)) {
     if (grid.length > 0) fields[key] = snap(fields[key] as number, grid);
@@ -571,7 +602,7 @@ interface HypothesisSlots {
 const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
   TREND_FOLLOWING: { triggers: ['EMA_CROSS', 'DONCHIAN_BREAKOUT', 'MACD_CROSS'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['ADX_TRENDING'] },
   VOL_BREAKOUT: { triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['VOLUME_SURGE'] },
-  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['ADX_TRENDING'] },
+  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: [] },
   RANGE_REVERSION: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: [], confirms: ['ADX_RANGING'] },
 };
 
@@ -579,10 +610,13 @@ const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
  * The market hypotheses a run can test. Each is a distinct, economically motivated idea; its
  * slots list the event triggers that express it and the state filters that say when it applies:
  *
- *   TREND_FOLLOWING  EMA cross · Donchian breakout · MACD cross  | close > slow EMA · slow EMA rising | ADX > level
- *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | close > slow EMA · slow EMA rising | volume surge
- *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA or slow EMA rising | ADX > level
- *   RANGE_REVERSION  RSI back above oversold · back inside lower band | –                                  | ADX < level
+ *   TREND_FOLLOWING  EMA cross · Donchian breakout · MACD cross  | one of: close > slow EMA · slow EMA rising · ADX > level
+ *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | one of: close > slow EMA · slow EMA rising · volume surge
+ *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA or slow EMA rising
+ *   RANGE_REVERSION  RSI back above oversold · back inside lower band | optional: ADX < level
+ *
+ *   The filter is always from another indicator family than the trigger, so an EMA-cross or MACD
+ *   trigger can only be filtered by ADX.
  */
 export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
   TREND_FOLLOWING: {
@@ -593,7 +627,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     rationale:
       'Time-series momentum: markets that have been rising tend to keep rising for a while, because information spreads slowly and money chases performance.',
     trigger: 'An EMA crossover, a Donchian-channel breakout or a MACD signal cross (one event per setup).',
-    filter: 'Optional regime: close above a slow EMA or a rising slow EMA. Optional confirmation: ADX above a level.',
+    filter: 'Optional, one only: ADX above a level, or – with a breakout trigger – close above a slow EMA or a rising slow EMA.',
     filterRequired: false,
     replaces: 'Supertrend, +DI/−DI and price-vs-MA states, which all measure the same trend.',
   },
@@ -605,7 +639,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     rationale:
       'A close beyond the recent range or volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
     trigger: 'Close breaks above the prior Donchian high or the upper Bollinger band.',
-    filter: 'Optional regime: close above a slow EMA or a rising slow EMA. Optional confirmation: volume above its average.',
+    filter: 'Optional, one only: close above a slow EMA, a rising slow EMA, or volume above its average.',
     filterRequired: false,
     replaces: 'Band-width and ATR "squeeze" filters, which describe the same volatility state.',
   },
@@ -617,7 +651,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     rationale:
       'Short-term overreaction: sharp pullbacks inside a long-term uptrend tend to be partly reversed, as buyers are paid to absorb forced selling.',
     trigger: 'Pullback rejection: RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
-    filter: 'Required regime: close above a slow EMA or a rising slow EMA. Optional confirmation: ADX above a level.',
+    filter: 'Required, and the only one: close above a slow EMA or a rising slow EMA.',
     filterRequired: true,
     replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
   },
@@ -628,7 +662,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     archetype: 'MEAN_REVERSION',
     rationale: 'In trendless markets prices oscillate around a mean, so oversold readings tend to revert.',
     trigger: 'RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
-    filter: 'Optional confirmation: ADX below a level – only trade when no trend is present.',
+    filter: 'Optional, one only: ADX below a level – only trade when no trend is present.',
     filterRequired: false,
     replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
   },
@@ -668,20 +702,25 @@ export function filterConforms(c: Condition, h: Hypothesis, limits: GenomeLimits
   return filterSlot(c, h, limits) !== null;
 }
 
-/** True when a genome is built exactly from its hypothesis's slots: trigger, then at most one regime and one confirmation filter. */
+/**
+ * True when a genome is built exactly from its hypothesis: one entry-trigger event, and at most one
+ * filter of the hypothesis from a different indicator family than the trigger.
+ */
 export function conformsTo(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
   const h = g.hypothesis;
   if (h === undefined) return false;
   const spec = HYPOTHESES[h];
   const { conditions } = g.longEntry;
   if (g.archetype !== spec.archetype || conditions.length < 1 || conditions.length > MAX_CONDITIONS) return false;
-  if (!triggerConforms(conditions[0], h, limits)) return false;
-  const slots = conditions.slice(1).map((c) => filterSlot(c, h, limits));
-  if (slots.some((slot) => slot === null)) return false;
-  // Canonical order: regime before confirmation, one of each at most.
-  const order = slots.map((slot) => (slot === 'regime' ? 0 : 1));
-  for (let k = 1; k < order.length; k++) if (order[k] <= order[k - 1]) return false;
-  if (spec.filterRequired && !slots.includes('regime')) return false;
+  const [trigger, filter] = conditions;
+  if (!triggerConforms(trigger, h, limits)) return false;
+  if (filter !== undefined) {
+    const slot = filterSlot(filter, h, limits);
+    if (slot === null || !orthogonal(trigger, filter)) return false;
+    if (spec.filterRequired && slot !== 'regime') return false;
+  } else if (spec.filterRequired) {
+    return false;
+  }
   if (g.exit.mode === 'dynamic' && g.exit.reversalExit && !allowsReversalExit(h, g.archetype)) return false;
   return true;
 }
@@ -749,22 +788,70 @@ export function hypothesisTrigger(rng: Rng, h: Hypothesis, limits: GenomeLimits,
   throw new Error(`No entry trigger of ${h} fits this data.`);
 }
 
-/** A random filter of `h` for `slot`, or null when the hypothesis has none (or the data cannot support it). */
-export function hypothesisSlotFilter(rng: Rng, h: Hypothesis, slot: 'regime' | 'confirm', limits: GenomeLimits): Condition | null {
+/**
+ * Indicator family of a condition. Two conditions of the same family measure the same thing – two
+ * moving-average rules, two momentum oscillators, two bands – so an entry may not pair them.
+ */
+export type IndicatorClass = 'moving-average' | 'oscillator' | 'band' | 'volatility' | 'trend-strength' | 'volume';
+
+export function indicatorClass(c: Condition): IndicatorClass {
+  switch (c.ind) {
+    case 'PRICE_MA':
+    case 'MA_CROSS':
+    case 'MA_SLOPE':
+    case 'MACD':
+    case 'SUPERTREND':
+      return 'moving-average';
+    case 'RSI':
+    case 'STOCH':
+    case 'CCI':
+      return 'oscillator';
+    case 'BB':
+      return c.variant === 'bandwidth' ? 'volatility' : c.variant === 'pctb' ? 'oscillator' : 'band';
+    case 'DONCHIAN':
+      return 'band';
+    case 'ATR':
+      return 'volatility';
+    case 'ADX':
+      return c.variant === 'strength' ? 'trend-strength' : 'moving-average';
+    case 'VOLUME':
+      return 'volume';
+  }
+}
+
+/** True when two conditions come from different indicator families. */
+export function orthogonal(a: Condition, b: Condition): boolean {
+  return indicatorClass(a) !== indicatorClass(b);
+}
+
+/** A random filter of `h` for `slot` (orthogonal to `trigger` when given), or null when there is none. */
+export function hypothesisSlotFilter(
+  rng: Rng,
+  h: Hypothesis,
+  slot: 'regime' | 'confirm',
+  limits: GenomeLimits,
+  trigger: Condition | null = null,
+): Condition | null {
   const ids = slot === 'regime' ? SLOTS[h].regimes : SLOTS[h].confirms;
   const shuffled = [...ids].sort(() => rng() - 0.5);
   for (const id of shuffled) {
     const c = drawPrimitive(rng, id, HYPOTHESES[h].archetype, limits);
-    if (c) return c;
+    if (c && (trigger === null || orthogonal(trigger, c))) return c;
   }
   return null;
 }
 
-/** A random filter of `h`: its regime filter when one is required, otherwise either kind. */
-export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition | null {
-  if (HYPOTHESES[h].filterRequired) return hypothesisSlotFilter(rng, h, 'regime', limits);
+/**
+ * A random filter of `h` orthogonal to `trigger`: its regime filter when one is required,
+ * otherwise a regime or confirmation filter. Null when no filter of `h` fits.
+ */
+export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits, trigger: Condition | null = null): Condition | null {
+  if (HYPOTHESES[h].filterRequired) return hypothesisSlotFilter(rng, h, 'regime', limits, trigger);
   const first: 'regime' | 'confirm' = SLOTS[h].regimes.length > 0 && rng() < 0.5 ? 'regime' : 'confirm';
-  return hypothesisSlotFilter(rng, h, first, limits) ?? hypothesisSlotFilter(rng, h, first === 'regime' ? 'confirm' : 'regime', limits);
+  return (
+    hypothesisSlotFilter(rng, h, first, limits, trigger) ??
+    hypothesisSlotFilter(rng, h, first === 'regime' ? 'confirm' : 'regime', limits, trigger)
+  );
 }
 
 /** The primitives of every slot of `h` (for the UI and tests). */
@@ -776,20 +863,24 @@ export function hypothesisPrimitives(h: Hypothesis): HypothesisSlots {
 /*  Exits                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function randomStaticExit(rng: Rng): ExitGene {
+function randomStaticExit(rng: Rng, limits: GenomeLimits): ExitGene {
+  const grids = staticGrids(limits);
   return {
     mode: 'static',
-    stopLossPct: pick(rng, GRIDS.stopLossPct),
-    takeProfitPct: pick(rng, GRIDS.takeProfitPct),
+    stopLossPct: pick(rng, grids.stopLossPct),
+    takeProfitPct: pick(rng, grids.takeProfitPct),
   };
 }
+
+/** Share of random strategies with ATR-based exits (they scale with volatility on every timeframe). */
+const ATR_EXIT_RATE = 0.7;
 
 function randomDynamicExit(rng: Rng, allowReversal: boolean): DynamicExit {
   const trailing = rng() < 0.4;
   const reversalExit = allowReversal && rng() < 0.35;
   return {
     mode: 'dynamic',
-    atrPeriod: pick(rng, GRIDS.atrPeriod),
+    atrPeriod: FIXED_ATR_PERIOD,
     stopAtrMult: pick(rng, GRIDS.stopAtrMult),
     trailing,
     takeProfitAtrMult: (trailing || reversalExit) && rng() < 0.45 ? null : pick(rng, GRIDS.takeProfitAtrMult),
@@ -853,10 +944,10 @@ function parameterHandles(g: StrategyGenome, limits: GenomeLimits): Handle[] {
   });
   const exit = g.exit;
   if (exit.mode === 'static') {
-    handles.push({ label: 'Stop loss %', grid: GRIDS.stopLossPct, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
-    handles.push({ label: 'Take profit %', grid: GRIDS.takeProfitPct, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
+    const grids = staticGrids(limits);
+    handles.push({ label: 'Stop loss %', grid: grids.stopLossPct, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
+    handles.push({ label: 'Take profit %', grid: grids.takeProfitPct, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
   } else {
-    handles.push({ label: 'ATR period', grid: GRIDS.atrPeriod, get: () => exit.atrPeriod, set: (v) => (exit.atrPeriod = v) });
     handles.push({ label: 'Stop × ATR', grid: GRIDS.stopAtrMult, get: () => exit.stopAtrMult, set: (v) => (exit.stopAtrMult = v) });
     if (exit.takeProfitAtrMult !== null) {
       handles.push({
@@ -970,8 +1061,8 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
   if (input.exit.mode === 'static') {
     exit = {
       mode: 'static',
-      stopLossPct: snap(input.exit.stopLossPct, GRIDS.stopLossPct),
-      takeProfitPct: snap(input.exit.takeProfitPct, GRIDS.takeProfitPct),
+      stopLossPct: snap(input.exit.stopLossPct, staticGrids(limits).stopLossPct),
+      takeProfitPct: snap(input.exit.takeProfitPct, staticGrids(limits).takeProfitPct),
     };
   } else {
     const stopAtrMult = snap(input.exit.stopAtrMult, GRIDS.stopAtrMult);
@@ -987,7 +1078,7 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
     }
     exit = {
       mode: 'dynamic',
-      atrPeriod: snap(input.exit.atrPeriod, GRIDS.atrPeriod),
+      atrPeriod: FIXED_ATR_PERIOD,
       stopAtrMult,
       trailing,
       takeProfitAtrMult,
@@ -1040,13 +1131,13 @@ export function repairGenome(g: StrategyGenome, mode: TradeMode, limits: GenomeL
   const spec = HYPOTHESES[hypothesis];
   let genome = normalizeGenome({ ...g, hypothesis, archetype: spec.archetype }, mode, limits);
   const { conditions } = genome.longEntry;
-  const { trigger, regime, confirm } = entrySlots(genome, limits);
-  const slots = {
-    trigger: trigger ?? hypothesisTrigger(rng, hypothesis, limits),
-    regime: regime ?? (spec.filterRequired ? hypothesisSlotFilter(rng, hypothesis, 'regime', limits) : null),
-    confirm,
-  };
-  const next = [slots.trigger, slots.regime, slots.confirm].filter((c): c is Condition => c !== null);
+  const slots = entrySlots(genome, limits);
+  const trigger = slots.trigger ?? hypothesisTrigger(rng, hypothesis, limits);
+  let filter = slots.filter !== null && orthogonal(trigger, slots.filter) ? slots.filter : null;
+  if (spec.filterRequired && (filter === null || filterSlot(filter, hypothesis, limits) !== 'regime')) {
+    filter = hypothesisFilter(rng, hypothesis, limits, trigger);
+  }
+  const next = [trigger, filter].filter((c): c is Condition => c !== null);
   if (next.length !== conditions.length || next.some((c, k) => c !== conditions[k])) {
     genome.longEntry = { logic: 'AND', conditions: next };
     genome = normalizeGenome(genome, mode, limits);
@@ -1056,44 +1147,38 @@ export function repairGenome(g: StrategyGenome, mode: TradeMode, limits: GenomeL
 
 /**
  * The entry slots of a genome built from a hypothesis: its trigger (when it is one of the
- * hypothesis's events) and its first regime and confirmation filter. Anything else is dropped.
+ * hypothesis's events) and its first filter of the hypothesis. Anything else is dropped.
  */
-export function entrySlots(g: StrategyGenome, limits: GenomeLimits): { trigger: Condition | null; regime: Condition | null; confirm: Condition | null } {
+export function entrySlots(g: StrategyGenome, limits: GenomeLimits): { trigger: Condition | null; filter: Condition | null } {
   const h = g.hypothesis ?? inferHypothesis(g);
   const [first, ...rest] = g.longEntry.conditions;
-  let regime: Condition | null = null;
-  let confirm: Condition | null = null;
-  for (const c of rest) {
-    const slot = filterSlot(c, h, limits);
-    if (slot === 'regime' && regime === null) regime = c;
-    else if (slot === 'confirm' && confirm === null) confirm = c;
-  }
-  return { trigger: first !== undefined && triggerConforms(first, h, limits) ? first : null, regime, confirm };
+  const filter = rest.find((c) => filterSlot(c, h, limits) !== null) ?? null;
+  return { trigger: first !== undefined && triggerConforms(first, h, limits) ? first : null, filter };
 }
 
-/** Probability that a random strategy carries a regime filter / a confirmation filter (when optional). */
-const REGIME_RATE = 0.6;
-const CONFIRM_RATE = 0.4;
+/**
+ * Probability that a random strategy carries its (optional) filter. Simple strategies trade more
+ * often and leave less room to fit noise, so about 60% of candidates are a single indicator and
+ * about 40% a trigger plus one orthogonal filter.
+ */
+export const FILTER_RATE = 0.4;
 
-/** A random strategy built from the slots of hypothesis `h`. */
+/** A random strategy built from hypothesis `h`: one entry trigger, and sometimes one orthogonal filter. */
 export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h: Hypothesis): StrategyGenome {
   const spec = HYPOTHESES[h];
-  const conditions = [hypothesisTrigger(rng, h, limits)];
-  if (spec.filterRequired || rng() < REGIME_RATE) {
-    const regime = hypothesisSlotFilter(rng, h, 'regime', limits);
-    if (regime) conditions.push(regime);
-  }
-  if (rng() < CONFIRM_RATE) {
-    const confirm = hypothesisSlotFilter(rng, h, 'confirm', limits);
-    if (confirm) conditions.push(confirm);
+  const trigger = hypothesisTrigger(rng, h, limits);
+  const conditions = [trigger];
+  if (spec.filterRequired || rng() < FILTER_RATE) {
+    const filter = hypothesisFilter(rng, h, limits, trigger);
+    if (filter) conditions.push(filter);
   }
   const genome: StrategyGenome = {
     archetype: spec.archetype,
     hypothesis: h,
     longEntry: { logic: 'AND', conditions },
     shortEntry: null,
-    exit: rng() < 0.45 ? randomStaticExit(rng) : randomDynamicExit(rng, allowsReversalExit(h, spec.archetype)),
-    maxBarsInTrade: rng() < 0.2 ? pick(rng, TIME_STOP_GRID) : null,
+    exit: rng() < ATR_EXIT_RATE ? randomDynamicExit(rng, allowsReversalExit(h, spec.archetype)) : randomStaticExit(rng, limits),
+    maxBarsInTrade: rng() < 0.15 ? pick(rng, TIME_STOP_GRID) : null,
   };
   return repairGenome(genome, mode, limits, rng);
 }
@@ -1107,16 +1192,23 @@ export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h:
  * drop / swap the regime or confirmation filter, or change the exit. They never flip a filter's
  * direction or change the archetype.
  */
-type MutationKind = 'tweak' | 'trigger' | 'regime' | 'confirm' | 'exit' | 'time';
+type MutationKind = 'tweak' | 'trigger' | 'filter' | 'exit' | 'time';
 
 const MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [
   ['tweak', 0.45],
-  ['trigger', 0.1],
-  ['regime', 0.12],
-  ['confirm', 0.1],
+  ['trigger', 0.12],
+  ['filter', 0.18],
   ['exit', 0.15],
-  ['time', 0.08],
+  ['time', 0.1],
 ];
+/**
+ * A filter mutation removes an existing optional filter with probability `FILTER_DROP_RATE`, and adds
+ * one to a single-indicator strategy with probability `FILTER_ADD_RATE` (otherwise it tunes a number).
+ * The single-indicator share then settles at drop / (add + drop) = 60%, the same 60 / 40 mix as the
+ * random population.
+ */
+const FILTER_DROP_RATE = 0.75;
+const FILTER_ADD_RATE = 0.5;
 
 /** Attempts at a random mutation before falling back to a guaranteed-distinct neighbour. */
 const MUTATION_ATTEMPTS = 16;
@@ -1133,7 +1225,7 @@ function tweak(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
   handle.set(handle.grid[Math.max(0, Math.min(handle.grid.length - 1, next))]);
 }
 
-function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean): void {
+function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean, limits: GenomeLimits): void {
   const exit = g.exit;
   if (exit.mode === 'static') {
     g.exit = randomDynamicExit(rng, allowReversal);
@@ -1142,7 +1234,7 @@ function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean): void {
   const r = rng();
   const options = allowReversal ? 4 : 3;
   const k = Math.floor(r * options);
-  if (k === 0) g.exit = randomStaticExit(rng);
+  if (k === 0) g.exit = randomStaticExit(rng, limits);
   else if (k === 1) exit.trailing = !exit.trailing;
   else if (k === 2) exit.takeProfitAtrMult = exit.takeProfitAtrMult === null ? pick(rng, GRIDS.takeProfitAtrMult) : null;
   else exit.reversalExit = !exit.reversalExit;
@@ -1154,7 +1246,7 @@ function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: Genom
   const slots = entrySlots(g, limits);
   const rebuild = (): void => {
     const trigger = slots.trigger ?? hypothesisTrigger(rng, h, limits);
-    g.longEntry = { logic: 'AND', conditions: [trigger, slots.regime, slots.confirm].filter((c): c is Condition => c !== null) };
+    g.longEntry = { logic: 'AND', conditions: [trigger, slots.filter].filter((c): c is Condition => c !== null) };
   };
   switch (kind) {
     case 'tweak':
@@ -1162,28 +1254,29 @@ function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: Genom
       return;
     case 'trigger':
       // Half the time another event of the hypothesis, otherwise fresh numbers for any of them.
+      // A filter that is no longer orthogonal to the new trigger is dropped by repair.
       slots.trigger = hypothesisTrigger(rng, h, limits, rng() < 0.5 ? slots.trigger : null);
       rebuild();
       return;
-    case 'regime':
-    case 'confirm': {
-      const slot = kind;
-      const required = slot === 'regime' && spec.filterRequired;
-      if (slots[slot] !== null && !required && rng() < 0.4) {
-        slots[slot] = null;
+    case 'filter': {
+      if (slots.filter !== null && !spec.filterRequired && rng() < FILTER_DROP_RATE) {
+        slots.filter = null;
+      } else if (slots.filter === null && rng() >= FILTER_ADD_RATE) {
+        tweak(rng, g, limits);
+        return;
       } else {
-        const filter = hypothesisSlotFilter(rng, h, slot, limits);
+        const filter = hypothesisFilter(rng, h, limits, slots.trigger);
         if (filter === null) {
           tweak(rng, g, limits);
           return;
         }
-        slots[slot] = filter;
+        slots.filter = filter;
       }
       rebuild();
       return;
     }
     case 'exit':
-      mutateExit(rng, g, allowsReversalExit(h, spec.archetype));
+      mutateExit(rng, g, allowsReversalExit(h, spec.archetype), limits);
       return;
     case 'time': {
       if (g.maxBarsInTrade === null) g.maxBarsInTrade = pick(rng, TIME_STOP_GRID);
@@ -1225,7 +1318,7 @@ export function mutateGenome(
   const neighbours = stepNeighbours(parent, mode, limits);
   if (neighbours.length > 0) return neighbours[Math.floor(rng() * neighbours.length)];
   const child = cloneGenome(parent);
-  child.exit = parent.exit.mode === 'static' ? randomDynamicExit(rng, allowsReversalExit(h, parent.archetype)) : randomStaticExit(rng);
+  child.exit = parent.exit.mode === 'static' ? randomDynamicExit(rng, allowsReversalExit(h, parent.archetype)) : randomStaticExit(rng, limits);
   return repairGenome(child, mode, limits, rng);
 }
 

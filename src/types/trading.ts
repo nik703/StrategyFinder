@@ -493,6 +493,8 @@ export interface StrategyResult {
   verdictNotes?: string[];
   /** The trade sample the strategy was gated on, and the gates. */
   sample?: SampleInfo;
+  /** Robustness gates (search period only), re-checked whenever the luck hurdle moves. */
+  robust?: RobustChecks;
 }
 
 export interface BenchmarkResult {
@@ -525,7 +527,9 @@ export interface ChartAxis {
 /* -------------------------------------------------------------------------- */
 
 /** Default number of strategy evaluations (trials) per run. */
-export const DEFAULT_RUN_EVALUATIONS = 5_000;
+export const DEFAULT_RUN_EVALUATIONS = 25_000;
+/** Safety ceiling of one run (the window budget may be extended beyond it, a run never goes past it). */
+export const MAX_RUN_EVALUATIONS = 50_000;
 /** Smallest per-run evaluation limit the controls accept. */
 export const MIN_RUN_EVALUATIONS = 100;
 /**
@@ -533,15 +537,20 @@ export const MIN_RUN_EVALUATIONS = 100;
  * At this point search stops by default: the user may extend the window by `BUDGET_EXTENSION`
  * trials at a time, knowingly – every extra trial raises the luck hurdle the deflated Sharpe uses.
  */
-export const WINDOW_TRIAL_BUDGET = 25_000;
+export const WINDOW_TRIAL_BUDGET = 50_000;
 /** Trials one explicit "Extend budget" adds to a data window. */
 export const BUDGET_EXTENSION = 10_000;
 /**
- * Early stopping: a run ends after this many evaluations in a row fail to improve the best
- * composite fitness on the leaderboard. (Not the deflated Sharpe: it sits at 0% through the early
- * generations, which stopped runs before good combinations had a chance to evolve.)
+ * Diversity restart: after this many evaluations in a row without a gain in the best composite
+ * fitness, a run that has not yet found its target number of robust strategies keeps its elite and
+ * re-seeds the rest of its parent population with fresh random genomes, instead of stopping.
  */
 export const FITNESS_PATIENCE = 1_500;
+/** Strategies kept in the hall of fame at every restart. */
+export const ELITE_SIZE = 5;
+/** Default number of robust strategies a run scans for ("Stop after N robust strategies"); 0 = the full budget. */
+export const DEFAULT_ROBUST_TARGET = 3;
+export const MAX_ROBUST_TARGET = 10;
 /** Safety stop: proposals in a row that yield no new (non-duplicate) evaluation, i.e. the search space is exhausted. */
 export const EXHAUSTION_LIMIT = 2_000;
 /** Size of the live leaderboard. */
@@ -591,6 +600,8 @@ export interface OptimizerStartPayload {
   ports?: MessagePort[];
   /** Candidates per round. Defaults to 25 × the pool size; only tests need to set it. */
   batchSize?: number;
+  /** Stop once this many strategies pass every robustness gate (1–10, default 3); 0 = run the full budget. */
+  robustTarget?: number;
 }
 
 export type WorkerRequest =
@@ -632,18 +643,60 @@ export interface ProgressSnapshot {
   hurdleSharpe: number;
   /** Candidates disqualified by the hard minimum-trade gates. */
   undersampled: number;
+  /** Strategies currently passing every robustness gate. */
+  robustFound: number;
+  /** Robust strategies the run is scanning for (0 = it runs the full budget). */
+  robustTarget: number;
+  /** Population cycle: 1, then +1 at every diversity restart. */
+  cycle: number;
+  /** How many candidates cleared each robustness gate on its own. */
+  funnel: GateFunnel;
   itersPerSec: number;
   elapsedMs: number;
 }
 
 /**
  * stopped       – the user pressed Stop;
- * converged     – early stop: no candidate improved the best fitness for `FITNESS_PATIENCE` evaluations;
+ * target        – the run found its target number of robust strategies;
  * budget        – the run's evaluation limit was reached;
  * window-budget – the data window's cumulative trial budget is spent;
  * exhausted     – the hypothesis's search space yields no new strategies.
  */
-export type StopReason = 'stopped' | 'converged' | 'budget' | 'window-budget' | 'exhausted';
+export type StopReason = 'stopped' | 'target' | 'budget' | 'window-budget' | 'exhausted';
+
+/**
+ * The robustness gates a candidate must ALL pass to count towards the run's target. They use the
+ * search period only – the holdout stays sealed – and are stricter than "on the leaderboard":
+ *
+ *   validation    validation Sharpe > 0.3 and a positive validation net profit (after all costs);
+ *   folds         at least 3 of the 5 sequential folds profitable, none beyond the fold drawdown cap;
+ *   neighbours    the one-grid-step parameter neighbours keep a positive median expectancy per trade;
+ *   significance  the timeframe-scaled minimum-trade gates, and a deflated Sharpe of at least 50%:
+ *                 the validation Sharpe beats the best a random walk is expected to reach after this
+ *                 many trials.
+ */
+export interface RobustChecks {
+  validation: boolean;
+  folds: boolean;
+  neighbours: boolean;
+  significance: boolean;
+  passed: boolean;
+}
+
+/** Candidates (fully scored trials) clearing each gate on its own, over the run so far. */
+export interface GateFunnel {
+  /** Fully scored trials. */
+  scored: number;
+  /** Cleared the minimum-trade gates. */
+  trades: number;
+  validation: number;
+  folds: number;
+  /** Deflated Sharpe ≥ 50%. */
+  dsr: number;
+  /** Neighbourhoods checked, and how many held up. */
+  neighboursChecked: number;
+  neighbours: number;
+}
 
 export type WorkerResponse =
   | { type: 'ready'; benchmark: BenchmarkResult; axis: ChartAxis; barsPerYear: number; gates: TradeGates; pooled: boolean }

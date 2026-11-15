@@ -7,6 +7,11 @@ import {
   emptyMetrics,
   CATASTROPHIC_FOLD_DRAWDOWN,
   CONSISTENCY_BONUS,
+  expectancy,
+  passesFoldGate,
+  passesValidationGate,
+  ROBUST_MIN_DSR,
+  ROBUST_MIN_VALIDATION_SHARPE,
   foldBounds,
   FOLDS,
   isSingleRegime,
@@ -52,6 +57,13 @@ import {
   gaussian,
   HYPOTHESES,
   hypothesisUnsupported,
+  indicatorClass,
+  orthogonal,
+  MAX_CONDITIONS,
+  FILTER_RATE,
+  FIXED_ATR_PERIOD,
+  STATIC_GRIDS,
+  staticTier,
   triggerConforms,
   countParameters,
   crossoverGenomes,
@@ -756,7 +768,7 @@ describe('backtester', () => {
       gates,
       singleRegime: false,
       profitableShare: 1,
-      params: 6,
+      params: 4,
       rewardToRisk: 2,
       validationWinRate: 50,
     };
@@ -773,7 +785,7 @@ describe('backtester', () => {
     expect(combineFitness({ ...base, trades: 0 })).toBe(UNFIT);
     // A strategy that makes all of its money in one market regime is disqualified.
     expect(combineFitness({ ...base, assetScores: [50], singleRegime: true })).toBe(UNFIT);
-    expect(combineFitness({ ...base, params: 10 })).toBeCloseTo(score - 0.6, 9);
+    expect(combineFitness({ ...base, params: 5 })).toBeCloseTo(score - 0.15, 9);
     // Reward:risk below 1 needs a win rate 10 points above break-even (66.7% at 0.5:1).
     expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 70 })).toBeCloseTo(score - 0.75, 9);
     expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 80 })).toBe(score);
@@ -792,6 +804,25 @@ describe('backtester', () => {
     // Stage 2: raw validation return over Buy & Hold no longer moves the score at all.
     const moreValidationRoi = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
     expect(assetBaseScore(moreValidationRoi)).toBe(assetScore);
+  });
+
+  it('defines the robustness gates a strategy must all pass to count towards the scan target', () => {
+    const m = (over: Partial<PerformanceMetrics>): PerformanceMetrics => ({ ...emptyMetrics(), ...over });
+    // 1. Out-of-sample validation: Sharpe above 0.3 AND a net profit after costs.
+    expect(ROBUST_MIN_VALIDATION_SHARPE).toBe(0.3);
+    expect(passesValidationGate(m({ sharpe: 0.31, netPnl: 10 }))).toBe(true);
+    expect(passesValidationGate(m({ sharpe: 0.3, netPnl: 10 }))).toBe(false);
+    expect(passesValidationGate(m({ sharpe: 0.8, netPnl: -1 }))).toBe(false);
+    // 2. Folds: 3 of 5 profitable and none beyond the drawdown cap.
+    const fold = (roi: number, maxDrawdown = 5): PerformanceMetrics => m({ roi, maxDrawdown });
+    expect(passesFoldGate([fold(1), fold(2), fold(-1), fold(3), fold(-2)])).toBe(true);
+    expect(passesFoldGate([fold(1), fold(2), fold(-1), fold(-3), fold(-2)])).toBe(false);
+    expect(passesFoldGate([fold(1), fold(2), fold(1, 40), fold(3), fold(2)])).toBe(false);
+    // 3. Neighbourhood: median expectancy per trade.
+    expect(expectancy(m({ netPnl: 50, trades: 10 }))).toBe(5);
+    expect(expectancy(m({ netPnl: 50, trades: 0 }))).toBe(0);
+    // 4. Significance: the deflated Sharpe must beat the random-walk hurdle (50%).
+    expect(ROBUST_MIN_DSR).toBe(0.5);
   });
 
   it('calibrates the minimum-trade gates to the timeframe and the length of the data', () => {
@@ -1118,8 +1149,12 @@ describe('genome', () => {
           triggers.add(genome.longEntry.conditions[0].ind);
           const rest = genome.longEntry.conditions.slice(1);
           if (rest.length > 0) filters++;
-          if (rest.length === 2) full++;
-          for (const filter of rest) expect(filterConforms(filter, h, DEFAULT_LIMITS)).toBe(true);
+          else full++; // single-indicator strategies
+          for (const filter of rest) {
+            expect(filterConforms(filter, h, DEFAULT_LIMITS)).toBe(true);
+            // Orthogonality: the filter never comes from the trigger's indicator family.
+            expect(indicatorClass(filter)).not.toBe(indicatorClass(genome.longEntry.conditions[0]));
+          }
           if (HYPOTHESES[h].filterRequired) expect(rest.length).toBeGreaterThan(0);
           for (const c of genome.longEntry.conditions) families.add(c.ind);
           if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit) reversals++;
@@ -1131,15 +1166,78 @@ describe('genome', () => {
         // Every hypothesis may close on the opposite signal.
         expect(reversals).toBeGreaterThan(20);
         expect(timeStops).toBeGreaterThan(20);
-        expect(filters).toBeGreaterThan(300);
-        // Trigger + regime + confirmation strategies are explored (range reversion has no regime slot).
-        if (h !== 'RANGE_REVERSION') expect(full).toBeGreaterThan(50);
+        // Parsimony: most strategies are a single indicator, a large minority trigger + one filter
+        // (dip-buying always carries its required trend filter).
+        if (HYPOTHESES[h].filterRequired) expect(full).toBe(0);
+        else {
+          expect(full / 1000).toBeGreaterThan(0.5);
+          expect(filters / 1000).toBeGreaterThan(0.2);
+        }
         // Every trigger primitive of the hypothesis is used.
         expect(triggers.size).toBeGreaterThanOrEqual(2);
       }
     }
     // The building blocks: event triggers, slow regime states and confirmation states – no oscillator soup.
     expect([...families].sort()).toEqual(['ADX', 'BB', 'DONCHIAN', 'MACD', 'MA_CROSS', 'MA_SLOPE', 'PRICE_MA', 'RSI', 'VOLUME']);
+  });
+
+  it('starts about 60% of random strategies as a single indicator, the rest with one orthogonal filter', () => {
+    const rng = mulberry32(8);
+    for (const h of HYPOTHESIS_IDS) {
+      let single = 0;
+      for (let i = 0; i < 2000; i++) {
+        const g = randomGenome(rng, 'long-only', DEFAULT_LIMITS, h);
+        expect(g.longEntry.conditions.length).toBeLessThanOrEqual(MAX_CONDITIONS);
+        expect(countParameters(g)).toBeLessThanOrEqual(MAX_PARAMETERS);
+        if (g.longEntry.conditions.length === 1) single++;
+      }
+      if (HYPOTHESES[h].filterRequired) expect(single).toBe(0);
+      else expect(Math.abs(single / 2000 - (1 - FILTER_RATE))).toBeLessThan(0.08);
+    }
+    expect(MAX_CONDITIONS).toBe(2);
+    expect(MAX_PARAMETERS).toBe(5);
+    // Two moving-average rules or two oscillators never pair; different families do.
+    const cross: Condition = { ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: 20, slowType: 'EMA', slowPeriod: 56, op: 'cross_above' };
+    expect(orthogonal(cross, { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' })).toBe(false);
+    expect(orthogonal(cross, { ind: 'MA_SLOPE', maType: 'EMA', period: 112, op: 'gt' })).toBe(false);
+    expect(orthogonal({ ind: 'RSI', period: 14, op: 'cross_above', level: 30 }, { ind: 'STOCH', kPeriod: 14, smooth: 3, dPeriod: 3, variant: 'level', op: 'lt', level: 20 })).toBe(false);
+    expect(orthogonal(cross, { ind: 'ADX', period: 14, variant: 'strength', op: 'gt', level: 20 })).toBe(true);
+    const ema200: Condition = { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' };
+    const stacked = repairGenome(
+      { archetype: 'TREND', hypothesis: 'TREND_FOLLOWING', longEntry: { logic: 'AND', conditions: [cross, ema200] }, shortEntry: null, exit: { mode: 'dynamic', atrPeriod: 20, stopAtrMult: 2, trailing: false, takeProfitAtrMult: 4, reversalExit: false, longExit: null, shortExit: null }, maxBarsInTrade: null },
+      'long-only',
+      DEFAULT_LIMITS,
+      rng,
+    );
+    expect(stacked.longEntry.conditions).toHaveLength(1); // the redundant EMA filter is dropped
+    expect(stacked.exit).toMatchObject({ atrPeriod: FIXED_ATR_PERIOD }); // ATR period is not tuned
+  });
+
+  it('scales static stops and targets to the candle timeframe', () => {
+    expect(staticTier(15 * 60_000)).toBe('intraday');
+    expect(staticTier(3_600_000)).toBe('intraday');
+    expect(staticTier(4 * 3_600_000)).toBe('swing');
+    expect(staticTier(86_400_000)).toBe('daily');
+    const intraday = STATIC_GRIDS.intraday;
+    expect(Math.min(...intraday.stopLossPct)).toBe(0.5);
+    expect(Math.max(...intraday.stopLossPct)).toBe(3.5);
+    expect(Math.min(...intraday.takeProfitPct)).toBe(1);
+    expect(Math.max(...intraday.takeProfitPct)).toBe(10);
+    // A 15m strategy never draws a macro 10%+ stop; random strategies mostly use ATR exits.
+    const rng = mulberry32(12);
+    const limits = { ...DEFAULT_LIMITS, barMs: 15 * 60_000 };
+    let atrExits = 0;
+    for (let i = 0; i < 1000; i++) {
+      const g = randomGenome(rng, 'long-only', limits, HYPOTHESIS_IDS[i % 4]);
+      if (g.exit.mode === 'static') {
+        expect(intraday.stopLossPct).toContain(g.exit.stopLossPct);
+        expect(intraday.takeProfitPct).toContain(g.exit.takeProfitPct);
+      } else atrExits++;
+    }
+    expect(atrExits / 1000).toBeGreaterThan(0.6);
+    // A daily stop snaps onto the intraday grid when the strategy moves to a 15m chart.
+    const daily = normalizeGenome({ ...TREND, exit: { mode: 'static', stopLossPct: 10, takeProfitPct: 20 } }, 'long-only', limits);
+    expect(daily.exit).toMatchObject({ stopLossPct: 3.5, takeProfitPct: 10 });
   });
 
   it('never produces a mutation identical to its parent', () => {
@@ -1205,10 +1303,11 @@ describe('genome', () => {
     // of its event triggers (the bearish Supertrend cross is not one, so it is redrawn).
     expect(fixed.hypothesis).toBe('TREND_FOLLOWING');
     expect(triggerConforms(fixed.longEntry.conditions[0], 'TREND_FOLLOWING')).toBe(true);
-    expect(fixed.longEntry.conditions.length).toBeLessThanOrEqual(3);
+    expect(fixed.longEntry.conditions.length).toBeLessThanOrEqual(2);
     // 2.4 / 1.6 ATR snaps to 2.5 / 1.5: the target is not 1 ATR beyond the stop, so the trail is dropped.
     expect(fixed.exit).toMatchObject({ stopAtrMult: 2.5, takeProfitAtrMult: 1.5, trailing: false });
-    expect(fixed.maxBarsInTrade).toBe(10);
+    // At most 5 tunable numbers: the time stop is shed before the entry loses anything.
+    expect(countParameters(fixed)).toBeLessThanOrEqual(MAX_PARAMETERS);
 
     // A Supertrend fade inside a slow uptrend is the dip-buy idea: its trigger becomes a pullback rejection,
     // and its slow-uptrend filter is kept (on the EMA primitive, snapped to the geometric grid).
@@ -1256,7 +1355,7 @@ describe('genome', () => {
     // A state trigger ("RSI below 30" on every candle it holds) is not an event: repair replaces it.
     const state = repairGenome({ ...dip, longEntry: { logic: 'AND', conditions: [{ ind: 'RSI', period: 14, op: 'lt', level: 30 }, dip.longEntry.conditions[1]] } }, 'long-only', DEFAULT_LIMITS, rng);
     expect(['cross_above']).toContain(state.longEntry.conditions[0].op);
-    expect(countParameters(kept)).toBe(7); // 2 + 1 + ATR period, stop, target + time stop
+    expect(countParameters(kept)).toBe(5); // RSI 2 + EMA 1 + ATR stop and target; the time stop is shed at the 5-number cap
 
     // Parameter cap on a hand-built genome: MACD (3) + Bollinger bandwidth (3) + ADX (2) + ATR exit (3) + time stop (1) = 12 → ≤ 10.
     const heavy = normalizeGenome(

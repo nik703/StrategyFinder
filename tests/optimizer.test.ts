@@ -21,6 +21,7 @@ import { IndicatorCache } from '../src/engine/indicators';
 import { countParameters, gaussian, isCoherent, MAX_PARAMETERS, mirrorGroup, mulberry32 } from '../src/engine/genome';
 import { deflatedSharpeAgainst } from '../src/lib/stats';
 import {
+  DEFAULT_ROBUST_TARGET,
   DEFAULT_RUN_EVALUATIONS,
   DEFAULT_SIZING,
   FITNESS_PATIENCE,
@@ -99,6 +100,7 @@ function runOptimizer(
     windowBudget?: number;
     ports?: MessagePort[];
     batchSize?: number;
+    robustTarget?: number;
   },
 ): Promise<WorkerResponse[]> {
   return new Promise((resolve) => {
@@ -132,6 +134,7 @@ function runOptimizer(
           windowBudget: options.windowBudget,
           ports: options.ports,
           batchSize: options.batchSize,
+          robustTarget: options.robustTarget,
         },
       },
     });
@@ -199,7 +202,8 @@ describe('optimizer worker', () => {
     for (const p of progress) {
       expect(p.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
       expect(p.windowTrials).toBe(p.evaluations); // no earlier runs on this window
-      expect(p.fitnessStall).toBeLessThanOrEqual(FITNESS_PATIENCE);
+      // A stall triggers a diversity restart at the next round boundary.
+      expect(p.fitnessStall).toBeLessThanOrEqual(FITNESS_PATIENCE + PROGRESS_EVERY);
       expect(p.runTrials.count).toBe(p.evaluations);
     }
 
@@ -221,11 +225,13 @@ describe('optimizer worker', () => {
     // The holdout is STILL sealed: nothing is revealed for the board.
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
-    expect(DEFAULT_RUN_EVALUATIONS).toBe(5000);
+    expect(DEFAULT_RUN_EVALUATIONS).toBe(25_000);
     expect(FITNESS_PATIENCE).toBe(1500);
-    expect(['converged', 'budget']).toContain(done.reason);
-    if (done.reason === 'converged') expect(done.fitnessStall).toBe(FITNESS_PATIENCE);
+    // The run scans until it has DEFAULT_ROBUST_TARGET robust strategies, or its budget is spent.
+    expect(['target', 'budget']).toContain(done.reason);
+    if (done.reason === 'target') expect(done.robustFound).toBeGreaterThanOrEqual(DEFAULT_ROBUST_TARGET);
     else expect(done.evaluations).toBe(DEFAULT_RUN_EVALUATIONS);
+    expect(done.strategies.filter((s) => s.robust?.passed).length).toBe(done.robustFound);
     expect(done.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
     // Repeated genomes and repeated trade logs were skipped, not counted as trials.
     expect(done.iteration).toBeGreaterThan(done.evaluations);
@@ -235,7 +241,8 @@ describe('optimizer worker', () => {
 
     const final = done.strategies;
     expect(final.length).toBeGreaterThan(5);
-    expect(final.length).toBeLessThanOrEqual(LEADERBOARD_SIZE);
+    // The leaderboard, plus robust strategies its fitness ranking pushed off.
+    expect(final.length).toBeLessThanOrEqual(LEADERBOARD_SIZE + done.robustFound);
     for (let i = 1; i < final.length; i++) expect(final[i - 1].fitness).toBeGreaterThanOrEqual(final[i].fitness);
     expect(new Set(final.map((s) => s.id)).size).toBe(final.length);
     assertConstraints(final, 'long-short');
@@ -420,17 +427,28 @@ describe('optimizer worker', () => {
     expect(error.message).toMatch(/trial budget/);
   }, 300_000);
 
-  it('stops early once 500 evaluations in a row fail to beat the best deflated Sharpe', async () => {
+  it('restarts the population instead of stopping when the search stalls', async () => {
     const messages = await runOptimizer([randomWalk(1826, 77, 0.035)], settingsFor('long-only'), {
       seed: 5,
       hypothesis: 'RANGE_REVERSION',
-      maxEvaluations: WINDOW_TRIAL_BUDGET,
+      maxEvaluations: 8_000,
+      robustTarget: 0, // run the full budget
     });
     const done = messages[messages.length - 1] as Of<'done'>;
-    expect(done.reason).toBe('converged');
-    expect(done.fitnessStall).toBe(FITNESS_PATIENCE);
-    expect(done.evaluations).toBeLessThan(WINDOW_TRIAL_BUDGET);
-    expect(done.evaluations).toBeGreaterThanOrEqual(FITNESS_PATIENCE);
+    expect(done.type).toBe('done');
+    // No early exit: the whole budget is scanned ...
+    expect(done.reason).toBe('budget');
+    expect(done.evaluations).toBe(8_000);
+    // ... in several population cycles, each started by a stall of FITNESS_PATIENCE evaluations.
+    expect(done.cycle).toBeGreaterThanOrEqual(3);
+    const cycles = ofType(messages, 'progress').map((p) => p.cycle);
+    for (let k = 1; k < cycles.length; k++) expect(cycles[k]).toBeGreaterThanOrEqual(cycles[k - 1]);
+    expect(done.evaluations / done.cycle).toBeGreaterThanOrEqual(FITNESS_PATIENCE * 0.9);
+    // The funnel counts every scored candidate per gate.
+    expect(done.funnel.scored).toBeGreaterThan(1000);
+    for (const key of ['trades', 'validation', 'folds', 'dsr'] as const) expect(done.funnel[key]).toBeLessThanOrEqual(done.funnel.scored);
+    expect(done.funnel.neighbours).toBeLessThanOrEqual(done.funnel.neighboursChecked);
+    expect(done.robustTarget).toBe(0);
   }, 300_000);
 
   it('scores a Robust universe on every asset and answers analyze requests', async () => {
@@ -553,7 +571,7 @@ describe('optimizer worker', () => {
       const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxEvaluations: 300 });
       const done = messages[messages.length - 1] as Of<'done'>;
       expect(done.type, `${symbol} ${interval}`).toBe('done');
-      expect(['budget', 'converged']).toContain(done.reason);
+      expect(['budget', 'target']).toContain(done.reason);
       for (const s of done.strategies) expect(s.holdout).toBeNull();
       const ready = messages[0] as Of<'ready'>;
       if (interval === '30m') {
@@ -662,11 +680,14 @@ describe('acceptance: pure noise must not look like an edge', () => {
       const top = lockTop(done);
       // Nothing on any board may look certified, and the locked #1 is never Robust.
       for (const row of rows) expect(row.dsr).toBeLessThan(0.95);
+      // Noise never passes the search-period robustness gates: the scan runs its whole budget.
+      expect(done.robustFound).toBe(0);
+      expect(done.reason).toBe('budget');
       if (top) expect(top.verdict).not.toBe('Robust');
       all.push(...rows);
       lines.push(
         `run ${k} (${HYPOTHESIS_IDS[k % HYPOTHESIS_IDS.length]}): ${done.evaluations} evaluations (${done.reason}), board ${rows.length} | holdout ROI > 0: ${rows.filter((r) => r.holdoutRoi > 0).length} | ` +
-          `passes the holdout conditions: ${rows.filter((r) => r.holdoutPass).length} | locked #1 ${top?.verdict ?? 'n/a'}`,
+          `passes the holdout conditions: ${rows.filter((r) => r.holdoutPass).length} | robust (search gates) ${done.robustFound} | locked #1 ${top?.verdict ?? 'n/a'}`,
       );
     }
     const share = (f: (r: BoardRow) => boolean): string => `${all.filter(f).length}/${all.length} (${((100 * all.filter(f).length) / Math.max(1, all.length)).toFixed(1)}%)`;
@@ -697,6 +718,48 @@ describe('acceptance: pure noise must not look like an edge', () => {
     if (process.env.NULL_LOG) appendFileSync(process.env.NULL_LOG, `inflation ${inflation.toFixed(2)}\n`);
     expect(inflation).toBeLessThan(1);
   }, 900_000);
+
+  it('finds robust strategies when a real edge exists, and stops at its target', async () => {
+    // Planted edge: the drift switches sign in persistent regimes (about every 20 candles), so trend
+    // following has a genuine, frequently repeated edge. The same gates that reject every random walk
+    // must accept it – and the scan then stops at its target instead of spending the budget.
+    const rng = mulberry32(3);
+    const n = 1826;
+    const data: OHLCV = { t: new Float64Array(n), o: new Float64Array(n), h: new Float64Array(n), l: new Float64Array(n), c: new Float64Array(n), v: new Float64Array(n) };
+    let close = 100;
+    let dir = 1;
+    const sigma = 0.02;
+    for (let i = 0; i < n; i++) {
+      if (rng() < 1 / 20) dir = -dir;
+      const open = close;
+      close = open * Math.exp(dir * 0.006 + sigma * gaussian(rng) - 0.5 * sigma * sigma);
+      data.t[i] = i * 86_400_000;
+      data.o[i] = open;
+      data.c[i] = close;
+      data.h[i] = Math.max(open, close) * (1 + Math.abs(gaussian(rng)) * sigma * 0.5);
+      data.l[i] = Math.min(open, close) * (1 - Math.abs(gaussian(rng)) * sigma * 0.5);
+      data.v[i] = 1000 * Math.exp(gaussian(rng) * 0.3);
+    }
+    const messages = await runOptimizer([{ symbol: 'EDGE', data }], { ...settingsFor('long-short'), slippageAtrMult: 0.03 }, { seed: 4, hypothesis: 'TREND_FOLLOWING', robustTarget: 3 });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.reason).toBe('target');
+    expect(done.robustFound).toBeGreaterThanOrEqual(3);
+    // The target only ends a run after a minimum scan.
+    expect(done.evaluations).toBeGreaterThanOrEqual(1000);
+    expect(done.evaluations).toBeLessThan(DEFAULT_RUN_EVALUATIONS);
+    const robust = done.strategies.filter((s) => s.robust?.passed);
+    expect(robust.length).toBe(done.robustFound);
+    for (const s of robust) {
+      expect(s.validation.sharpe).toBeGreaterThan(0.3);
+      expect(s.validation.netPnl).toBeGreaterThan(0);
+      expect(s.folds!.filter((f) => f.roi > 0).length).toBeGreaterThanOrEqual(3);
+      expect(s.dsr).toBeGreaterThanOrEqual(0.5);
+      expect(s.genome.longEntry.conditions.length).toBeLessThanOrEqual(2);
+      expect(s.params).toBeLessThanOrEqual(5);
+    }
+    // A robust strategy can be locked like any other – the holdout is still revealed only once.
+    expect(lock(robust[0].id).type).toBe('locked');
+  }, 600_000);
 
   it('pools trades across a multi-asset universe without certifying noise', async () => {
     // Four independent random walks traded with the same rules: the trades are pooled for the gates,

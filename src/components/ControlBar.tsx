@@ -28,6 +28,7 @@ import {
   MIN_RUN_EVALUATIONS,
   rangeAllowed,
   BUDGET_EXTENSION,
+  MAX_RUN_EVALUATIONS,
   WINDOW_TRIAL_BUDGET,
   YAHOO_MAX_DAYS,
   type EngineStatus,
@@ -83,6 +84,13 @@ const SIZING_OPTIONS: { value: RunConfig['sizingMode']; label: string }[] = [
   { value: 'fixed', label: 'Risk % · fixed' },
   { value: 'compound', label: 'Risk % · compounding' },
   { value: 'full', label: '100% of equity' },
+];
+type RobustTargetOption = '1' | '3' | '5' | '0';
+const ROBUST_TARGET_OPTIONS: { value: RobustTargetOption; label: string }[] = [
+  { value: '1', label: '1' },
+  { value: '3', label: '3' },
+  { value: '5', label: '5' },
+  { value: '0', label: 'Run Full Budget' },
 ];
 const ASSET_MODE_OPTIONS: { value: RunConfig['assetMode']; label: string }[] = [
   { value: 'single', label: 'Single asset' },
@@ -525,11 +533,21 @@ export default function ControlBar({
             label="Evaluations / run"
             value={config.maxEvaluations}
             min={MIN_RUN_EVALUATIONS}
-            max={WINDOW_TRIAL_BUDGET}
-            step={500}
+            max={MAX_RUN_EVALUATIONS}
+            step={1000}
             onChange={(maxEvaluations) => onChange({ maxEvaluations: Math.round(maxEvaluations) })}
             disabled={busy}
             className="w-[124px]"
+          />
+        </div>
+        <div title="Keep scanning – with diversity restarts when the search stalls – until this many strategies pass every robustness gate, or the budget runs out.">
+          <FieldLabel>Stop after N robust</FieldLabel>
+          <Segmented
+            ariaLabel="Stop after N robust strategies"
+            options={ROBUST_TARGET_OPTIONS}
+            value={String(config.robustTarget) as RobustTargetOption}
+            onChange={(value) => onChange({ robustTarget: Number(value) })}
+            disabled={busy}
           />
         </div>
         <div>
