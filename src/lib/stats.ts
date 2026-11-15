@@ -80,7 +80,14 @@ export function deflatedSharpe(
   trials: number,
   trialVariance: number,
 ): DeflatedSharpe {
-  const hurdle = expectedMaxSharpe(trials, trialVariance);
+  return deflatedSharpeAgainst(m, expectedMaxSharpe(trials, trialVariance));
+}
+
+/** Same as `deflatedSharpe`, for callers that have already computed the hurdle (it is the same for every strategy). */
+export function deflatedSharpeAgainst(
+  m: Pick<PerformanceMetrics, 'sharpeRaw' | 'bars' | 'skew' | 'kurtosis'>,
+  hurdle: number,
+): DeflatedSharpe {
   const se = sharpeStandardError(m.sharpeRaw, m.bars, m.skew, m.kurtosis);
   if (!Number.isFinite(se) || se <= 0) return { z: -4, probability: 0, hurdle };
   const z = (m.sharpeRaw - hurdle) / se;

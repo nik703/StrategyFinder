@@ -419,7 +419,8 @@ export class IndicatorCache {
 
   private read(key: string): Float64Array | undefined {
     const hit = this.store.get(key);
-    if (hit !== undefined) {
+    // Recency only matters once eviction is in sight; below half capacity a plain lookup is enough.
+    if (hit !== undefined && this.store.size * 2 > this.maxEntries) {
       // Refresh recency: Map iteration order is insertion order.
       this.store.delete(key);
       this.store.set(key, hit);

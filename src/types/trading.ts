@@ -396,11 +396,17 @@ export interface OptimizerStartPayload {
   maxStagnation?: number;
   /** Optional seed for reproducible runs. */
   seed?: number;
+  /** Ports to evaluator workers (see `evaluator.worker.ts`); empty or absent = evaluate on the optimiser thread. */
+  ports?: MessagePort[];
+  /** Candidates per round. Defaults to 25 × the pool size; only tests need to set it. */
+  batchSize?: number;
 }
 
 export type WorkerRequest =
   | { type: 'start'; payload: OptimizerStartPayload }
   | { type: 'stop' }
+  /** An evaluator worker died: finish the run on the optimiser thread. */
+  | { type: 'pool-failed' }
   /** Robustness analysis of one strategy. `universe` supplies extra assets for the cross-asset test. */
   | { type: 'analyze'; strategyId: string; genome: StrategyGenome; universe?: NamedDataset[] };
 

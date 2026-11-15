@@ -31,6 +31,7 @@ import {
 } from './lib/config';
 import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
 import { datasetFingerprint, holdoutViews, recordHoldoutView } from './lib/holdoutLog';
+import type { EvaluatorConnect } from './engine/evaluation';
 import {
   DEFAULT_CRYPTO_UNIVERSE,
   DEFAULT_STOCK_UNIVERSE,
@@ -48,6 +49,20 @@ import {
 } from './types/trading';
 
 type Analysis = { report: RobustnessReport; verdict: Verdict | null };
+
+/** Most evaluator workers a run will start (each holds its own copy of the data and an indicator cache). */
+const MAX_EVALUATORS = 6;
+
+/**
+ * Number of evaluator workers for this device: every core but one (left for the page and the
+ * optimiser thread, which only proposes and ranks). With one or two cores the optimiser
+ * scores candidates itself – a pool of one would only add messaging overhead.
+ */
+function evaluatorPoolSize(): number {
+  const cores = typeof navigator !== 'undefined' && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : 2;
+  const size = Math.min(MAX_EVALUATORS, cores - 1);
+  return size >= 2 ? size : 0;
+}
 
 const DEFAULT_UNIVERSES = [DEFAULT_CRYPTO_UNIVERSE.join(', '), DEFAULT_STOCK_UNIVERSE.join(', ')];
 
@@ -99,6 +114,8 @@ export default function App(): JSX.Element {
   const [pendingAnalyses, setPendingAnalyses] = useState<Record<string, boolean>>({});
 
   const workerRef = useRef<Worker | null>(null);
+  /** Evaluator workers that score candidate strategies in parallel for the optimiser. */
+  const evaluatorsRef = useRef<Worker[]>([]);
   const runIdRef = useRef(0);
   const pendingProgress = useRef<ProgressSnapshot | null>(null);
   const frameRef = useRef<number | null>(null);
@@ -110,13 +127,19 @@ export default function App(): JSX.Element {
   const extraUniverseRef = useRef<Promise<NamedDataset[]> | null>(null);
   const extraUniverseSentRef = useRef(false);
 
+  const disposePool = useCallback(() => {
+    for (const evaluator of evaluatorsRef.current) evaluator.terminate();
+    evaluatorsRef.current = [];
+  }, []);
+
   const disposeWorker = useCallback(() => {
+    disposePool();
     workerRef.current?.terminate();
     workerRef.current = null;
     if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
     frameRef.current = null;
     pendingProgress.current = null;
-  }, []);
+  }, [disposePool]);
 
   useEffect(() => disposeWorker, [disposeWorker]);
 
@@ -175,7 +198,9 @@ export default function App(): JSX.Element {
           setPendingAnalyses({});
           if (contextRef.current) recordHoldoutView(contextRef.current.fingerprint);
           setStatus(reason === 'converged' ? 'converged' : 'stopped');
-          // The worker stays alive to answer robustness-analysis requests.
+          // The search is over, so the evaluator pool is no longer needed. The optimiser
+          // worker stays alive to answer robustness-analysis requests.
+          disposePool();
           break;
         }
         case 'analysis':
@@ -192,7 +217,7 @@ export default function App(): JSX.Element {
           break;
       }
     },
-    [disposeWorker, queueProgress],
+    [disposePool, disposeWorker, queueProgress],
   );
 
   const start = useCallback(async () => {
@@ -272,15 +297,39 @@ export default function App(): JSX.Element {
         setStatus('error');
         disposeWorker();
       };
-      const request: WorkerRequest = { type: 'start', payload: { datasets, settings, maxStagnation: config.maxStagnation } };
-      worker.postMessage(request);
+      // Evaluator pool: candidate strategies are scored on several cores. Each evaluator gets its
+      // own copy of the data and talks to the optimiser directly over a MessageChannel.
+      const poolSize = evaluatorPoolSize();
+      const ports: MessagePort[] = [];
+      const budgetBytes = Math.max(64, Math.floor(512 / Math.max(1, poolSize))) * 1024 * 1024;
+      for (let w = 0; w < poolSize; w++) {
+        const evaluator = new Worker(new URL('./workers/evaluator.worker.ts', import.meta.url), { type: 'module' });
+        const channel = new MessageChannel();
+        evaluator.onerror = () => {
+          // A dead evaluator would never answer: tell the optimiser to finish the run single-threaded.
+          if (runId !== runIdRef.current) return;
+          disposePool();
+          const fallback: WorkerRequest = { type: 'pool-failed' };
+          workerRef.current?.postMessage(fallback);
+        };
+        const connect: EvaluatorConnect = { type: 'connect', port: channel.port2, datasets, settings, budgetBytes };
+        evaluator.postMessage(connect, [channel.port2]);
+        evaluatorsRef.current.push(evaluator);
+        ports.push(channel.port1);
+      }
+
+      const request: WorkerRequest = {
+        type: 'start',
+        payload: { datasets, settings, maxStagnation: config.maxStagnation, ports },
+      };
+      worker.postMessage(request, ports);
       setStatus('optimizing');
     } catch (cause) {
       if (runId !== runIdRef.current) return;
       setError(cause instanceof Error ? cause.message : 'Could not start the optimisation.');
       setStatus('error');
     }
-  }, [config, disposeWorker, handleMessage]);
+  }, [config, disposePool, disposeWorker, handleMessage]);
 
   const stop = useCallback(() => {
     if (status === 'optimizing' && workerRef.current) {

@@ -23,23 +23,28 @@
  */
 
 import {
-  assetBaseScore,
-  BacktestWorkspace,
-  barsPerYear,
   benchmarkEquity,
-  benchmarkSearch,
-  combineFitness,
-  deflatedTerm,
   evaluateSearch,
   holdoutMetrics,
   runBacktest,
-  searchMetrics,
   segmentMetrics,
-  splitFor,
   UNFIT,
-  type SearchMetrics,
-  type Split,
 } from '../engine/backtester';
+import {
+  buildAsset,
+  createContext,
+  evaluateCandidate,
+  fitnessOf,
+  sampleCurve,
+  scoreAssets,
+  type Asset,
+  type AssetScore,
+  type CandidateResult,
+  type EvalContext,
+  type EvaluatorBatch,
+  type EvaluatorReply,
+  type PortLike,
+} from '../engine/evaluation';
 import {
   countParameters,
   crossoverGenomes,
@@ -50,12 +55,10 @@ import {
   parameterVariants,
   randomGenome,
   repairGenome,
-  rewardToRisk,
   type GenomeLimits,
   type Rng,
 } from '../engine/genome';
-import { IndicatorCache } from '../engine/indicators';
-import { deflatedSharpe, RunningStats } from '../lib/stats';
+import { expectedMaxSharpe, RunningStats } from '../lib/stats';
 import {
   DEFAULT_MAX_STAGNATION,
   LEADERBOARD_SIZE,
@@ -63,11 +66,8 @@ import {
   MIN_MAX_STAGNATION,
   PROGRESS_EVERY,
   type AssetResult,
-  type BacktestSettings,
   type BenchmarkResult,
-  type ChartAxis,
   type NamedDataset,
-  type OHLCV,
   type OptimizerStartPayload,
   type PerformanceMetrics,
   type ProgressSnapshot,
@@ -92,10 +92,6 @@ interface WorkerScope {
 
 const scope = self as unknown as WorkerScope;
 
-/** Minimum number of candles required for a meaningful three-way split. */
-const MIN_BARS = 150;
-/** Maximum number of points per equity curve sent to the UI. */
-const MAX_CHART_POINTS = 1200;
 /** Leaderboard snapshots are throttled so the UI is not flooded on fast datasets. */
 const LEADERBOARD_INTERVAL_MS = 150;
 /** Maximum number of leaderboard slots a single structural niche may occupy. */
@@ -105,6 +101,12 @@ const NICHE_CAP = 3;
  * the same idea. Only the fitter twin is listed.
  */
 const CLONE_CORRELATION = 0.9;
+/**
+ * With an evaluator pool, each evaluator scores this many blocks of 25 candidates per round.
+ * Bigger rounds spend less time on messaging. On seeded comparisons, rounds of 300 found
+ * strategies at least as good as rounds of 25, so the larger rounds cost no search quality.
+ */
+const ROUNDS_PER_EVALUATOR = 4;
 /** Pure random search until the leaderboard holds this many strategies. */
 const SEED_POPULATION = 10;
 /** Trades removed by the "top trades" robustness test. */
@@ -115,6 +117,8 @@ const INDICATOR_BUDGET_BYTES = 256 * 1024 * 1024;
 let activeRun = 0;
 let stopRequested = false;
 let session: Session | null = null;
+/** The live run's evaluator pool, so a `pool-failed` message can release whatever it is waiting on. */
+let activePool: EvaluatorPool | null = null;
 
 /**
  * Yield to the worker's event loop so queued `stop` / `analyze` messages can be handled.
@@ -141,6 +145,11 @@ scope.onmessage = (event) => {
   const message = event.data;
   if (message.type === 'stop') {
     stopRequested = true;
+    return;
+  }
+  if (message.type === 'pool-failed') {
+    // Rejects any batch in flight; the run catches that and continues single-threaded.
+    activePool?.close();
     return;
   }
   if (message.type === 'analyze') {
@@ -170,24 +179,6 @@ scope.onmessage = (event) => {
 /*  Session state                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Everything needed to backtest one asset. */
-interface Asset {
-  symbol: string;
-  data: OHLCV;
-  ind: IndicatorCache;
-  ws: BacktestWorkspace;
-  split: Split;
-  periodsPerYear: number;
-  /** Buy & Hold over the search period. */
-  benchmark: SearchMetrics & { equity: Float64Array };
-}
-
-/** Per-asset ingredients of a fitness score that do not depend on the number of trials. */
-interface AssetScore {
-  base: number;
-  metrics: SearchMetrics;
-}
-
 interface Entry {
   result: StrategyResult;
   niche: string;
@@ -198,15 +189,11 @@ interface Entry {
   scores: AssetScore[];
 }
 
-interface Session {
-  /** The primary asset first. More than one asset = Robust-universe scoring. */
-  assets: Asset[];
+/** A run's state. The scoring context (`assets` = the universe, primary first) is shared with the evaluator pool. */
+interface Session extends EvalContext {
   /** Additional assets used only by the cross-asset robustness test. */
   extra: Asset[];
-  settings: BacktestSettings;
   mode: TradeMode;
-  limits: GenomeLimits;
-  axis: ChartAxis;
   /** Validation Sharpe (per bar, primary asset) of every strategy evaluated so far. */
   trials: RunningStats;
   /** Frozen copy of (trials, variance) used for scoring; refreshed between batches. */
@@ -218,80 +205,11 @@ interface Session {
   finals: Map<string, StrategyResult>;
 }
 
-function validate(dataset: NamedDataset): void {
-  const { data, symbol } = dataset;
-  const n = data.c.length;
-  if (n < MIN_BARS) {
-    throw new Error(`Not enough history for ${symbol}: ${n} candles loaded, at least ${MIN_BARS} are required.`);
-  }
-  for (const key of ['t', 'o', 'h', 'l', 'v'] as const) {
-    if (data[key].length !== n) throw new Error(`Malformed market data for ${symbol}: OHLCV columns have different lengths.`);
-  }
-  for (let i = 0; i < n; i++) {
-    if (!(data.o[i] > 0) || !(data.h[i] > 0) || !(data.l[i] > 0) || !(data.c[i] > 0)) {
-      throw new Error(`Malformed market data for ${symbol}: non-positive or missing price at candle ${i}.`);
-    }
-  }
-}
-
-function buildAsset(dataset: NamedDataset, settings: BacktestSettings, budgetBytes: number): Asset {
-  validate(dataset);
-  const { data, symbol } = dataset;
-  const split = splitFor(data.c.length);
-  const periodsPerYear = barsPerYear(data.t);
-  return {
-    symbol,
-    data,
-    ind: new IndicatorCache(data, budgetBytes),
-    ws: new BacktestWorkspace(data.c.length),
-    split,
-    periodsPerYear,
-    benchmark: benchmarkSearch(data, settings, split, periodsPerYear),
-  };
-}
-
 function addUniverse(s: Session, universe: NamedDataset[]): void {
   const known = new Set([...s.assets, ...s.extra].map((asset) => asset.symbol));
   const fresh = universe.filter((dataset) => !known.has(dataset.symbol));
   const budget = INDICATOR_BUDGET_BYTES / Math.max(1, s.assets.length + s.extra.length + fresh.length);
   for (const dataset of fresh) s.extra.push(buildAsset(dataset, s.settings, budget));
-}
-
-/** Evenly spaced sample of bar indices that always contains bar 0, both segment boundaries and the last bar. */
-function buildAxis(t: Float64Array, split: Split): ChartAxis {
-  const n = t.length;
-  const stride = Math.max(1, Math.ceil(n / MAX_CHART_POINTS));
-  const picked = new Set<number>();
-  for (let i = 0; i < n; i += stride) picked.add(i);
-  picked.add(split.validationStart);
-  picked.add(split.holdoutStart - 1);
-  picked.add(split.holdoutStart);
-  picked.add(n - 1);
-  const barIndex = Int32Array.from([...picked].sort((a, b) => a - b));
-  const time = new Float64Array(barIndex.length);
-  let validationPos = 0;
-  let holdoutPos = 0;
-  for (let k = 0; k < barIndex.length; k++) {
-    time[k] = t[barIndex[k]];
-    if (barIndex[k] === split.validationStart) validationPos = k;
-    if (barIndex[k] === split.holdoutStart) holdoutPos = k;
-  }
-  return {
-    barIndex,
-    time,
-    validationPos,
-    holdoutPos,
-    bars: n,
-    validationIndex: split.validationStart,
-    holdoutIndex: split.holdoutStart,
-  };
-}
-
-/** Sample an equity curve on the chart axis. `points` limits it to the search period while a run is live. */
-function sampleCurve(equity: Float64Array, axis: ChartAxis, points: number = axis.barIndex.length): Float32Array {
-  const out = new Float32Array(points);
-  for (let k = 0; k < points; k++) out[k] = equity[axis.barIndex[k]];
-  return out;
 }
 
 /** Simple returns between consecutive samples of an equity curve. */
@@ -323,17 +241,6 @@ function correlation(a: Float32Array, b: Float32Array): number {
     vb += db * db;
   }
   return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : 0;
-}
-
-function deriveLimits(primary: Asset): GenomeLimits {
-  const volume = primary.data.v;
-  let withVolume = 0;
-  for (let i = 0; i < volume.length; i++) if (volume[i] > 0) withVolume++;
-  return {
-    // Lookbacks are capped so indicators are warmed up for most of the training segment.
-    maxLookback: Math.max(30, Math.min(200, Math.floor(primary.split.validationStart / 3))),
-    hasVolume: withVolume > volume.length * 0.5,
-  };
 }
 
 /** Coherent textbook strategies that give the search a sensible starting population. */
@@ -437,45 +344,11 @@ function seedGenomes(mode: TradeMode, limits: GenomeLimits, rng: Rng): StrategyG
 /*  Scoring                                                                   */
 /* -------------------------------------------------------------------------- */
 
-/** Backtest `genome` on the search period of every asset. The primary asset is run last, so its workspace stays loaded. */
-function scoreAssets(s: Session, genome: StrategyGenome): AssetScore[] {
-  const scores = new Array<AssetScore>(s.assets.length);
-  for (let a = s.assets.length - 1; a >= 0; a--) {
-    const asset = s.assets[a];
-    const metrics = evaluateSearch(asset.ind, genome, s.settings, asset.ws, asset.split, asset.periodsPerYear);
-    scores[a] = { base: assetBaseScore(metrics, asset.benchmark), metrics };
-  }
-  return scores;
-}
-
-/** Fitness of a scored genome against the current selection-bias hurdle. */
-function fitnessOf(s: Session, genome: StrategyGenome, scores: AssetScore[]): { fitness: number; dsr: number } {
-  let searchTrades = 0;
-  let validationTrades = 0;
-  let profitable = 0;
-  const assetScores = scores.map((score) => {
-    searchTrades += score.metrics.search.trades;
-    validationTrades += score.metrics.validation.trades;
-    if (score.metrics.validation.roi > 0) profitable++;
-    return score.base + deflatedTerm(deflatedSharpe(score.metrics.validation, s.hurdleTrials, s.hurdleVariance));
-  });
-  const fitness = combineFitness({
-    assetScores,
-    searchTrades,
-    validationTrades,
-    profitableShare: profitable / scores.length,
-    params: countParameters(genome, s.limits),
-    rewardToRisk: rewardToRisk(genome),
-    validationWinRate: scores[0].metrics.validation.winRate,
-  });
-  const dsr = deflatedSharpe(scores[0].metrics.validation, s.hurdleTrials, s.hurdleVariance).probability;
-  return { fitness, dsr };
-}
-
 /** Re-score the leaderboard against the latest hurdle (it rises as more strategies are tried). */
 function rescoreBoard(s: Session): void {
   s.hurdleTrials = s.trials.count;
   s.hurdleVariance = s.trials.variance;
+  s.hurdle = expectedMaxSharpe(s.hurdleTrials, s.hurdleVariance);
   for (const entry of s.board) {
     const { fitness, dsr } = fitnessOf(s, entry.result.genome, entry.scores);
     entry.result.fitness = fitness;
@@ -504,7 +377,7 @@ const medianOf = (values: number[]): number => {
  * ±20% parameter sensitivity, removal of the best trades, and the same rules on other assets.
  */
 function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
-  const baseScores = scoreAssets(s, genome);
+  const baseScores = scoreAssets(s, genome).scores;
   const base = fitnessOf(s, genome, baseScores);
   const baseRoi = baseScores[0].metrics.search.roi;
 
@@ -521,7 +394,7 @@ function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
   const rois: number[] = [];
   const fitnesses: number[] = [];
   for (const variant of parameterVariants(genome, s.mode, s.limits)) {
-    const scores = scoreAssets(s, variant);
+    const { scores } = scoreAssets(s, variant);
     rois.push(scores[0].metrics.search.roi);
     fitnesses.push(Math.max(UNFIT, fitnessOf(s, variant, scores).fitness));
   }
@@ -583,8 +456,11 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
   let equity = base.equity;
   for (let a = s.assets.length - 1; a >= 0; a--) {
     const asset = s.assets[a];
+    // Train / validation figures stay exactly what the search ranked on: a backtest that ends at
+    // the holdout boundary (any open trade is closed there, with costs) ...
+    const m = evaluateSearch(asset.ind, base.genome, s.settings, asset.ws, asset.split, asset.periodsPerYear);
+    // ... and only the holdout comes from a backtest over the whole history.
     runBacktest(asset.ind, base.genome, s.settings, asset.ws);
-    const m = searchMetrics(asset.ws.equity, asset.split, s.settings.initialCapital, asset.periodsPerYear, asset.ws);
     assets[a] = {
       symbol: asset.symbol,
       ...m,
@@ -611,7 +487,7 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
 function finalResult(s: Session, id: string, genome: StrategyGenome): StrategyResult {
   const known = s.finals.get(id);
   if (known) return known;
-  const scores = scoreAssets(s, genome);
+  const { scores } = scoreAssets(s, genome);
   const { fitness, dsr } = fitnessOf(s, genome, scores);
   const primary = scores[0].metrics;
   const result = revealHoldout(s, {
@@ -645,25 +521,82 @@ function finalBenchmark(s: Session): BenchmarkResult {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Evaluator pool                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Client side of the evaluation pool: the main thread connects one MessagePort
+ * per evaluator worker. A batch is split into contiguous chunks, one per
+ * evaluator, and the results come back in the original order – so the search
+ * is identical whichever thread scored a candidate.
+ */
+class EvaluatorPool {
+  private nextId = 1;
+  private readonly pending = new Map<number, { resolve: (results: CandidateResult[]) => void; reject: (error: Error) => void }>();
+
+  constructor(private ports: PortLike[]) {
+    for (const port of ports) {
+      port.onmessage = (event: MessageEvent) => {
+        const reply = event.data as EvaluatorReply;
+        const waiting = this.pending.get(reply.id);
+        if (!waiting) return;
+        this.pending.delete(reply.id);
+        if (reply.type === 'results') waiting.resolve(reply.results);
+        else waiting.reject(new Error(reply.message));
+      };
+    }
+  }
+
+  get size(): number {
+    return this.ports.length;
+  }
+
+  async evaluate(genomes: StrategyGenome[], hurdle: number, floor: number): Promise<CandidateResult[]> {
+    if (this.ports.length === 0) throw new Error('Evaluator pool closed.');
+    const chunk = Math.ceil(genomes.length / this.ports.length);
+    const requests: Promise<CandidateResult[]>[] = [];
+    for (let w = 0; w < this.ports.length && w * chunk < genomes.length; w++) {
+      const id = this.nextId++;
+      const message: EvaluatorBatch = { type: 'batch', id, hurdle, floor, genomes: genomes.slice(w * chunk, (w + 1) * chunk) };
+      requests.push(
+        new Promise((resolve, reject) => {
+          this.pending.set(id, { resolve, reject });
+          this.ports[w].postMessage(message);
+        }),
+      );
+    }
+    return (await Promise.all(requests)).flat();
+  }
+
+  close(): void {
+    for (const port of this.ports) {
+      port.onmessage = null;
+      port.close?.();
+    }
+    this.ports = [];
+    for (const waiting of this.pending.values()) waiting.reject(new Error('Evaluator pool closed.'));
+    this.pending.clear();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Optimisation run                                                          */
 /* -------------------------------------------------------------------------- */
 
 async function run(payload: OptimizerStartPayload, token: number): Promise<void> {
   const { settings } = payload;
-  if (payload.datasets.length === 0) throw new Error('No market data was supplied.');
   session = null;
+  activePool?.close();
+  const pool = new EvaluatorPool(payload.ports ?? []);
+  activePool = pool;
 
-  const budget = INDICATOR_BUDGET_BYTES / payload.datasets.length;
-  const assets = payload.datasets.map((dataset) => buildAsset(dataset, settings, budget));
+  const ctx = createContext(payload.datasets, settings, INDICATOR_BUDGET_BYTES);
+  const { assets, axis } = ctx;
   const primary = assets[0];
-  const axis = buildAxis(primary.data.t, primary.split);
   const s: Session = {
-    assets,
+    ...ctx,
     extra: [],
-    settings,
     mode: settings.tradeMode,
-    limits: deriveLimits(primary),
-    axis,
     trials: new RunningStats(),
     hurdleTrials: 0,
     hurdleVariance: 0,
@@ -679,6 +612,14 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     ? Math.max(MIN_MAX_STAGNATION, Math.min(MAX_MAX_STAGNATION, requested))
     : DEFAULT_MAX_STAGNATION;
   const rng = mulberry32(payload.seed ?? (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0);
+  /**
+   * Candidates proposed per round. They are all generated from the leaderboard as it
+   * stood at the start of the round, scored (in parallel when there is a pool), then
+   * applied one by one in proposal order. The size depends only on the pool size,
+   * so a seeded run is reproducible.
+   */
+  const defaultBatch = pool.size > 0 ? PROGRESS_EVERY * ROUNDS_PER_EVALUATOR * pool.size : PROGRESS_EVERY;
+  const batchSize = Math.max(1, Math.round(payload.batchSize ?? defaultBatch));
 
   // The live benchmark stops at the holdout boundary, exactly like the strategy curves.
   scope.postMessage({
@@ -736,14 +677,19 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     return mutateGenome(rng, parent, mode, limits, 1 + Math.floor(progress * 3));
   };
 
-  /** Insert into the leaderboard if it qualifies. Returns true when the top fitness improved. */
-  const consider = (genome: StrategyGenome): boolean => {
-    const scores = scoreAssets(s, genome);
+  /** Primary-asset curve for a candidate whose curve was not captured during evaluation (rare: the board shrank). */
+  const primaryCurve = (genome: StrategyGenome): Float32Array => {
+    runBacktest(primary.ind, genome, settings, primary.ws, primary.split.holdoutStart);
+    return sampleCurve(primary.ws.equity, axis, axis.holdoutPos);
+  };
+
+  /** Insert an evaluated candidate into the leaderboard if it qualifies. Returns true when the top fitness improved. */
+  const consider = (genome: StrategyGenome, evaluated: CandidateResult): boolean => {
+    const { scores, complete, fitness, dsr } = evaluated;
     const primaryMetrics = scores[0].metrics;
     // Every evaluated strategy is a trial, whether or not it makes the leaderboard.
     s.trials.push(primaryMetrics.validation.sharpeRaw);
-
-    const { fitness, dsr } = fitnessOf(s, genome, scores);
+    if (!complete) return false;
     if (fitness <= UNFIT) return false;
     const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return false;
@@ -754,7 +700,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
 
     // Behavioural clones: a fitter twin already on the board wins; otherwise this one replaces its twins.
     // The curve stops at the holdout boundary – nothing beyond it has been simulated.
-    const equity = sampleCurve(primary.ws.equity, axis, axis.holdoutPos);
+    const equity = evaluated.curve ?? primaryCurve(genome);
     const returns = curveReturns(equity);
     const twins: number[] = [];
     for (let k = 0; k < board.length; k++) {
@@ -811,11 +757,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     return fitness > best + 1e-9;
   };
 
-  const step = (): void => {
-    iteration++;
+  /** Propose a candidate the search has not evaluated before (a few retries, then accept the duplicate). */
+  const proposeUnique = (): { genome: StrategyGenome; duplicate: boolean } => {
     let genome = propose();
     let signature = genomeSignature(genome);
-    // Skip genomes that were already evaluated (a few retries, then accept the duplicate).
     for (let attempt = 0; attempt < 4 && seen.has(signature); attempt++) {
       genome =
         board.length >= SEED_POPULATION && rng() < 0.7 ? mutateGenome(rng, genome, mode, limits, 1) : randomGenome(rng, mode, limits);
@@ -824,11 +769,30 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const duplicate = seen.has(signature);
     if (seen.size > 250_000) seen.clear();
     seen.add(signature);
-    const improved = duplicate ? false : consider(genome);
-    stagnation = improved ? 0 : stagnation + 1;
+    return { genome, duplicate };
+  };
+
+  /** Score a batch – on the evaluator pool when there is one, otherwise right here. */
+  let usePool = pool.size > 0;
+  const evaluateBatch = async (genomes: StrategyGenome[], floor: number): Promise<CandidateResult[]> => {
+    if (usePool) {
+      try {
+        return await pool.evaluate(genomes, s.hurdle, floor);
+      } catch {
+        // An evaluator failed: carry on single-threaded rather than abort the run.
+        usePool = false;
+        pool.close();
+      }
+    }
+    return genomes.map((genome) => evaluateCandidate(s, genome, floor));
+  };
+
+  const postProgress = (): void => {
+    scope.postMessage({ type: 'progress', ...snapshot() });
   };
 
   const finish = (reason: StopReason): void => {
+    pool.close();
     // The search is over: only now is the holdout simulated, for the final leaderboard.
     rescoreBoard(s);
     s.finished = true;
@@ -841,29 +805,54 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   };
 
   for (;;) {
-    // The selection-bias hurdle is frozen for the batch so every comparison inside it is like for like.
+    // The selection-bias hurdle and the leaderboard floor are frozen for the round, so every
+    // candidate in it is judged like for like whichever evaluator scores it.
     rescoreBoard(s);
-    for (let k = 0; k < PROGRESS_EVERY && stagnation < maxStagnation; k++) step();
+    const floor = board.length >= LEADERBOARD_SIZE ? board[board.length - 1].result.fitness : -Infinity;
+    const batch: { genome: StrategyGenome; duplicate: boolean }[] = [];
+    for (let k = 0; k < batchSize; k++) batch.push(proposeUnique());
+    const results = await evaluateBatch(
+      batch.filter((candidate) => !candidate.duplicate).map((candidate) => candidate.genome),
+      floor,
+    );
+    if (token !== activeRun) {
+      pool.close();
+      return; // superseded by a newer run
+    }
+
+    // Apply in proposal order; candidates past convergence are discarded unseen.
+    let considered = 0;
+    let next = 0;
+    for (const candidate of batch) {
+      if (stagnation >= maxStagnation) break;
+      iteration++;
+      considered++;
+      const improved = candidate.duplicate ? false : consider(candidate.genome, results[next++]);
+      stagnation = improved ? 0 : stagnation + 1;
+      // Streamed every PROGRESS_EVERY (25) iterations.
+      if (iteration % PROGRESS_EVERY === 0) postProgress();
+    }
 
     const now = performance.now();
     const batchMs = now - lastBatchAt;
     lastBatchAt = now;
-    if (batchMs > 0) {
-      const rate = (PROGRESS_EVERY * 1000) / batchMs;
+    if (batchMs > 0 && considered > 0) {
+      const rate = (considered * 1000) / batchMs;
       itersPerSec = itersPerSec === 0 ? rate : itersPerSec * 0.9 + rate * 0.1;
     }
-
-    // Streamed every PROGRESS_EVERY (25) iterations.
-    scope.postMessage({ type: 'progress', ...snapshot() });
     if (boardDirty && now - lastBoardPost >= LEADERBOARD_INTERVAL_MS) postBoard();
 
     if (stagnation >= maxStagnation) {
+      if (iteration % PROGRESS_EVERY !== 0) postProgress();
       finish('converged');
       return;
     }
 
     await yieldToEventLoop();
-    if (token !== activeRun) return; // superseded by a newer run
+    if (token !== activeRun) {
+      pool.close();
+      return; // superseded by a newer run
+    }
     if (stopRequested) {
       finish('stopped');
       return;

@@ -99,12 +99,11 @@ export function resolveOperands(c: Condition, ind: IndicatorCache): Operands {
 }
 
 /**
- * Evaluate one condition on every bar. `out[i]` is 1 when the condition is true
- * on the close of bar `i`. Comparisons against NaN (indicator warm-up) are false.
+ * Evaluate one condition on the first `n` bars. `out[i]` is 1 when the condition is
+ * true on the close of bar `i`. Comparisons against NaN (indicator warm-up) are false.
  */
-export function evaluateCondition(c: Condition, ind: IndicatorCache, out: Uint8Array): void {
+export function evaluateCondition(c: Condition, ind: IndicatorCache, out: Uint8Array, n: number = out.length): void {
   const { left, right, level } = resolveOperands(c, ind);
-  const n = out.length;
   if (n === 0) return;
   switch (c.op) {
     case 'gt':
@@ -128,19 +127,68 @@ export function evaluateCondition(c: Condition, ind: IndicatorCache, out: Uint8A
   }
 }
 
-/** Combine the conditions of a rule group with AND / OR into `out`. */
-export function evaluateGroup(group: RuleGroup, ind: IndicatorCache, out: Uint8Array, scratch: Uint8Array): void {
+/**
+ * AND a further condition into `out` in place. Only bars that are still set are
+ * looked at, so a sparse trigger makes the second condition almost free.
+ */
+function refineCondition(c: Condition, ind: IndicatorCache, out: Uint8Array, n: number): void {
+  const { left, right, level } = resolveOperands(c, ind);
+  if (n === 0) return;
+  switch (c.op) {
+    case 'gt':
+      if (right) {
+        for (let i = 0; i < n; i++) if (out[i] === 1 && !(left[i] > right[i])) out[i] = 0;
+      } else {
+        for (let i = 0; i < n; i++) if (out[i] === 1 && !(left[i] > level)) out[i] = 0;
+      }
+      return;
+    case 'lt':
+      if (right) {
+        for (let i = 0; i < n; i++) if (out[i] === 1 && !(left[i] < right[i])) out[i] = 0;
+      } else {
+        for (let i = 0; i < n; i++) if (out[i] === 1 && !(left[i] < level)) out[i] = 0;
+      }
+      return;
+    case 'cross_above':
+      out[0] = 0;
+      if (right) {
+        for (let i = 1; i < n; i++) if (out[i] === 1 && !(left[i] > right[i] && left[i - 1] <= right[i - 1])) out[i] = 0;
+      } else {
+        for (let i = 1; i < n; i++) if (out[i] === 1 && !(left[i] > level && left[i - 1] <= level)) out[i] = 0;
+      }
+      return;
+    case 'cross_below':
+      out[0] = 0;
+      if (right) {
+        for (let i = 1; i < n; i++) if (out[i] === 1 && !(left[i] < right[i] && left[i - 1] >= right[i - 1])) out[i] = 0;
+      } else {
+        for (let i = 1; i < n; i++) if (out[i] === 1 && !(left[i] < level && left[i - 1] >= level)) out[i] = 0;
+      }
+      return;
+  }
+}
+
+/** Combine the conditions of a rule group with AND / OR into the first `n` entries of `out`. */
+export function evaluateGroup(
+  group: RuleGroup,
+  ind: IndicatorCache,
+  out: Uint8Array,
+  scratch: Uint8Array,
+  n: number = out.length,
+): void {
   const { conditions, logic } = group;
   if (conditions.length === 0) {
-    out.fill(0);
+    out.fill(0, 0, n);
     return;
   }
-  evaluateCondition(conditions[0], ind, out);
-  const n = out.length;
+  evaluateCondition(conditions[0], ind, out, n);
   for (let k = 1; k < conditions.length; k++) {
-    evaluateCondition(conditions[k], ind, scratch);
-    if (logic === 'AND') for (let i = 0; i < n; i++) out[i] &= scratch[i];
-    else for (let i = 0; i < n; i++) out[i] |= scratch[i];
+    if (logic === 'AND') {
+      refineCondition(conditions[k], ind, out, n);
+    } else {
+      evaluateCondition(conditions[k], ind, scratch, n);
+      for (let i = 0; i < n; i++) out[i] |= scratch[i];
+    }
   }
 }
 
@@ -222,25 +270,28 @@ export function runBacktest(
   const { goLong, goShort, exitLong, exitShort, scratch, equity: eq, equityLow: eqLow, inMarket } = ws;
   const { tradeEntryBar, tradeExitBar, tradePnl, tradeDir, tradeAmbiguous } = ws;
 
-  /* ---- 1. Signals (vectorised) ------------------------------------------ */
-  evaluateGroup(genome.longEntry, ind, goLong, scratch);
-  if (allowShort && genome.shortEntry) evaluateGroup(genome.shortEntry, ind, goShort, scratch);
-  else goShort.fill(0);
+  /* ---- 1. Signals (vectorised, search window only) ------------------------- */
+  // Only the arrays the simulation will actually read are computed; the others stay stale and untouched.
+  evaluateGroup(genome.longEntry, ind, goLong, scratch, n);
+  if (allowShort && genome.shortEntry) evaluateGroup(genome.shortEntry, ind, goShort, scratch, n);
 
   const hasLongExit = exit.mode === 'dynamic' && exit.longExit !== null;
   const hasShortExit = exit.mode === 'dynamic' && allowShort && exit.shortExit !== null;
-  if (exit.mode === 'dynamic' && exit.longExit) evaluateGroup(exit.longExit, ind, exitLong, scratch);
-  else exitLong.fill(0);
-  if (exit.mode === 'dynamic' && allowShort && exit.shortExit) evaluateGroup(exit.shortExit, ind, exitShort, scratch);
-  else exitShort.fill(0);
+  if (exit.mode === 'dynamic' && exit.longExit) evaluateGroup(exit.longExit, ind, exitLong, scratch, n);
+  if (exit.mode === 'dynamic' && allowShort && exit.shortExit) evaluateGroup(exit.shortExit, ind, exitShort, scratch, n);
 
   // Resolve conflicts once: an entry is only actionable when the opposite entry
   // and the same-side exit signal are both silent on that candle.
-  for (let i = 0; i < n; i++) {
-    const l = goLong[i];
-    const s = goShort[i];
-    goLong[i] = l === 1 && s === 0 && exitLong[i] === 0 ? 1 : 0;
-    goShort[i] = s === 1 && l === 0 && exitShort[i] === 0 ? 1 : 0;
+  if (allowShort) {
+    for (let i = 0; i < n; i++) {
+      const l = goLong[i];
+      const s = goShort[i];
+      if (l === 0 && s === 0) continue;
+      goLong[i] = l === 1 && s === 0 && !(hasLongExit && exitLong[i] === 1) ? 1 : 0;
+      goShort[i] = s === 1 && l === 0 && !(hasShortExit && exitShort[i] === 1) ? 1 : 0;
+    }
+  } else if (hasLongExit) {
+    for (let i = 0; i < n; i++) if (goLong[i] === 1 && exitLong[i] === 1) goLong[i] = 0;
   }
 
   /* ---- 2. Exit and sizing parameters -------------------------------------- */
@@ -271,6 +322,13 @@ export function runBacktest(
   let busted = false;
 
   for (let i = 0; i < n; i++) {
+    // Fast path: flat, and the previous candle gave no entry signal → nothing can happen on this bar.
+    if (pos === 0 && (i === 0 || (goLong[i - 1] === 0 && (!allowShort || goShort[i - 1] === 0)))) {
+      eq[i] = equity;
+      eqLow[i] = equity;
+      inMarket[i] = 0;
+      continue;
+    }
     const o = O[i];
     const h = H[i];
     const l = L[i];
@@ -287,7 +345,7 @@ export function runBacktest(
         const leave =
           timedOut ||
           (pos === 1
-            ? goShort[p] === 1 || (hasLongExit && exitLong[p] === 1)
+            ? (allowShort && goShort[p] === 1) || (hasLongExit && exitLong[p] === 1)
             : goLong[p] === 1 || (hasShortExit && exitShort[p] === 1));
         if (leave) {
           const px = pos === 1 ? o * (1 - slip) : o * (1 + slip);
@@ -307,7 +365,7 @@ export function runBacktest(
 
       /* -- 3b. Entries at the open ---------------------------------------- */
       if (pos === 0 && equity > 0 && !exitedAtOpen) {
-        const dir = goLong[p] === 1 ? 1 : goShort[p] === 1 ? -1 : 0;
+        const dir = goLong[p] === 1 ? 1 : allowShort && goShort[p] === 1 ? -1 : 0;
         if (dir !== 0) {
           const a = atr !== null ? atr[p] : 0;
           // Dynamic exits need a valid ATR on the signal candle.
@@ -644,7 +702,118 @@ export interface SearchMetrics {
   validation: PerformanceMetrics;
 }
 
-/** Train / validation / combined metrics of a run that simulated bars `[0, split.holdoutStart)`. */
+/** Running totals of one segment. Raw power sums let every moment be derived without a second pass. */
+interface Tally {
+  bars: number;
+  start: number;
+  end: number;
+  s1: number;
+  s2: number;
+  s3: number;
+  s4: number;
+  down: number;
+  exposed: number;
+  maxDd: number;
+  trades: number;
+  wins: number;
+  grossProfit: number;
+  grossLoss: number;
+  worstStreak: number;
+  ambiguous: number;
+  pnl1: number;
+  pnl2: number;
+  pnl3: number;
+}
+
+const newTally = (): Tally => ({
+  bars: 0, start: 0, end: 0, s1: 0, s2: 0, s3: 0, s4: 0, down: 0, exposed: 0, maxDd: 0,
+  trades: 0, wins: 0, grossProfit: 0, grossLoss: 0, worstStreak: 0, ambiguous: 0, pnl1: 0, pnl2: 0, pnl3: 0,
+});
+
+function resetTally(t: Tally, bars: number, start: number): void {
+  t.bars = bars;
+  t.start = start;
+  t.end = start;
+  t.s1 = t.s2 = t.s3 = t.s4 = t.down = t.exposed = t.maxDd = 0;
+  t.trades = t.wins = t.grossProfit = t.grossLoss = t.worstStreak = t.ambiguous = t.pnl1 = t.pnl2 = t.pnl3 = 0;
+}
+
+// Scratch tallies: `searchMetrics` is synchronous and never re-entered.
+const TRAIN = newTally();
+const VALIDATION = newTally();
+const SEARCH = newTally();
+
+/** Turn a tally into metrics. Produces the same numbers as `segmentMetrics`. */
+function finishTally(t: Tally, periodsPerYear: number, withTrades: boolean): PerformanceMetrics {
+  const m = emptyMetrics();
+  const { bars } = t;
+  m.bars = bars;
+  const growth = t.end / t.start;
+  const mean = t.s1 / bars;
+  const meanSq = t.s2 / bars;
+  const variance = Math.max(0, meanSq - mean * mean);
+  const std = Math.sqrt(variance);
+  const downside = Math.sqrt(t.down / bars);
+  const annualiser = Math.sqrt(periodsPerYear);
+  const years = bars / periodsPerYear;
+
+  if (std > 1e-12) {
+    // Central moments from the raw power sums.
+    const meanCube = t.s3 / bars;
+    const m3 = meanCube - 3 * mean * meanSq + 2 * mean * mean * mean;
+    const m4 = t.s4 / bars - 4 * mean * meanCube + 6 * mean * mean * meanSq - 3 * mean * mean * mean * mean;
+    m.skew = m3 / (std * std * std);
+    m.kurtosis = m4 / (variance * variance);
+  }
+
+  m.netPnl = t.end - t.start;
+  m.roi = (growth - 1) * 100;
+  m.cagr = growth <= 0 ? -100 : years > 0 ? (Math.pow(growth, 1 / years) - 1) * 100 : m.roi;
+  m.maxDrawdown = Math.min(100, t.maxDd * 100);
+  m.sharpeRaw = std > 1e-12 ? mean / std : 0;
+  m.sharpe = m.sharpeRaw * annualiser;
+  m.sortino =
+    downside > 1e-12
+      ? Math.max(-SORTINO_CAP, Math.min(SORTINO_CAP, (mean / downside) * annualiser))
+      : mean > 0
+        ? SORTINO_CAP
+        : 0;
+
+  if (withTrades) {
+    const { trades, wins, grossProfit, grossLoss } = t;
+    const losses = trades - wins;
+    m.trades = trades;
+    m.winRate = trades > 0 ? (wins / trades) * 100 : 0;
+    m.profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+    m.exposure = (t.exposed / bars) * 100;
+    m.maxConsecLosses = t.worstStreak;
+    m.ambiguousTrades = t.ambiguous;
+    const avgWin = wins > 0 ? grossProfit / wins : 0;
+    const avgLoss = losses > 0 ? grossLoss / losses : 0;
+    m.payoffRatio = avgLoss > 0 ? avgWin / avgLoss : avgWin > 0 ? Infinity : 0;
+    m.breakevenWinRate = m.payoffRatio === Infinity ? 0 : m.payoffRatio > 0 ? 100 / (1 + m.payoffRatio) : 100;
+    if (trades > 2) {
+      const tm = t.pnl1 / trades;
+      const tv = Math.max(0, t.pnl2 / trades - tm * tm);
+      const ts = Math.sqrt(tv);
+      if (ts > 1e-12) m.tradeSkew = (t.pnl3 / trades - 3 * tm * tv - tm * tm * tm) / (ts * ts * ts);
+    }
+  }
+  return m;
+}
+
+/**
+ * Train / validation / combined metrics of a run that simulated bars `[0, split.holdoutStart)`
+ * (or more – anything from the holdout onwards is ignored).
+ *
+ * This is the optimiser's hottest function after the simulation itself, so it
+ * does not walk the whole curve. Outside a trade equity cannot move (no
+ * position, no funding, the intrabar low equals the close), so such bars add
+ * nothing to returns, drawdown or exposure. Only the bars from each trade's
+ * entry to its exit are visited, all three segments are filled in that single
+ * pass (the combined segment is the sum of the other two), and the results
+ * equal three `segmentMetrics` calls.
+ */
 export function searchMetrics(
   equity: Float64Array,
   split: Split,
@@ -654,10 +823,155 @@ export function searchMetrics(
   equityLow: Float64Array | null = ws ? ws.equityLow : null,
 ): SearchMetrics {
   const { validationStart, holdoutStart } = split;
+  const validationCapital = equity[validationStart - 1];
+  if (ws === null || equity !== ws.equity || equityLow !== ws.equityLow || !(initialCapital > 0) || !(validationCapital > 0)) {
+    // No trade list to walk (the Buy & Hold benchmark), a foreign curve, or a wiped-out
+    // account: use the reference implementation, which handles every case.
+    return {
+      search: segmentMetrics(equity, 0, holdoutStart, initialCapital, periodsPerYear, ws, equityLow),
+      train: segmentMetrics(equity, 0, validationStart, initialCapital, periodsPerYear, ws, equityLow),
+      validation: segmentMetrics(equity, validationStart, holdoutStart, validationCapital, periodsPerYear, ws, equityLow),
+    };
+  }
+
+  resetTally(TRAIN, validationStart, initialCapital);
+  resetTally(VALIDATION, holdoutStart - validationStart, validationCapital);
+  resetTally(SEARCH, holdoutStart, initialCapital);
+
+  const low = ws.equityLow;
+  const { inMarket, tradeEntryBar, tradeExitBar, tradePnl, tradeAmbiguous, tradeCount } = ws;
+
+  let seg = TRAIN;
+  let inValidation = false;
+  let prev = initialCapital;
+  let peak = initialCapital;
+  // The combined segment's drawdown equals the train drawdown until validation starts.
+  let searchPeak = initialCapital;
+  let searchDd = 0;
+  let streak = 0;
+  let streakOwner = TRAIN;
+  let searchStreak = 0;
+  let searchWorst = 0;
+  /** First bar not yet visited (consecutive trades can share the exit / re-entry bar). */
+  let cursor = 0;
+
+  for (let k = 0; k <= tradeCount; k++) {
+    // k === tradeCount is a sentinel that only closes the train segment if no trade reached validation.
+    const entry = k < tradeCount ? tradeEntryBar[k] : holdoutStart;
+    const stop = k < tradeCount ? Math.min(tradeExitBar[k], holdoutStart - 1) : -1;
+    let from = entry > cursor ? entry : cursor;
+
+    for (;;) {
+      // Cross into the validation segment when this trade (or the end) lies beyond it.
+      if (!inValidation && (from >= validationStart || entry >= validationStart)) {
+        TRAIN.end = validationCapital;
+        TRAIN.maxDd = seg.maxDd;
+        searchPeak = peak;
+        searchDd = TRAIN.maxDd;
+        seg = VALIDATION;
+        inValidation = true;
+        prev = validationCapital;
+        peak = validationCapital;
+      }
+      const to = !inValidation && stop >= validationStart ? validationStart - 1 : stop;
+      let maxDd = seg.maxDd;
+      for (let i = from; i <= to; i++) {
+        const value = equity[i];
+        if (value !== prev) {
+          const r = prev > 0 ? value / prev - 1 : 0;
+          const r2 = r * r;
+          seg.s1 += r;
+          seg.s2 += r2;
+          seg.s3 += r2 * r;
+          seg.s4 += r2 * r2;
+          if (r < 0) seg.down += r2;
+          prev = value;
+        }
+        // Drawdown: from the highest close so far to the worst intrabar mark.
+        const worst = low[i] < value ? low[i] : value;
+        if (worst < peak) {
+          const dd = 1 - worst / peak;
+          if (dd > maxDd) maxDd = dd;
+        }
+        if (value > peak) peak = value;
+        if (inValidation) {
+          if (worst < searchPeak) {
+            const dd = 1 - worst / searchPeak;
+            if (dd > searchDd) searchDd = dd;
+          }
+          if (value > searchPeak) searchPeak = value;
+        }
+        seg.exposed += inMarket[i];
+      }
+      seg.maxDd = maxDd;
+      if (to >= from && to + 1 > cursor) cursor = to + 1;
+      // A trade that straddles the boundary continues in the validation segment.
+      if (!inValidation && stop >= validationStart) {
+        from = validationStart;
+        continue;
+      }
+      break;
+    }
+
+    if (k === tradeCount || entry >= holdoutStart) break; // trades are stored in entry order
+
+    /* -- Trade statistics: a trade belongs to the segment it was opened in -- */
+    const owner = entry < validationStart ? TRAIN : VALIDATION;
+    if (owner !== streakOwner) {
+      // Losing streaks are counted per segment (the combined streak keeps running).
+      streak = 0;
+      streakOwner = owner;
+    }
+    const pnl = tradePnl[k];
+    owner.trades++;
+    owner.pnl1 += pnl;
+    owner.pnl2 += pnl * pnl;
+    owner.pnl3 += pnl * pnl * pnl;
+    owner.ambiguous += tradeAmbiguous[k];
+    if (pnl > 0) {
+      owner.wins++;
+      owner.grossProfit += pnl;
+      streak = 0;
+      searchStreak = 0;
+    } else {
+      owner.grossLoss -= pnl;
+      streak++;
+      searchStreak++;
+      if (streak > owner.worstStreak) owner.worstStreak = streak;
+      if (searchStreak > searchWorst) searchWorst = searchStreak;
+    }
+  }
+
+  if (!inValidation) {
+    // Every trade was in the training segment (or there were none): validation is flat.
+    TRAIN.end = validationCapital;
+    TRAIN.maxDd = seg.maxDd;
+    searchDd = TRAIN.maxDd;
+  }
+  VALIDATION.end = equity[holdoutStart - 1];
+
+  SEARCH.s1 = TRAIN.s1 + VALIDATION.s1;
+  SEARCH.s2 = TRAIN.s2 + VALIDATION.s2;
+  SEARCH.s3 = TRAIN.s3 + VALIDATION.s3;
+  SEARCH.s4 = TRAIN.s4 + VALIDATION.s4;
+  SEARCH.down = TRAIN.down + VALIDATION.down;
+  SEARCH.exposed = TRAIN.exposed + VALIDATION.exposed;
+  SEARCH.maxDd = searchDd;
+  SEARCH.end = VALIDATION.end;
+  SEARCH.trades = TRAIN.trades + VALIDATION.trades;
+  SEARCH.wins = TRAIN.wins + VALIDATION.wins;
+  SEARCH.grossProfit = TRAIN.grossProfit + VALIDATION.grossProfit;
+  SEARCH.grossLoss = TRAIN.grossLoss + VALIDATION.grossLoss;
+  SEARCH.ambiguous = TRAIN.ambiguous + VALIDATION.ambiguous;
+  SEARCH.pnl1 = TRAIN.pnl1 + VALIDATION.pnl1;
+  SEARCH.pnl2 = TRAIN.pnl2 + VALIDATION.pnl2;
+  SEARCH.pnl3 = TRAIN.pnl3 + VALIDATION.pnl3;
+  SEARCH.worstStreak = searchWorst;
+
   return {
-    search: segmentMetrics(equity, 0, holdoutStart, initialCapital, periodsPerYear, ws, equityLow),
-    train: segmentMetrics(equity, 0, validationStart, initialCapital, periodsPerYear, ws, equityLow),
-    validation: segmentMetrics(equity, validationStart, holdoutStart, equity[validationStart - 1], periodsPerYear, ws, equityLow),
+    search: finishTally(SEARCH, periodsPerYear, true),
+    train: finishTally(TRAIN, periodsPerYear, true),
+    validation: finishTally(VALIDATION, periodsPerYear, true),
   };
 }
 

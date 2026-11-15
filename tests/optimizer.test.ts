@@ -1,6 +1,9 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { buildDataset } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
+import { BacktestWorkspace, barsPerYear, evaluateSearch, runBacktest, splitFor } from '../src/engine/backtester';
+import { attachEvaluator } from '../src/engine/evaluation';
+import { IndicatorCache } from '../src/engine/indicators';
 import { countParameters, gaussian, isCoherent, MAX_PARAMETERS, mirrorGroup, mulberry32 } from '../src/engine/genome';
 import {
   DEFAULT_MAX_STAGNATION,
@@ -67,7 +70,7 @@ function randomWalk(n: number, seed: number, sigma = 0.02): NamedDataset {
 function runOptimizer(
   datasets: NamedDataset[],
   settings: BacktestSettings,
-  options: { seed: number; stopAfterIterations?: number; maxStagnation?: number },
+  options: { seed: number; stopAfterIterations?: number; maxStagnation?: number; ports?: MessagePort[]; batchSize?: number },
 ): Promise<WorkerResponse[]> {
   return new Promise((resolve) => {
     const messages: WorkerResponse[] = [];
@@ -88,7 +91,17 @@ function runOptimizer(
       if (message.type === 'done' || message.type === 'error') resolve(messages);
     };
     scope.onmessage?.({
-      data: { type: 'start', payload: { datasets, settings, seed: options.seed, maxStagnation: options.maxStagnation } },
+      data: {
+        type: 'start',
+        payload: {
+          datasets,
+          settings,
+          seed: options.seed,
+          maxStagnation: options.maxStagnation,
+          ports: options.ports,
+          batchSize: options.batchSize,
+        },
+      },
     });
   });
 }
@@ -270,6 +283,63 @@ describe('optimizer worker', () => {
     const other = request({ type: 'analyze', strategyId: 'S-custom', genome: done.strategies[done.strategies.length - 1].genome }) as Of<'analysis'>;
     expect(other.type).toBe('analysis');
     expect(other.verdict).not.toBeNull();
+  }, 300_000);
+
+  it('keeps the train / validation figures of every strategy unchanged when the holdout is revealed', async () => {
+    const eth = dataset('ETH-USD', '1d', '5y');
+    const settings = settingsFor('long-short');
+    const messages = await runOptimizer([eth], settings, { seed: 99, maxStagnation: 600 });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    // The final figures must be exactly what the search ranked on: a backtest that stops at the holdout boundary.
+    const split = splitFor(eth.data.c.length);
+    const ind = new IndicatorCache(eth.data);
+    const ws = new BacktestWorkspace(eth.data.c.length);
+    const ppy = barsPerYear(eth.data.t);
+    let openAtBoundary = 0;
+    for (const final of done.strategies) {
+      const expected = evaluateSearch(ind, final.genome, settings, ws, split, ppy);
+      expect(final.search).toEqual(expected.search);
+      expect(final.train).toEqual(expected.train);
+      expect(final.validation).toEqual(expected.validation);
+      expect(final.holdout).not.toBeNull();
+      runBacktest(ind, final.genome, settings, ws);
+      if (ws.inMarket[split.holdoutStart - 1] === 1) openAtBoundary++;
+    }
+    // At least one strategy holds a position across the boundary, so the test can tell the two backtests apart.
+    expect(openAtBoundary).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('gives identical results on an evaluator pool and on a single thread', async () => {
+    const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD'].map((symbol) => dataset(symbol, '1d', '2y'));
+    const settings = settingsFor('long-short');
+    const options = { seed: 314, maxStagnation: 500, batchSize: 75 };
+
+    const single = await runOptimizer(universe, settings, options);
+
+    // Three in-process evaluators on real MessageChannels – the same protocol the browser uses.
+    const channels = [0, 1, 2].map(() => new MessageChannel());
+    for (const channel of channels) {
+      attachEvaluator(channel.port2 as unknown as Parameters<typeof attachEvaluator>[0], {
+        datasets: universe,
+        settings,
+        budgetBytes: 64 * 1024 * 1024,
+      });
+    }
+    const pooled = await runOptimizer(universe, settings, { ...options, ports: channels.map((c) => c.port1) });
+    for (const channel of channels) channel.port2.close();
+
+    const a = single[single.length - 1] as Of<'done'>;
+    const b = pooled[pooled.length - 1] as Of<'done'>;
+    expect(b.type).toBe('done');
+    expect(b.iteration).toBe(a.iteration);
+    expect(b.stagnation).toBe(a.stagnation);
+    expect(b.strategies.map((s) => s.id)).toEqual(a.strategies.map((s) => s.id));
+    expect(b.strategies.map((s) => s.fitness)).toEqual(a.strategies.map((s) => s.fitness));
+    expect(b.strategies.map((s) => s.genome)).toEqual(a.strategies.map((s) => s.genome));
+    expect(Array.from(b.strategies[0].equity)).toEqual(Array.from(a.strategies[0].equity));
+    // Progress is still streamed every 25 iterations even though rounds are 75 candidates long.
+    const progress = ofType(pooled, 'progress');
+    progress.slice(0, -1).forEach((p, index) => expect(p.iteration).toBe((index + 1) * PROGRESS_EVERY));
   }, 300_000);
 
   it('reports an error instead of crashing on unusable data', async () => {

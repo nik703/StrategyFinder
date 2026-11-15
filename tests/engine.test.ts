@@ -8,6 +8,8 @@ import {
   benchmarkEquity,
   benchmarkSearch,
   combineFitness,
+  evaluateCondition,
+  evaluateGroup,
   evaluateSearch,
   holdoutMetrics,
   MIN_TRADES,
@@ -471,6 +473,83 @@ describe('backtester', () => {
     expect(Number.isFinite(full.skew)).toBe(true);
     expect(full.kurtosis).toBeGreaterThan(1);
     expect(full.sharpe).toBeCloseTo(full.sharpeRaw * Math.sqrt(ppy), 9);
+  });
+
+  it('computes the fused search metrics exactly like three separate segment passes', () => {
+    const rng = mulberry32(2024);
+    const keys = [
+      'netPnl', 'roi', 'cagr', 'maxDrawdown', 'sharpe', 'sortino', 'winRate', 'profitFactor', 'trades', 'exposure', 'bars',
+      'sharpeRaw', 'skew', 'kurtosis', 'maxConsecLosses', 'payoffRatio', 'breakevenWinRate', 'tradeSkew', 'ambiguousTrades',
+    ] as const;
+    const close = (a: number, b: number): boolean =>
+      a === b || Math.abs(a - b) <= 1e-7 * Math.max(1, Math.abs(a), Math.abs(b));
+    let withTrades = 0;
+    let flat = 0;
+    for (const [symbol, mode, sizing] of [
+      ['BTC-USD', 'long-short', SETTINGS.sizing],
+      ['NVDA', 'long-only', { mode: 'risk', riskPct: 2, compounding: false }],
+      ['SOL-USD', 'long-short', { mode: 'risk', riskPct: 1, compounding: true }],
+    ] as const) {
+      const data = dataset(symbol, '1d', '5y');
+      const n = data.c.length;
+      const split = splitFor(n);
+      const ppy = barsPerYear(data.t);
+      const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
+      const ind = new IndicatorCache(data);
+      const ws = new BacktestWorkspace(n);
+      for (let i = 0; i < 400; i++) {
+        const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
+        // Search-period run (what the optimiser does) and a full run (what the holdout reveal does).
+        for (const bars of [split.holdoutStart, n]) {
+          runBacktest(ind, genome, settings, ws, bars);
+          const fused = searchMetrics(ws.equity, split, settings.initialCapital, ppy, ws);
+          const reference = {
+            search: segmentMetrics(ws.equity, 0, split.holdoutStart, settings.initialCapital, ppy, ws),
+            train: segmentMetrics(ws.equity, 0, split.validationStart, settings.initialCapital, ppy, ws),
+            validation: segmentMetrics(ws.equity, split.validationStart, split.holdoutStart, ws.equity[split.validationStart - 1], ppy, ws),
+          };
+          for (const segment of ['search', 'train', 'validation'] as const) {
+            for (const key of keys) {
+              const a = fused[segment][key];
+              const b = reference[segment][key];
+              if (!close(a, b)) throw new Error(`${symbol} #${i} ${segment}.${key}: fused ${a} vs reference ${b}`);
+            }
+          }
+          if (fused.search.trades > 0) withTrades++;
+          else flat++;
+        }
+      }
+    }
+    expect(withTrades).toBeGreaterThan(1500);
+    expect(flat).toBeGreaterThan(5); // the never-traded shortcut is exercised too
+  });
+
+  it('evaluates signals only inside the simulated window and matches a plain AND of the conditions', () => {
+    const data = dataset('ETH-USD', '1d', '5y');
+    const n = data.c.length;
+    const ind = new IndicatorCache(data);
+    const rng = mulberry32(11);
+    const out = new Uint8Array(n);
+    const a = new Uint8Array(n);
+    const b = new Uint8Array(n);
+    let pairs = 0;
+    for (let i = 0; i < 600; i++) {
+      const genome = randomGenome(rng, 'long-only', DEFAULT_LIMITS);
+      const { conditions } = genome.longEntry;
+      const limit = 1 + Math.floor(rng() * (n - 1));
+      out.fill(7); // sentinel: nothing beyond `limit` may be written
+      evaluateGroup(genome.longEntry, ind, out, new Uint8Array(n), limit);
+      evaluateCondition(conditions[0], ind, a);
+      if (conditions.length > 1) {
+        evaluateCondition(conditions[1], ind, b);
+        pairs++;
+      } else b.fill(1);
+      for (let k = 0; k < n; k++) {
+        if (k < limit) expect(out[k]).toBe(a[k] & b[k]);
+        else expect(out[k]).toBe(7);
+      }
+    }
+    expect(pairs).toBeGreaterThan(200);
   });
 
   it('builds an exact Buy & Hold benchmark', () => {

@@ -160,6 +160,15 @@ the number of strategies tried so far, the spread of their Sharpe ratios, the sa
 skewness and kurtosis of returns. The hurdle rises with every trial, so the leaderboard is re-scored as
 the run goes on and a score can fall over time.
 
+**Speed.** Candidate strategies are scored on several CPU cores: the app starts one evaluator
+worker per core (minus one, up to 6) and the optimiser sends them rounds of 100 candidates each over
+direct MessageChannels. Results are applied in proposal order, so a seeded run gives the same answer
+whatever the pool size. With one or two cores, or if an evaluator fails to load, the optimiser scores
+candidates itself. Within each evaluation, the expensive parts are kept small: only the bars inside
+trades are visited when computing metrics, the second condition of an entry is only checked where the
+trigger fired, and in a Robust universe a candidate stops being backtested once it provably cannot
+reach the leaderboard (an exact bound on the median, so it never changes the result).
+
 The leaderboard keeps the 25 best behaviourally distinct strategies: two candidates whose equity returns
 correlate above 0.9 count as the same idea and only the fitter one is listed.
 
@@ -210,6 +219,8 @@ src/engine/genome.ts              Archetypes, grids, random generation, mutation
 src/engine/describe.ts            Plain-English rules and badges
 src/engine/pine.ts                Pine Script v5 exporter
 src/workers/optimizer.worker.ts   Optimisation loop (Web Worker)
+src/workers/evaluator.worker.ts   Evaluator pool member: scores candidate strategies
+src/engine/evaluation.ts          Shared scoring code and the evaluator protocol
 src/lib/stats.ts                  Deflated Sharpe Ratio, confidence intervals
 src/lib/holdoutLog.ts             Holdout reveal counter
 src/data/                         Data loader, offline generator, basket builder
