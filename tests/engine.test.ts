@@ -3,6 +3,19 @@ import { buildDataset, normalizeWeights } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
 import {
   assetBaseScore,
+  collapsedRegimes,
+  emptyMetrics,
+  FOLD_QUANTILE,
+  foldBounds,
+  FOLDS,
+  isSingleRegime,
+  plateauFitness,
+  quantile,
+  regimeMask,
+  REGIME_COLLAPSE_PENALTY,
+  REGIME_HIGH_VOL,
+  testableRegimes,
+  type SearchMetrics,
   BacktestWorkspace,
   barsPerYear,
   benchmarkEquity,
@@ -64,6 +77,8 @@ import {
   type Condition,
   type ConditionRole,
   type OHLCV,
+  type PerformanceMetrics,
+  type RegimeMetrics,
   type StrategyGenome,
   type StrategyResult,
 } from '../src/types/trading';
@@ -501,12 +516,30 @@ describe('backtester', () => {
       const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
       const ind = new IndicatorCache(data);
       const ws = new BacktestWorkspace(n);
+      const regimes = regimeMask(data.c, split, ppy);
+      const fb = foldBounds(split);
       for (let i = 0; i < 400; i++) {
         const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
         // Search-period run (what the optimiser does) and a full run (what the holdout reveal does).
         for (const bars of [split.holdoutStart, n]) {
           runBacktest(ind, genome, settings, ws, bars);
-          const fused = searchMetrics(ws.equity, split, settings.initialCapital, ppy, ws);
+          const fused = searchMetrics(ws.equity, split, settings.initialCapital, ppy, ws, ws.equityLow, regimes);
+          // Folds: the single pass must equal five separate segment passes.
+          fb.slice(0, -1).forEach((from, f) => {
+            const start = from === 0 ? settings.initialCapital : ws.equity[from - 1];
+            const ref = segmentMetrics(ws.equity, from, fb[f + 1], start, ppy, ws);
+            for (const key of keys) {
+              if (!close(fused.folds[f][key], ref[key])) throw new Error(`${symbol} #${i} fold ${f}.${key}: fused ${fused.folds[f][key]} vs reference ${ref[key]}`);
+            }
+          });
+          // Regimes: a copy of the curve forces the bar-by-bar reference implementation.
+          const slow = searchMetrics(Float64Array.from(ws.equity), split, settings.initialCapital, ppy, ws, ws.equityLow, regimes);
+          fused.regimes?.forEach((r, j) => {
+            const ref = slow.regimes?.[j];
+            for (const key of ['bars', 'coverage', 'trades', 'netPnl', 'sharpe'] as const) {
+              if (!ref || !close(r[key], ref[key])) throw new Error(`${symbol} #${i} regime ${r.regime}.${key}: fused ${r[key]} vs reference ${ref?.[key]}`);
+            }
+          });
           const reference = {
             search: segmentMetrics(ws.equity, 0, split.holdoutStart, settings.initialCapital, ppy, ws),
             train: segmentMetrics(ws.equity, 0, split.validationStart, settings.initialCapital, ppy, ws),
@@ -526,6 +559,33 @@ describe('backtester', () => {
     }
     expect(withTrades).toBeGreaterThan(1500);
     expect(flat).toBeGreaterThan(5); // the never-traded shortcut is exercised too
+  });
+
+  it('labels bull, bear and high-volatility regimes causally, without looking at the holdout', () => {
+    const data = dataset('BTC-USD', '1d', '5y');
+    const n = data.c.length;
+    const split = splitFor(n);
+    const ppy = barsPerYear(data.t);
+    const r = regimeMask(data.c, split, ppy);
+    expect(r.searchBars).toBe(split.holdoutStart);
+    // Bull and bear partition the labelled bars; every slice is populated on five years of data.
+    for (let i = 0; i < split.holdoutStart; i++) expect((r.mask[i] & 3) !== 3).toBe(true);
+    expect(r.bars[0] + r.bars[1]).toBeGreaterThan(0.8 * split.holdoutStart);
+    expect(r.bars[0]).toBeGreaterThan(0.1 * split.holdoutStart);
+    expect(r.bars[1]).toBeGreaterThan(0.1 * split.holdoutStart);
+    // High volatility is the top third of the search period's own trailing volatility.
+    expect(r.bars[2] / split.holdoutStart).toBeGreaterThan(0.25);
+    expect(r.bars[2] / split.holdoutStart).toBeLessThan(0.4);
+    for (let i = split.holdoutStart; i < n; i++) expect(r.mask[i]).toBe(0);
+    // Wrecking every holdout price changes nothing in the search period.
+    const poisoned = Float64Array.from(data.c);
+    for (let i = split.holdoutStart; i < n; i++) poisoned[i] = poisoned[i] * (i % 2 === 0 ? 10 : 0.1);
+    expect(Array.from(regimeMask(poisoned, split, ppy).mask)).toEqual(Array.from(r.mask));
+    // Truncating the future cannot relabel the past trend (only the volatility threshold may move).
+    const cut = truncate(data, Math.floor(n * 0.9));
+    const rCut = regimeMask(cut.c, splitFor(cut.c.length), ppy);
+    for (let i = 0; i < rCut.searchBars; i++) expect(rCut.mask[i] & 3).toBe(r.mask[i] & 3);
+    expect(REGIME_HIGH_VOL).toBe(4);
   });
 
   it('evaluates signals only inside the simulated window and matches a plain AND of the conditions', () => {
@@ -581,6 +641,7 @@ describe('backtester', () => {
       primaryTrades: 150,
       primaryValidationTrades: 70,
       minTradesPerYear: 40,
+      singleRegime: false,
       profitableShare: 1,
       params: 4,
       rewardToRisk: 2,
@@ -601,6 +662,8 @@ describe('backtester', () => {
     // The audit's noise champions (17–55 validation trades) can never rank, even with a perfect score.
     for (const trades of [17, 32, 55]) expect(combineFitness({ ...base, assetScores: [50], primaryValidationTrades: trades })).toBe(UNFIT);
     expect(combineFitness({ ...base, primaryTrades: 0 })).toBe(UNFIT);
+    // A strategy that makes all of its money in one market regime is disqualified.
+    expect(combineFitness({ ...base, assetScores: [50], singleRegime: true })).toBe(UNFIT);
     expect(combineFitness({ ...base, params: 8 })).toBeCloseTo(score - 0.6, 9);
     // Reward:risk below 1 needs a win rate 10 points above break-even (66.7% at 0.5:1).
     expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 70 })).toBeCloseTo(score - 0.75, 9);
@@ -612,14 +675,76 @@ describe('backtester', () => {
     const data = dataset();
     const split = splitFor(data.c.length);
     const ppy = barsPerYear(data.t);
-    const bench = benchmarkSearch(data, SETTINGS, split, ppy);
     const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, ppy);
-    const assetScore = assetBaseScore(m, bench);
+    const assetScore = assetBaseScore(m);
     expect(Number.isFinite(assetScore)).toBe(true);
     const deeper = { ...m, search: { ...m.search, maxDrawdown: m.search.maxDrawdown + 40 } };
-    expect(assetBaseScore(deeper, bench)).toBeLessThan(assetScore);
-    const moreAlpha = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
-    expect(assetBaseScore(moreAlpha, bench)).toBeGreaterThan(assetScore);
+    expect(assetBaseScore(deeper)).toBeLessThan(assetScore);
+    // Stage 2: raw validation return over Buy & Hold no longer moves the score at all.
+    const moreValidationRoi = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
+    expect(assetBaseScore(moreValidationRoi)).toBe(assetScore);
+  });
+
+  it('scores the 25th-percentile fold, so one lucky fold cannot carry a strategy', () => {
+    const fold = (sharpe: number): PerformanceMetrics => ({ ...emptyMetrics(), sharpe, sortino: sharpe * 1.5 });
+    const asMetrics = (sharpes: number[]): SearchMetrics => ({
+      search: emptyMetrics(),
+      train: emptyMetrics(),
+      validation: emptyMetrics(),
+      folds: sharpes.map(fold),
+      regimes: null,
+    });
+    expect(FOLDS).toBe(5);
+    // One spectacular fold and four losing ones vs five steady, modest folds.
+    const lucky = assetBaseScore(asMetrics([3, -0.5, -0.4, -0.6, -0.3]));
+    const steady = assetBaseScore(asMetrics([0.8, 0.7, 0.9, 0.6, 0.75]));
+    expect(steady).toBeGreaterThan(lucky);
+    expect(lucky).toBeLessThan(0);
+    // The fold order does not matter, only the distribution.
+    expect(assetBaseScore(asMetrics([-0.3, -0.6, -0.4, -0.5, 3]))).toBeCloseTo(lucky, 12);
+    // 25th percentile of five values = the second-worst.
+    expect(quantile([5, 1, 4, 2, 3], FOLD_QUANTILE)).toBe(2);
+    expect(quantile([1, 2], 0.5)).toBe(1.5);
+    // The fold boundaries cut the search period into five equal, sequential pieces.
+    const bounds = foldBounds(splitFor(1000));
+    expect(bounds).toEqual([0, 160, 320, 480, 640, 800]);
+  });
+
+  it('penalises regime collapse and disqualifies one-regime strategies', () => {
+    const slice = (regime: RegimeMetrics['regime'], sharpe: number, trades = 30, coverage = 0.4): RegimeMetrics => ({
+      regime, bars: 400, coverage, trades, netPnl: sharpe * 100, sharpe,
+    });
+    const steadyFolds = [0.8, 0.7, 0.9, 0.6, 0.75].map((sharpe) => ({ ...emptyMetrics(), sharpe, sortino: sharpe * 1.5 }));
+    const withRegimes = (regimes: RegimeMetrics[]): SearchMetrics => ({
+      search: emptyMetrics(), train: emptyMetrics(), validation: emptyMetrics(), folds: steadyFolds, regimes,
+    });
+    const healthy = [slice('Bull', 1.2), slice('Bear', 0.3), slice('High volatility', 0.5)];
+    const bearCollapse = [slice('Bull', 1.2), slice('Bear', -1.4), slice('High volatility', 0.5)];
+    expect(collapsedRegimes(healthy)).toHaveLength(0);
+    expect(collapsedRegimes(bearCollapse).map((r) => r.regime)).toEqual(['Bear']);
+    expect(assetBaseScore(withRegimes(bearCollapse))).toBeCloseTo(assetBaseScore(withRegimes(healthy)) - REGIME_COLLAPSE_PENALTY, 12);
+    // Profitable in the bull slice only, collapsing everywhere else: a bet on one regime.
+    expect(isSingleRegime([slice('Bull', 2), slice('Bear', -1.4), slice('High volatility', -0.9)])).toBe(true);
+    expect(isSingleRegime(bearCollapse)).toBe(false); // two regimes made money
+    expect(isSingleRegime([slice('Bull', 2), slice('Bear', -0.2), slice('High volatility', -0.9)])).toBe(false); // bear only mildly negative
+    // Slices with too little coverage or too few trades are not judged at all.
+    const untestable = [slice('Bull', 2), slice('Bear', -3, 4), slice('High volatility', -3, 30, 0.05)];
+    expect(testableRegimes(untestable)).toHaveLength(1);
+    expect(isSingleRegime(untestable)).toBe(false);
+    expect(collapsedRegimes(untestable)).toHaveLength(0);
+  });
+
+  it('caps a strategy at the median of its one-step neighbours, so spikes rank below plateaus', () => {
+    // An isolated spike: brilliant at its exact parameters, poor one grid step away.
+    const spike = plateauFitness(3, [0.1, -1, 0.2, 0, 0.3]);
+    // A broad plateau: slightly lower peak, but the neighbourhood holds up.
+    const plateau = plateauFitness(2, [1.9, 2.1, 2, 1.8, 2.05]);
+    expect(spike).toBeCloseTo(0.1, 12);
+    expect(plateau).toBeCloseTo(2, 12);
+    expect(plateau).toBeGreaterThan(spike);
+    // Better neighbours never lift a strategy above its own fitness; no neighbours leaves it unchanged.
+    expect(plateauFitness(1, [5, 6, 7])).toBe(1);
+    expect(plateauFitness(1.5, [])).toBe(1.5);
   });
 });
 

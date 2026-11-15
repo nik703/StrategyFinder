@@ -15,11 +15,16 @@ import {
   combineFitness,
   deflatedTerm,
   evaluateSearch,
+  isSingleRegime,
+  plateauFitness,
+  regimeMask,
   splitFor,
+  UNFIT,
+  type Regimes,
   type SearchMetrics,
   type Split,
 } from './backtester';
-import { countParameters, rewardToRisk, type GenomeLimits } from './genome';
+import { countParameters, rewardToRisk, stepNeighbours, type GenomeLimits } from './genome';
 import { IndicatorCache } from './indicators';
 import { deflatedSharpeAgainst } from '../lib/stats';
 import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, StrategyGenome } from '../types/trading';
@@ -39,6 +44,8 @@ export interface Asset {
   periodsPerYear: number;
   /** Buy & Hold over the search period. */
   benchmark: SearchMetrics & { equity: Float64Array };
+  /** Bull / bear / high-volatility label of every search-period bar. */
+  regimes: Regimes;
 }
 
 /** Per-asset ingredients of a fitness score that do not depend on the number of trials. */
@@ -86,6 +93,7 @@ export function buildAsset(dataset: NamedDataset, settings: BacktestSettings, bu
     split,
     periodsPerYear,
     benchmark: benchmarkSearch(data, settings, split, periodsPerYear),
+    regimes: regimeMask(data.c, split, periodsPerYear),
   };
 }
 
@@ -158,8 +166,8 @@ export function scoreAssets(ctx: EvalContext, genome: StrategyGenome, floor = -I
   const scores: AssetScore[] = [];
   for (let a = 0; a < total; a++) {
     const asset = ctx.assets[a];
-    const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear);
-    scores.push({ base: assetBaseScore(metrics, asset.benchmark), metrics });
+    const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
+    scores.push({ base: assetBaseScore(metrics), metrics });
     // The median of `total` values is settled by its lower half: bounding needs more than half of them.
     if (floor > -Infinity && a + 1 < total && a + 1 > total >> 1 && fitnessCeiling(ctx, genome, scores) <= floor) {
       return { scores, complete: false };
@@ -201,6 +209,7 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
     primaryTrades: scores[0].metrics.search.trades,
     primaryValidationTrades: scores[0].metrics.validation.trades,
     minTradesPerYear: minTradesPerYear(ctx, scores),
+    singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / ctx.assets.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
@@ -220,6 +229,7 @@ export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: Asse
     primaryTrades: scores[0].metrics.search.trades,
     primaryValidationTrades: scores[0].metrics.validation.trades,
     minTradesPerYear: minTradesPerYear(ctx, scores),
+    singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / scores.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
@@ -229,25 +239,76 @@ export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: Asse
   return { fitness, dsr };
 }
 
+/** A one-grid-step neighbour of a candidate and its per-asset scores. */
+export interface NeighbourScore {
+  genome: StrategyGenome;
+  scores: AssetScore[];
+}
+
+/** Backtest every one-grid-step parameter neighbour of `genome` on the whole universe. */
+export function scoreNeighbours(ctx: EvalContext, genome: StrategyGenome): NeighbourScore[] {
+  return stepNeighbours(genome, ctx.settings.tradeMode, ctx.limits).map((neighbour) => ({
+    genome: neighbour,
+    scores: scoreAssets(ctx, neighbour).scores,
+  }));
+}
+
+/**
+ * Rank fitness: the candidate's own fitness capped at the median fitness of its neighbours, all
+ * scored against the current hurdle. Returns the point fitness and the neighbour median as well.
+ */
+export function rankFitness(
+  ctx: EvalContext,
+  genome: StrategyGenome,
+  scores: AssetScore[],
+  neighbours: readonly NeighbourScore[] | null,
+): { fitness: number; point: number; neighbourMedian: number | null; dsr: number } {
+  const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
+  if (neighbours === null || neighbours.length === 0) return { fitness: point, point, neighbourMedian: null, dsr };
+  const values = neighbours.map((nb) => fitnessOf(ctx, nb.genome, nb.scores).fitness);
+  const fitness = plateauFitness(point, values);
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const neighbourMedian = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  return { fitness, point, neighbourMedian, dsr };
+}
+
 /** Outcome of evaluating one candidate during the search. */
 export interface CandidateResult {
   scores: AssetScore[];
   /** False when scoring stopped early because the candidate provably cannot beat `floor`. */
   complete: boolean;
+  /** Rank fitness: `pointFitness` capped by the neighbourhood (equal to it when no neighbours were scored). */
   fitness: number;
+  /** Fitness of the exact parameter values. */
+  pointFitness: number;
   dsr: number;
+  /** One-grid-step neighbours – scored only for candidates whose point fitness beats `floor`. */
+  neighbours: NeighbourScore[] | null;
   /** Primary-asset equity curve on the chart axis (search period only) – only for candidates that beat `floor`. */
   curve: Float32Array | null;
 }
 
-/** Evaluate one candidate against the frozen hurdle in `ctx` and the leaderboard floor. */
+/**
+ * Evaluate one candidate against the frozen hurdle in `ctx` and the leaderboard floor.
+ *
+ * Candidates whose own fitness beats the floor – the only ones that can enter the leaderboard –
+ * also have their one-grid-step parameter neighbourhood backtested, and are ranked by their
+ * fitness capped at the neighbours' median (`plateauFitness`). The cap only ever lowers a score,
+ * so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
+ */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
   const { scores, complete } = scoreAssets(ctx, genome, floor);
-  if (!complete) return { scores, complete, fitness: -Infinity, dsr: 0, curve: null };
-  const { fitness, dsr } = fitnessOf(ctx, genome, scores);
-  // The curve is only needed by candidates that can enter the leaderboard; it stops at the holdout boundary.
-  const curve = fitness > floor ? sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos) : null;
-  return { scores, complete, fitness, dsr, curve };
+  if (!complete) return { scores, complete, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
+  const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
+  if (!(point > floor) || point <= UNFIT) {
+    return { scores, complete, fitness: point, pointFitness: point, dsr, neighbours: null, curve: null };
+  }
+  // Sample the curve BEFORE the neighbours' backtests overwrite the primary workspace.
+  const curve = sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos);
+  const neighbours = scoreNeighbours(ctx, genome);
+  const { fitness } = rankFitness(ctx, genome, scores, neighbours);
+  return { scores, complete, fitness, pointFitness: point, dsr, neighbours, curve: fitness > floor ? curve : null };
 }
 
 /** Build a scoring context from raw datasets (the primary asset first). */

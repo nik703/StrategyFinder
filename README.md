@@ -148,15 +148,27 @@ a universe (default BTC, ETH, SOL, XRP, ADA, DOGE; editable). Fitness is the med
 counts are gated per asset (never pooled), and there is a penalty when fewer than 2/3 of the assets are profitable on
 validation. The leaderboard and chart show the primary asset.
 
+The search period (train + validation) is cut into **5 equal, sequential folds**, and every fold is
+scored on its own (0.6 Sortino + 0.4 Sharpe, clamped). Fitness rests on the **25th percentile** of the
+five – the second-worst fold – so one lucky year cannot carry a strategy that fails in the others. Raw
+return over Buy & Hold no longer counts at all: it is a bet on the market's direction, not evidence of an
+edge.
+
+Every search-period bar is also labelled, causally, as **bull** or **bear** (sign of the trailing return
+over about a quarter of a year) and, separately, **high volatility** (trailing one-month volatility in the
+top third of the search period). A regime slice is judged when it covers at least 10% of the period and
+holds at least 10 of the strategy's trades. A strategy that **collapses** in a slice (annualised Sharpe
+below −0.5 there) loses 0.75 per slice; one that makes money in only one regime and collapses in all the
+others is **disqualified**.
+
 Fitness (higher is better), per asset:
 
 ```
 + 3.00 × Deflated Sharpe Ratio of the validation segment (plus a small slice of its z-score as a gradient)
-+ 0.35 × train risk-adjusted return (0.6 Sortino + 0.4 Sharpe, clamped)
-+ 1.50 × validation excess return over Buy & Hold
-+ 0.75 × train + validation excess return over Buy & Hold
++ 1.50 × 25th-percentile fold score
++ 0.25 × median fold score
 − penalty for intrabar drawdowns beyond 20%, steeper beyond 45%
-− penalty for a loss on the training segment, and for train / validation divergence
+− 0.75 for every regime slice the strategy collapses in
 ```
 
 then, across assets, after the **hard sample-size gates**: a strategy is disqualified outright with fewer
@@ -170,6 +182,13 @@ longer history.
 − 0.15 for each tunable parameter above 4
 − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
 ```
+
+**Plateaus, not spikes.** A strategy that could enter the leaderboard also has every one-grid-step
+parameter neighbour backtested (each tunable number moved one step down and one step up, everything else
+unchanged). It is ranked by its own fitness **capped at the median fitness of those neighbours**: a
+broad plateau keeps its score, while an isolated spike – great at exactly these values, poor one step
+away – is pulled down to what its neighbourhood supports. The cap only ever lowers a score, so it is
+re-applied whenever the deflated-Sharpe hurdle moves and never lets a strategy jump the leaderboard.
 
 The **Deflated Sharpe Ratio** (Bailey & López de Prado) is the probability that a Sharpe ratio is real given
 the number of strategies tried so far, the spread of their Sharpe ratios, the sample length, and the
@@ -207,9 +226,10 @@ data. **Fragile** otherwise; the drawer lists every unmet condition.
 
 - **Expect small numbers and few "Robust" verdicts.** With 2% risk per trade and a deflated Sharpe hurdle,
   most strategies are labelled Overfit or Fragile. That is the tool being honest, not broken: a year or
-  two of validation data cannot prove an edge against thousands of trials. On six driftless random walks
-  the best strategy's deflated Sharpe stayed at or below 16%, every listed strategy was labelled Overfit,
-  and the mean holdout Sharpe was −0.36.
+  two of validation data cannot prove an edge against thousands of trials. On the audit's random walks
+  (6 driftless, 6 with +40% a year of drift, whole top-25 boards), no strategy reached a 95% deflated
+  Sharpe, only 2.7% / 3.3% of them met the holdout conditions of a Robust verdict, none was eligible for
+  Robust, and every locked #1 was rated Overfit.
 - **The holdout is a one-shot test.** Re-running on the same dataset and picking the run whose holdout looks
   best turns the holdout into training data. The reveal log makes that visible and blocks a Robust verdict
   on a holdout that has been seen before.

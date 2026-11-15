@@ -901,12 +901,20 @@ export function crossoverGenomes(
 }
 
 /**
- * Every single-parameter ±20% neighbour of a strategy, snapped to the grids.
- * When ±20% rounds back to the same grid value the adjacent grid step is used
- * instead, so each parameter is always moved. Variants that would break the
- * archetype are skipped.
+ * How a neighbour moves one parameter:
+ *   pct20 – ±20%, snapped to the grid (the adjacent grid value when ±20% rounds back) – the
+ *           post-run sensitivity report;
+ *   step  – exactly one grid step down and one up – the neighbourhood used for ranking.
  */
-export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
+export type NeighbourKind = 'pct20' | 'step';
+
+/**
+ * Every single-parameter neighbour of a strategy (see `NeighbourKind`). Each tunable
+ * parameter is moved down and up once while every other parameter stays put.
+ * Variants that would break the archetype, or that normalise back to an already
+ * listed genome, are skipped.
+ */
+export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits, kind: NeighbourKind = 'pct20'): StrategyGenome[] {
   const base = normalizeGenome(g, mode, limits);
   const baseSignature = genomeSignature(base);
   const seen = new Set<string>([baseSignature]);
@@ -919,12 +927,19 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
       if (!handle || handle.grid.length < 2) continue;
       const current = snap(handle.get(), handle.grid);
       const at = handle.grid.indexOf(current);
-      const target = current * factor;
-      let next = snap(target, handle.grid);
-      if (next === current) {
-        const neighbour = at + (target < current ? -1 : 1);
+      let next: number;
+      if (kind === 'step') {
+        const neighbour = at + (factor < 1 ? -1 : 1);
         if (neighbour < 0 || neighbour >= handle.grid.length) continue;
         next = handle.grid[neighbour];
+      } else {
+        const target = current * factor;
+        next = snap(target, handle.grid);
+        if (next === current) {
+          const neighbour = at + (target < current ? -1 : 1);
+          if (neighbour < 0 || neighbour >= handle.grid.length) continue;
+          next = handle.grid[neighbour];
+        }
       }
       handle.set(next);
       const variant = normalizeGenome(copy, mode, limits);
@@ -935,6 +950,11 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
     }
   }
   return variants;
+}
+
+/** The one-grid-step parameter neighbourhood used to rank strategies by plateau, not spike. */
+export function stepNeighbours(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
+  return parameterVariants(g, mode, limits, 'step');
 }
 
 /* -------------------------------------------------------------------------- */

@@ -310,6 +310,25 @@ export interface PerformanceMetrics {
   ambiguousTrades: number;
 }
 
+/** Market regime slices of the search period, in this order. A bar can be in a trend slice AND the high-volatility slice. */
+export const REGIME_NAMES = ['Bull', 'Bear', 'High volatility'] as const;
+export type RegimeName = (typeof REGIME_NAMES)[number];
+
+/** How a strategy behaved on the search-period bars of one market regime. */
+export interface RegimeMetrics {
+  regime: RegimeName;
+  /** Search-period bars labelled with this regime. */
+  bars: number;
+  /** Share of the search period in this regime (0–1). */
+  coverage: number;
+  /** Trades opened on a bar of this regime. */
+  trades: number;
+  /** Net profit of those trades. */
+  netPnl: number;
+  /** Annualised Sharpe ratio of the per-bar returns on this regime's bars. */
+  sharpe: number;
+}
+
 /** Metrics of one strategy on one asset. */
 export interface AssetResult {
   symbol: string;
@@ -317,6 +336,10 @@ export interface AssetResult {
   search: PerformanceMetrics;
   train: PerformanceMetrics;
   validation: PerformanceMetrics;
+  /** The search period cut into equal, sequential folds (oldest first). */
+  folds?: PerformanceMetrics[];
+  /** Behaviour in the bull, bear and high-volatility slices of the search period (null when unavailable). */
+  regimes?: RegimeMetrics[] | null;
   /** Null until the run has ended. */
   holdout: PerformanceMetrics | null;
 }
@@ -355,8 +378,14 @@ export interface StrategyResult {
   /** Unique within one optimisation run, e.g. "S-4821". */
   id: string;
   genome: StrategyGenome;
-  /** Composite fitness score used for ranking (higher is better). */
+  /** Composite fitness score used for ranking (higher is better), after the parameter-neighbourhood cap. */
   fitness: number;
+  /** Fitness of the exact parameter values, before the neighbourhood cap. */
+  pointFitness?: number;
+  /** Median fitness of the one-grid-step parameter neighbours (null without neighbours). */
+  neighbourMedian?: number | null;
+  /** Number of one-grid-step neighbours that were backtested. */
+  neighbourCount?: number;
   /** Number of tunable numeric parameters. */
   params: number;
   /** Deflated Sharpe Ratio of the validation segment: probability that the Sharpe is real given every trial so far. */
@@ -365,6 +394,10 @@ export interface StrategyResult {
   search: PerformanceMetrics;
   train: PerformanceMetrics;
   validation: PerformanceMetrics;
+  /** Primary-asset folds of the search period (oldest first). */
+  folds?: PerformanceMetrics[];
+  /** Primary-asset regime slices of the search period. */
+  regimes?: RegimeMetrics[] | null;
   /** Null while the run is in progress – the holdout is only evaluated once the search has ended. */
   holdout: PerformanceMetrics | null;
   /** Search-period ROI minus Buy & Hold ROI, in percentage points. */

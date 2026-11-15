@@ -4,10 +4,16 @@ import { generateSyntheticCandles } from '../src/data/synthetic';
 import {
   BacktestWorkspace,
   barsPerYear,
+  benchmarkEquity,
   evaluateSearch,
+  FOLDS,
+  holdoutMetrics,
+  holdoutShortfalls,
   MIN_TRADES,
   MIN_VALIDATION_TRADES,
+  plateauFitness,
   runBacktest,
+  segmentMetrics,
   splitFor,
 } from '../src/engine/backtester';
 import { attachEvaluator } from '../src/engine/evaluation';
@@ -220,6 +226,19 @@ describe('optimizer worker', () => {
     expect(done.bestFitness).toBeCloseTo(final[0].fitness, 9);
     expect(done.bestDsr).toBeCloseTo(Math.max(...final.map((s) => s.dsr)), 9);
     expect(done.hurdleSharpe).toBeGreaterThan(0);
+
+    // Stage 2 ranking: every listed strategy carries its fold and regime breakdown, and is ranked by
+    // its own fitness capped at the median of its one-grid-step neighbours (spikes sink, plateaus hold).
+    for (const s of final) {
+      expect(s.folds).toHaveLength(FOLDS);
+      expect(s.regimes?.map((r) => r.regime)).toEqual(['Bull', 'Bear', 'High volatility']);
+      expect(s.neighbourCount ?? 0).toBeGreaterThan(2);
+      expect(s.pointFitness).toBeDefined();
+      expect(s.fitness).toBeLessThanOrEqual((s.pointFitness as number) + 1e-12);
+      expect(s.fitness).toBeCloseTo(plateauFitness(s.pointFitness as number, [s.neighbourMedian as number]), 9);
+    }
+    // The cap actually bites on part of the board: those strategies were spikes at their exact parameters.
+    expect(final.filter((s) => (s.pointFitness as number) > s.fitness + 1e-9).length).toBeGreaterThan(0);
 
     // Before the lock no strategy gets a verdict, even on request.
     const early = request({ type: 'analyze', strategyId: final[2].id, genome: final[2].genome }) as Of<'analysis'>;
@@ -480,62 +499,111 @@ describe('optimizer worker', () => {
 });
 
 describe('acceptance: pure noise must not look like an edge', () => {
-  /** Run on noise, lock the #1 strategy (the user's natural pick) and return what the reveal says. */
-  async function lockTopOnNoise(data: NamedDataset, seed: number): Promise<{ done: Of<'done'>; top: StrategyResult | null }> {
-    // Defaults: 2% risk sizing, 0.1% fee, 0.05% slippage, 5,000-iteration stagnation limit.
-    const messages = await runOptimizer([data], settingsFor('long-only'), { seed });
+  /*
+   * The walks of docs/AUDIT.md §0, reproduced exactly: 1,826 daily candles (≈ 5 years), 3.5% daily
+   * volatility, the same seeds. Before any fix, 96 of the 150 strategies on the drift boards
+   * (64%) made money on the holdout – the test the verdict used then. These tests judge the WHOLE
+   * top-25 board of every run, not just #1, with the holdout conditions the verdict uses now.
+   * Revealing every holdout is only done here, by the test acting as an outside oracle; the app
+   * itself reveals one locked strategy per run.
+   */
+  const AUDIT_BARS = 1826;
+  const AUDIT_SIGMA = 0.035;
+  const AUDIT_DRIFT_PER_BAR = 0.4 / 365;
+  const SETTINGS = settingsFor('long-only');
+
+  interface BoardRow {
+    dsr: number;
+    /** Annualised Sharpe over train + validation – what the search saw. */
+    searchSharpe: number;
+    holdoutRoi: number;
+    holdoutSharpe: number;
+    /** Passes every holdout condition of a Robust verdict (`holdoutShortfalls` is empty). */
+    holdoutPass: boolean;
+    /** Holdout conditions AND a deflated Sharpe of 95% or more: everything Robust needs short of the robustness tests. */
+    robustEligible: boolean;
+  }
+
+  /** Run on noise, then reveal the holdout of every strategy on the final board (oracle only). */
+  async function revealWholeBoard(data: NamedDataset, seed: number): Promise<{ done: Of<'done'>; rows: BoardRow[] }> {
+    const messages = await runOptimizer([data], SETTINGS, { seed });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.reason).toBe('converged');
     assertConstraints(done.strategies, 'long-only');
-    for (const s of done.strategies) {
-      expect(s.holdout).toBeNull();
+    const n = data.data.c.length;
+    const split = splitFor(n);
+    const ppy = barsPerYear(data.data.t);
+    const ind = new IndicatorCache(data.data);
+    const ws = new BacktestWorkspace(n);
+    const bench = benchmarkEquity(data.data, SETTINGS);
+    const benchHoldout = segmentMetrics(bench, split.holdoutStart, n, bench[split.holdoutStart - 1], ppy, null, null);
+    const rows = done.strategies.map((s) => {
+      expect(s.holdout).toBeNull(); // the app itself never revealed it
       expect(s.validation.trades).toBeGreaterThanOrEqual(MIN_VALIDATION_TRADES);
-    }
-    if (done.strategies.length === 0) return { done, top: null }; // nothing cleared the gates: nothing certified
-    const reply = lock(done.strategies[0].id) as Of<'locked'>;
-    expect(reply.type).toBe('locked');
-    return { done, top: reply.strategy };
+      runBacktest(ind, s.genome, SETTINGS, ws);
+      const h = holdoutMetrics(ws.equity, split, ppy, ws);
+      const holdoutPass = holdoutShortfalls(h, benchHoldout, ppy).length === 0;
+      return { dsr: s.dsr, searchSharpe: s.search.sharpe, holdoutRoi: h.roi, holdoutSharpe: h.sharpe, holdoutPass, robustEligible: holdoutPass && s.dsr >= 0.95 };
+    });
+    return { done, rows };
   }
 
-  it('flags the best strategy found on driftless random walks as unproven', async () => {
-    const holdoutSharpes: number[] = [];
+  /** Lock the #1 strategy, as a user would, and return its verdict. */
+  function lockTop(done: Of<'done'>): StrategyResult | null {
+    if (done.strategies.length === 0) return null;
+    const reply = lock(done.strategies[0].id) as Of<'locked'>;
+    expect(reply.type).toBe('locked');
+    return reply.strategy;
+  }
+
+  async function nullBoards(driftPerBar: number, walkSeed: number): Promise<BoardRow[]> {
+    const all: BoardRow[] = [];
     const lines: string[] = [];
-    for (let seed = 0; seed < 6; seed++) {
-      const { done, top } = await lockTopOnNoise(randomWalk(3650, 1000 + seed), 77 + seed);
-      if (top === null) {
-        lines.push(`seed ${seed}: ${done.iteration} iterations | no strategy cleared the trade gates`);
-        continue;
-      }
-      // The deflated Sharpe must never certify noise as real, and neither may the verdict.
-      expect(top.dsr).toBeLessThan(0.95);
-      expect(top.verdict).not.toBe('Robust');
-      holdoutSharpes.push(top.holdout?.sharpe ?? 0);
+    for (let k = 0; k < 6; k++) {
+      const { done, rows } = await revealWholeBoard(randomWalk(AUDIT_BARS, walkSeed + k, AUDIT_SIGMA, driftPerBar), 900 + k);
+      const top = lockTop(done);
+      // Nothing on any board may look certified, and the locked #1 is never Robust.
+      for (const row of rows) expect(row.dsr).toBeLessThan(0.95);
+      if (top) expect(top.verdict).not.toBe('Robust');
+      all.push(...rows);
       lines.push(
-        `seed ${seed}: ${done.iteration} iterations | #1 validation Sharpe ${top.validation.sharpe.toFixed(2)} (${top.validation.trades} trades) ` +
-          `DSR ${(top.dsr * 100).toFixed(1)}% → holdout Sharpe ${top.holdout?.sharpe.toFixed(2)} (${top.verdict})`,
+        `run ${k}: ${done.iteration} iterations, board ${rows.length} | holdout ROI > 0: ${rows.filter((r) => r.holdoutRoi > 0).length} | ` +
+          `passes the holdout conditions: ${rows.filter((r) => r.holdoutPass).length} | locked #1 ${top?.verdict ?? 'n/a'}`,
       );
     }
-    const mean = holdoutSharpes.length > 0 ? holdoutSharpes.reduce((a, b) => a + b, 0) / holdoutSharpes.length : 0;
-    console.log(`${lines.join('\n')}\nmean holdout Sharpe of the #1 strategies: ${mean.toFixed(2)}`);
-    expect(mean).toBeLessThanOrEqual(0.3);
+    const share = (f: (r: BoardRow) => boolean): string => `${all.filter(f).length}/${all.length} (${((100 * all.filter(f).length) / Math.max(1, all.length)).toFixed(1)}%)`;
+    console.log(
+      `${lines.join('\n')}\nwhole board: holdout ROI > 0 ${share((r) => r.holdoutRoi > 0)} · passes the holdout conditions ${share((r) => r.holdoutPass)} · ` +
+        `Robust-eligible ${share((r) => r.robustEligible)} · mean holdout Sharpe ${(all.reduce((sum, r) => sum + r.holdoutSharpe, 0) / Math.max(1, all.length)).toFixed(2)}`,
+    );
+    return all;
+  }
+
+  it('flags every strategy on the boards of driftless random walks as unproven', async () => {
+    const rows = await nullBoards(0, 500);
+    expect(rows.length).toBeGreaterThan(100);
+    expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
+    // A false positive is a strategy whose holdout meets the verdict's conditions: rare on noise.
+    expect(rows.filter((r) => r.holdoutPass).length / rows.length).toBeLessThanOrEqual(0.1);
+    // With no edge to find, the board as a whole does not make risk-adjusted money on the holdout.
+    expect(rows.reduce((sum, r) => sum + r.holdoutSharpe, 0) / rows.length).toBeLessThanOrEqual(0);
+    // Selection inflation: how much better the board looked in-sample than on the holdout. On these
+    // exact walks it was 1.33 Sharpe before any fix and 1.11 after Stage 1; fold + neighbourhood
+    // scoring brings it under 1.
+    const inflation = rows.reduce((sum, r) => sum + r.searchSharpe - r.holdoutSharpe, 0) / rows.length;
+    console.log(`selection inflation (mean in-sample − holdout Sharpe): ${inflation.toFixed(2)}`);
+    expect(inflation).toBeLessThan(1);
   }, 900_000);
 
-  it('does not certify noise on a trending asset, where any long strategy makes money on the holdout', async () => {
-    const lines: string[] = [];
-    for (let seed = 0; seed < 4; seed++) {
-      // +40% a year of pure drift: no timing skill exists, but long exposure profits.
-      const { done, top } = await lockTopOnNoise(randomWalk(3650, 2000 + seed, 0.02, 0.4 / 365), 177 + seed);
-      if (top === null) {
-        lines.push(`seed ${seed}: ${done.iteration} iterations | no strategy cleared the trade gates`);
-        continue;
-      }
-      expect(top.verdict).not.toBe('Robust');
-      lines.push(
-        `seed ${seed}: #1 DSR ${(top.dsr * 100).toFixed(1)}% → holdout ROI ${top.holdout?.roi.toFixed(1)}%, Sharpe ${top.holdout?.sharpe.toFixed(2)} ` +
-          `(${top.verdict}: ${(top.verdictNotes ?? []).length} unmet conditions)`,
-      );
-    }
-    console.log(lines.join('\n'));
+  it('does not certify noise on a trending asset, where most long strategies profit from drift alone', async () => {
+    const rows = await nullBoards(AUDIT_DRIFT_PER_BAR, 600);
+    expect(rows.length).toBeGreaterThan(100);
+    expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
+    // Audit baseline: 64% of these boards passed the old holdout test (a positive holdout return).
+    // Under the current holdout conditions the false-positive rate must be a small fraction of that.
+    const falsePositiveRate = rows.filter((r) => r.holdoutPass).length / rows.length;
+    expect(falsePositiveRate).toBeLessThanOrEqual(0.1);
+    expect(falsePositiveRate).toBeLessThan(0.64 / 5);
   }, 900_000);
 });

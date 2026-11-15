@@ -24,15 +24,17 @@
  */
 
 import {
+  REGIME_NAMES,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
+  type RegimeMetrics,
   type BacktestSettings,
   type Condition,
   type PerformanceMetrics,
   type RuleGroup,
   type StrategyGenome,
 } from '../types/trading';
-import type { DeflatedSharpe } from '../lib/stats';
+import { sharpeConfidenceInterval, type DeflatedSharpe } from '../lib/stats';
 import { FREE_PARAMETERS } from './genome';
 import type { IndicatorCache } from './indicators';
 
@@ -719,12 +721,100 @@ export function segmentMetrics(
   return m;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Folds and market regimes of the search period                             */
+/* -------------------------------------------------------------------------- */
+
+/** Number of equal, sequential folds the search period is cut into for scoring. */
+export const FOLDS = 5;
+
+/** Bar boundaries of the folds: `[0, b1, …, holdoutStart]` (FOLDS + 1 entries). */
+export function foldBounds(split: Split): number[] {
+  const bounds: number[] = [0];
+  for (let k = 1; k < FOLDS; k++) bounds.push(Math.floor((split.holdoutStart * k) / FOLDS));
+  bounds.push(split.holdoutStart);
+  return bounds;
+}
+
+/** Bit flags of `Regimes.mask`, in the order of `REGIME_NAMES`. */
+export const REGIME_BULL = 1;
+export const REGIME_BEAR = 2;
+export const REGIME_HIGH_VOL = 4;
+const REGIME_BITS = [REGIME_BULL, REGIME_BEAR, REGIME_HIGH_VOL] as const;
+/** Bars above this percentile of trailing realised volatility count as "high volatility". */
+export const HIGH_VOL_PERCENTILE = 2 / 3;
+
+/** Regime label of every search-period bar. */
+export interface Regimes {
+  /** Bit mask per bar (REGIME_BULL | REGIME_BEAR | REGIME_HIGH_VOL); 0 during the warm-up and in the holdout. */
+  mask: Uint8Array;
+  /** Search-period bars carrying each label, in `REGIME_NAMES` order. */
+  bars: [number, number, number];
+  /** Search-period length the coverage is measured against. */
+  searchBars: number;
+}
+
+/**
+ * Label the search period with market regimes, causally:
+ *   bull / bear      – sign of the trailing return over about a quarter of a year;
+ *   high volatility  – trailing realised volatility over about a month above the 67th percentile.
+ * Each label at bar i uses closes up to bar i only. The volatility threshold is a percentile of
+ * the SEARCH period's own volatility, so nothing about the holdout enters the labels. Lookbacks
+ * are calendar-based (bars per year), so the same labels mean the same thing on every timeframe,
+ * and capped so short histories still get labelled for most of their length.
+ */
+export function regimeMask(close: Float64Array, split: Split, periodsPerYear: number): Regimes {
+  const H = split.holdoutStart;
+  const mask = new Uint8Array(close.length);
+  const trendLook = Math.max(5, Math.min(Math.round(periodsPerYear / 4), Math.floor(H / 8)));
+  const volLook = Math.max(5, Math.min(Math.round(periodsPerYear / 12), Math.floor(H / 16)));
+
+  // Trailing realised volatility (std of log returns over `volLook` bars ending at i).
+  const vol = new Float64Array(H).fill(NaN);
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 1; i < H; i++) {
+    const r = Math.log(close[i] / close[i - 1]);
+    sum += r;
+    sumSq += r * r;
+    if (i > volLook) {
+      const old = Math.log(close[i - volLook] / close[i - volLook - 1]);
+      sum -= old;
+      sumSq -= old * old;
+    }
+    if (i >= volLook) {
+      const mean = sum / volLook;
+      vol[i] = Math.sqrt(Math.max(0, sumSq / volLook - mean * mean));
+    }
+  }
+  const sorted = Array.from(vol).filter((v) => v === v).sort((a, b) => a - b);
+  const threshold = sorted.length > 0 ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * HIGH_VOL_PERCENTILE))] : Infinity;
+
+  const bars: [number, number, number] = [0, 0, 0];
+  for (let i = 0; i < H; i++) {
+    let m = 0;
+    if (i >= trendLook) m |= close[i] > close[i - trendLook] ? REGIME_BULL : REGIME_BEAR;
+    if (vol[i] > threshold) m |= REGIME_HIGH_VOL;
+    mask[i] = m;
+    for (let j = 0; j < 3; j++) if (m & REGIME_BITS[j]) bars[j]++;
+  }
+  return { mask, bars, searchBars: H };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Search-period metrics: segments, folds and regimes in one pass            */
+/* -------------------------------------------------------------------------- */
+
 /** Metrics of everything the search may look at. */
 export interface SearchMetrics {
   /** Train + Validation combined. */
   search: PerformanceMetrics;
   train: PerformanceMetrics;
   validation: PerformanceMetrics;
+  /** The search period cut into `FOLDS` equal, sequential folds (oldest first). */
+  folds: PerformanceMetrics[];
+  /** Bull, bear and high-volatility slices of the search period; null when no regime labels were supplied. */
+  regimes: RegimeMetrics[] | null;
 }
 
 /** Running totals of one segment. Raw power sums let every moment be derived without a second pass. */
@@ -755,18 +845,34 @@ const newTally = (): Tally => ({
   trades: 0, wins: 0, grossProfit: 0, grossLoss: 0, worstStreak: 0, ambiguous: 0, pnl1: 0, pnl2: 0, pnl3: 0,
 });
 
-function resetTally(t: Tally, bars: number, start: number): void {
+function resetTally(t: Tally, bars: number, start: number, end: number): void {
   t.bars = bars;
   t.start = start;
-  t.end = start;
+  t.end = end;
   t.s1 = t.s2 = t.s3 = t.s4 = t.down = t.exposed = t.maxDd = 0;
   t.trades = t.wins = t.grossProfit = t.grossLoss = t.worstStreak = t.ambiguous = t.pnl1 = t.pnl2 = t.pnl3 = 0;
 }
 
-// Scratch tallies: `searchMetrics` is synchronous and never re-entered.
-const TRAIN = newTally();
-const VALIDATION = newTally();
-const SEARCH = newTally();
+/**
+ * One way of cutting the search period into consecutive segments, with the walking state
+ * the single pass needs: the current segment, its running peak and its losing streak.
+ */
+interface Partition {
+  bounds: number[];
+  tallies: Tally[];
+  seg: number;
+  peak: number;
+  tradeSeg: number;
+  streak: number;
+}
+
+// Scratch state: `searchMetrics` is synchronous and never re-entered.
+const SEARCH_PART: Partition = { bounds: [], tallies: [newTally()], seg: 0, peak: 0, tradeSeg: 0, streak: 0 };
+const SPLIT_PART: Partition = { bounds: [], tallies: [newTally(), newTally()], seg: 0, peak: 0, tradeSeg: 0, streak: 0 };
+const FOLD_PART: Partition = { bounds: [], tallies: Array.from({ length: FOLDS }, newTally), seg: 0, peak: 0, tradeSeg: 0, streak: 0 };
+const PARTS = [SEARCH_PART, SPLIT_PART, FOLD_PART];
+/** Regime slices: per-bar return sums (s1, s2) and trade totals. */
+const REGIME_ACC = Array.from({ length: 3 }, () => ({ s1: 0, s2: 0, trades: 0, pnl: 0 }));
 
 /** Turn a tally into metrics. Produces the same numbers as `segmentMetrics`. */
 function finishTally(t: Tally, periodsPerYear: number, withTrades: boolean): PerformanceMetrics {
@@ -827,17 +933,74 @@ function finishTally(t: Tally, periodsPerYear: number, withTrades: boolean): Per
   return m;
 }
 
+/** Reference (slow) regime statistics: walks every search-period bar. Used when there is no trade list. */
+function regimeStatsReference(
+  equity: Float64Array,
+  initialCapital: number,
+  periodsPerYear: number,
+  regimes: Regimes,
+  ws: BacktestWorkspace | null,
+): RegimeMetrics[] {
+  for (const acc of REGIME_ACC) acc.s1 = acc.s2 = acc.trades = acc.pnl = 0;
+  let prev = initialCapital;
+  for (let i = 0; i < regimes.searchBars; i++) {
+    const value = equity[i];
+    const r = prev > 0 ? value / prev - 1 : 0;
+    prev = value;
+    const m = regimes.mask[i];
+    for (let j = 0; j < 3; j++) {
+      if (m & REGIME_BITS[j]) {
+        REGIME_ACC[j].s1 += r;
+        REGIME_ACC[j].s2 += r * r;
+      }
+    }
+  }
+  if (ws !== null) {
+    for (let k = 0; k < ws.tradeCount; k++) {
+      const entry = ws.tradeEntryBar[k];
+      if (entry >= regimes.searchBars) break;
+      const m = regimes.mask[entry];
+      for (let j = 0; j < 3; j++) {
+        if (m & REGIME_BITS[j]) {
+          REGIME_ACC[j].trades++;
+          REGIME_ACC[j].pnl += ws.tradePnl[k];
+        }
+      }
+    }
+  }
+  return finishRegimes(regimes, periodsPerYear);
+}
+
+function finishRegimes(regimes: Regimes, periodsPerYear: number): RegimeMetrics[] {
+  const annualiser = Math.sqrt(periodsPerYear);
+  return REGIME_NAMES.map((regime, j) => {
+    const bars = regimes.bars[j];
+    const acc = REGIME_ACC[j];
+    const mean = bars > 0 ? acc.s1 / bars : 0;
+    const std = bars > 0 ? Math.sqrt(Math.max(0, acc.s2 / bars - mean * mean)) : 0;
+    return {
+      regime,
+      bars,
+      coverage: regimes.searchBars > 0 ? bars / regimes.searchBars : 0,
+      trades: acc.trades,
+      netPnl: acc.pnl,
+      sharpe: std > 1e-12 ? (mean / std) * annualiser : 0,
+    };
+  });
+}
+
 /**
- * Train / validation / combined metrics of a run that simulated bars `[0, split.holdoutStart)`
- * (or more – anything from the holdout onwards is ignored).
+ * Train / validation / combined metrics, the `FOLDS` sequential folds and (with `regimes`) the
+ * regime slices of a run that simulated bars `[0, split.holdoutStart)` (or more – anything from
+ * the holdout onwards is ignored).
  *
- * This is the optimiser's hottest function after the simulation itself, so it
- * does not walk the whole curve. Outside a trade equity cannot move (no
- * position, no funding, the intrabar low equals the close), so such bars add
- * nothing to returns, drawdown or exposure. Only the bars from each trade's
- * entry to its exit are visited, all three segments are filled in that single
- * pass (the combined segment is the sum of the other two), and the results
- * equal three `segmentMetrics` calls.
+ * This is the optimiser's hottest function after the simulation itself, so it does not walk the
+ * whole curve. Outside a trade equity cannot move (no position, no funding, the intrabar low
+ * equals the close), so such bars add nothing to returns, drawdown or exposure. Only the bars
+ * from each trade's entry to its exit are visited – ONCE – and every view of the period is filled
+ * from that single pass: each visited bar's return goes into its segment, its fold and its regime
+ * slices. Each segment starts from the equity at its first bar, exactly like `segmentMetrics`,
+ * whose results this reproduces.
  */
 export function searchMetrics(
   equity: Float64Array,
@@ -846,157 +1009,145 @@ export function searchMetrics(
   periodsPerYear: number,
   ws: BacktestWorkspace | null,
   equityLow: Float64Array | null = ws ? ws.equityLow : null,
+  regimes: Regimes | null = null,
 ): SearchMetrics {
   const { validationStart, holdoutStart } = split;
-  const validationCapital = equity[validationStart - 1];
-  if (ws === null || equity !== ws.equity || equityLow !== ws.equityLow || !(initialCapital > 0) || !(validationCapital > 0)) {
+  const capitalAt = (bar: number): number => (bar === 0 ? initialCapital : equity[bar - 1]);
+  SEARCH_PART.bounds = [0, holdoutStart];
+  SPLIT_PART.bounds = [0, validationStart, holdoutStart];
+  FOLD_PART.bounds = foldBounds(split);
+
+  let wipedOut = !(initialCapital > 0);
+  for (const part of PARTS) for (const b of part.bounds) if (b < holdoutStart && !(capitalAt(b) > 0)) wipedOut = true;
+  if (ws === null || equity !== ws.equity || equityLow !== ws.equityLow || wipedOut) {
     // No trade list to walk (the Buy & Hold benchmark), a foreign curve, or a wiped-out
     // account: use the reference implementation, which handles every case.
+    const seg = (from: number, to: number): PerformanceMetrics =>
+      segmentMetrics(equity, from, to, capitalAt(from), periodsPerYear, ws, equityLow);
+    const fb = FOLD_PART.bounds;
     return {
-      search: segmentMetrics(equity, 0, holdoutStart, initialCapital, periodsPerYear, ws, equityLow),
-      train: segmentMetrics(equity, 0, validationStart, initialCapital, periodsPerYear, ws, equityLow),
-      validation: segmentMetrics(equity, validationStart, holdoutStart, validationCapital, periodsPerYear, ws, equityLow),
+      search: seg(0, holdoutStart),
+      train: seg(0, validationStart),
+      validation: seg(validationStart, holdoutStart),
+      folds: fb.slice(0, -1).map((from, k) => seg(from, fb[k + 1])),
+      regimes: regimes ? regimeStatsReference(equity, initialCapital, periodsPerYear, regimes, ws) : null,
     };
   }
 
-  resetTally(TRAIN, validationStart, initialCapital);
-  resetTally(VALIDATION, holdoutStart - validationStart, validationCapital);
-  resetTally(SEARCH, holdoutStart, initialCapital);
+  for (const part of PARTS) {
+    part.seg = 0;
+    part.tradeSeg = 0;
+    part.streak = 0;
+    part.peak = initialCapital;
+    part.tallies.forEach((t, s) => resetTally(t, part.bounds[s + 1] - part.bounds[s], capitalAt(part.bounds[s]), capitalAt(part.bounds[s + 1])));
+  }
+  for (const acc of REGIME_ACC) acc.s1 = acc.s2 = acc.trades = acc.pnl = 0;
+  const mask = regimes ? regimes.mask : null;
 
   const low = ws.equityLow;
   const { inMarket, tradeEntryBar, tradeExitBar, tradePnl, tradeAmbiguous, tradeCount } = ws;
-
-  let seg = TRAIN;
-  let inValidation = false;
-  let prev = initialCapital;
-  let peak = initialCapital;
-  // The combined segment's drawdown equals the train drawdown until validation starts.
-  let searchPeak = initialCapital;
-  let searchDd = 0;
-  let streak = 0;
-  let streakOwner = TRAIN;
-  let searchStreak = 0;
-  let searchWorst = 0;
   /** First bar not yet visited (consecutive trades can share the exit / re-entry bar). */
   let cursor = 0;
 
-  for (let k = 0; k <= tradeCount; k++) {
-    // k === tradeCount is a sentinel that only closes the train segment if no trade reached validation.
-    const entry = k < tradeCount ? tradeEntryBar[k] : holdoutStart;
-    const stop = k < tradeCount ? Math.min(tradeExitBar[k], holdoutStart - 1) : -1;
-    let from = entry > cursor ? entry : cursor;
+  for (let k = 0; k < tradeCount; k++) {
+    const entry = tradeEntryBar[k];
+    if (entry >= holdoutStart) break; // trades are stored in entry order
+    const to = Math.min(tradeExitBar[k], holdoutStart - 1);
 
-    for (;;) {
-      // Cross into the validation segment when this trade (or the end) lies beyond it.
-      if (!inValidation && (from >= validationStart || entry >= validationStart)) {
-        TRAIN.end = validationCapital;
-        TRAIN.maxDd = seg.maxDd;
-        searchPeak = peak;
-        searchDd = TRAIN.maxDd;
-        seg = VALIDATION;
-        inValidation = true;
-        prev = validationCapital;
-        peak = validationCapital;
-      }
-      const to = !inValidation && stop >= validationStart ? validationStart - 1 : stop;
-      let maxDd = seg.maxDd;
-      for (let i = from; i <= to; i++) {
-        const value = equity[i];
-        if (value !== prev) {
-          const r = prev > 0 ? value / prev - 1 : 0;
-          const r2 = r * r;
-          seg.s1 += r;
-          seg.s2 += r2;
-          seg.s3 += r2 * r;
-          seg.s4 += r2 * r2;
-          if (r < 0) seg.down += r2;
-          prev = value;
+    /* -- Equity path of the trade, bar by bar, into every partition -------- */
+    for (let i = entry > cursor ? entry : cursor; i <= to; i++) {
+      const value = equity[i];
+      const prev = capitalAt(i);
+      const r = value !== prev && prev > 0 ? value / prev - 1 : 0;
+      const r2 = r * r;
+      const worst = low[i] < value ? low[i] : value;
+      const exposed = inMarket[i];
+      for (let p = 0; p < 3; p++) {
+        const part = PARTS[p];
+        // Entering a later segment: its peak starts from the equity at its first bar.
+        while (i >= part.bounds[part.seg + 1]) {
+          part.seg++;
+          part.peak = capitalAt(part.bounds[part.seg]);
         }
-        // Drawdown: from the highest close so far to the worst intrabar mark.
-        const worst = low[i] < value ? low[i] : value;
-        if (worst < peak) {
-          const dd = 1 - worst / peak;
-          if (dd > maxDd) maxDd = dd;
+        const t = part.tallies[part.seg];
+        if (r !== 0) {
+          t.s1 += r;
+          t.s2 += r2;
+          t.s3 += r2 * r;
+          t.s4 += r2 * r2;
+          if (r < 0) t.down += r2;
         }
-        if (value > peak) peak = value;
-        if (inValidation) {
-          if (worst < searchPeak) {
-            const dd = 1 - worst / searchPeak;
-            if (dd > searchDd) searchDd = dd;
-          }
-          if (value > searchPeak) searchPeak = value;
+        // Drawdown: from the highest close so far in the segment to the worst intrabar mark.
+        if (worst < part.peak) {
+          const dd = 1 - worst / part.peak;
+          if (dd > t.maxDd) t.maxDd = dd;
         }
-        seg.exposed += inMarket[i];
+        if (value > part.peak) part.peak = value;
+        t.exposed += exposed;
       }
-      seg.maxDd = maxDd;
-      if (to >= from && to + 1 > cursor) cursor = to + 1;
-      // A trade that straddles the boundary continues in the validation segment.
-      if (!inValidation && stop >= validationStart) {
-        from = validationStart;
-        continue;
+      if (mask !== null && r !== 0) {
+        const m = mask[i];
+        if (m & REGIME_BULL) {
+          REGIME_ACC[0].s1 += r;
+          REGIME_ACC[0].s2 += r2;
+        }
+        if (m & REGIME_BEAR) {
+          REGIME_ACC[1].s1 += r;
+          REGIME_ACC[1].s2 += r2;
+        }
+        if (m & REGIME_HIGH_VOL) {
+          REGIME_ACC[2].s1 += r;
+          REGIME_ACC[2].s2 += r2;
+        }
       }
-      break;
     }
-
-    if (k === tradeCount || entry >= holdoutStart) break; // trades are stored in entry order
+    if (to + 1 > cursor) cursor = to + 1;
 
     /* -- Trade statistics: a trade belongs to the segment it was opened in -- */
-    const owner = entry < validationStart ? TRAIN : VALIDATION;
-    if (owner !== streakOwner) {
-      // Losing streaks are counted per segment (the combined streak keeps running).
-      streak = 0;
-      streakOwner = owner;
-    }
     const pnl = tradePnl[k];
-    owner.trades++;
-    owner.pnl1 += pnl;
-    owner.pnl2 += pnl * pnl;
-    owner.pnl3 += pnl * pnl * pnl;
-    owner.ambiguous += tradeAmbiguous[k];
-    if (pnl > 0) {
-      owner.wins++;
-      owner.grossProfit += pnl;
-      streak = 0;
-      searchStreak = 0;
-    } else {
-      owner.grossLoss -= pnl;
-      streak++;
-      searchStreak++;
-      if (streak > owner.worstStreak) owner.worstStreak = streak;
-      if (searchStreak > searchWorst) searchWorst = searchStreak;
+    const ambiguous = tradeAmbiguous[k];
+    for (let p = 0; p < 3; p++) {
+      const part = PARTS[p];
+      let s = part.tradeSeg;
+      while (entry >= part.bounds[s + 1]) s++;
+      if (s !== part.tradeSeg) {
+        // Losing streaks are counted per segment.
+        part.tradeSeg = s;
+        part.streak = 0;
+      }
+      const t = part.tallies[s];
+      t.trades++;
+      t.pnl1 += pnl;
+      t.pnl2 += pnl * pnl;
+      t.pnl3 += pnl * pnl * pnl;
+      t.ambiguous += ambiguous;
+      if (pnl > 0) {
+        t.wins++;
+        t.grossProfit += pnl;
+        part.streak = 0;
+      } else {
+        t.grossLoss -= pnl;
+        part.streak++;
+        if (part.streak > t.worstStreak) t.worstStreak = part.streak;
+      }
+    }
+    if (mask !== null) {
+      const m = mask[entry];
+      for (let j = 0; j < 3; j++) {
+        if (m & REGIME_BITS[j]) {
+          REGIME_ACC[j].trades++;
+          REGIME_ACC[j].pnl += pnl;
+        }
+      }
     }
   }
-
-  if (!inValidation) {
-    // Every trade was in the training segment (or there were none): validation is flat.
-    TRAIN.end = validationCapital;
-    TRAIN.maxDd = seg.maxDd;
-    searchDd = TRAIN.maxDd;
-  }
-  VALIDATION.end = equity[holdoutStart - 1];
-
-  SEARCH.s1 = TRAIN.s1 + VALIDATION.s1;
-  SEARCH.s2 = TRAIN.s2 + VALIDATION.s2;
-  SEARCH.s3 = TRAIN.s3 + VALIDATION.s3;
-  SEARCH.s4 = TRAIN.s4 + VALIDATION.s4;
-  SEARCH.down = TRAIN.down + VALIDATION.down;
-  SEARCH.exposed = TRAIN.exposed + VALIDATION.exposed;
-  SEARCH.maxDd = searchDd;
-  SEARCH.end = VALIDATION.end;
-  SEARCH.trades = TRAIN.trades + VALIDATION.trades;
-  SEARCH.wins = TRAIN.wins + VALIDATION.wins;
-  SEARCH.grossProfit = TRAIN.grossProfit + VALIDATION.grossProfit;
-  SEARCH.grossLoss = TRAIN.grossLoss + VALIDATION.grossLoss;
-  SEARCH.ambiguous = TRAIN.ambiguous + VALIDATION.ambiguous;
-  SEARCH.pnl1 = TRAIN.pnl1 + VALIDATION.pnl1;
-  SEARCH.pnl2 = TRAIN.pnl2 + VALIDATION.pnl2;
-  SEARCH.pnl3 = TRAIN.pnl3 + VALIDATION.pnl3;
-  SEARCH.worstStreak = searchWorst;
 
   return {
-    search: finishTally(SEARCH, periodsPerYear, true),
-    train: finishTally(TRAIN, periodsPerYear, true),
-    validation: finishTally(VALIDATION, periodsPerYear, true),
+    search: finishTally(SEARCH_PART.tallies[0], periodsPerYear, true),
+    train: finishTally(SPLIT_PART.tallies[0], periodsPerYear, true),
+    validation: finishTally(SPLIT_PART.tallies[1], periodsPerYear, true),
+    folds: FOLD_PART.tallies.map((t) => finishTally(t, periodsPerYear, true)),
+    regimes: regimes ? finishRegimes(regimes, periodsPerYear) : null,
   };
 }
 
@@ -1019,9 +1170,10 @@ export function evaluateSearch(
   ws: BacktestWorkspace,
   split: Split,
   periodsPerYear: number,
+  regimes: Regimes | null = null,
 ): SearchMetrics {
   runBacktest(ind, genome, settings, ws, split.holdoutStart);
-  return searchMetrics(ws.equity, split, settings.initialCapital, periodsPerYear, ws);
+  return searchMetrics(ws.equity, split, settings.initialCapital, periodsPerYear, ws, ws.equityLow, regimes);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1065,6 +1217,8 @@ export function benchmarkSearch(
     search: decorateBenchmark(m.search, true),
     train: decorateBenchmark(m.train, true),
     validation: decorateBenchmark(m.validation, false),
+    folds: m.folds.map((fold, k) => decorateBenchmark(fold, k === 0)),
+    regimes: null,
   };
 }
 
@@ -1088,6 +1242,24 @@ export const MIN_VALIDATION_TRADES = 60;
 export const MIN_TRADES_PER_YEAR = 25;
 /** Holdout trades below which a locked strategy cannot be rated Robust. */
 export const MIN_HOLDOUT_TRADES = 30;
+/**
+ * The holdout conditions of a Robust verdict, as a list of the ones a strategy misses (empty =
+ * the holdout supports an edge): the holdout Sharpe's 95% confidence interval must lie above zero,
+ * the holdout Sharpe must beat Buy & Hold's holdout Sharpe, and there must be at least
+ * `MIN_HOLDOUT_TRADES` holdout trades. Raw holdout profit is NOT enough: on a trending market
+ * most long strategies make money on the holdout by drift alone.
+ */
+export function holdoutShortfalls(holdout: PerformanceMetrics, benchmark: PerformanceMetrics | null, periodsPerYear: number): string[] {
+  const out: string[] = [];
+  const [ciLow] = sharpeConfidenceInterval(holdout, periodsPerYear);
+  if (!(ciLow > 0)) out.push(`The holdout Sharpe's 95% confidence interval reaches ${ciLow.toFixed(2)}: it includes zero.`);
+  if (benchmark !== null && !(holdout.sharpe > benchmark.sharpe)) {
+    out.push(`Holdout Sharpe ${holdout.sharpe.toFixed(2)} does not beat Buy & Hold's ${benchmark.sharpe.toFixed(2)}.`);
+  }
+  if (holdout.trades < MIN_HOLDOUT_TRADES) out.push(`Only ${holdout.trades} holdout trades (at least ${MIN_HOLDOUT_TRADES} needed).`);
+  return out;
+}
+
 /** Fitness assigned to strategies that never trade or fail a minimum-trade gate. */
 export const UNFIT = -1000;
 
@@ -1098,34 +1270,74 @@ function riskAdjusted(m: PerformanceMetrics): number {
   return 0.6 * (clampTo(m.sortino, -3, 4.5) / 1.5) + 0.4 * clampTo(m.sharpe, -3, 3);
 }
 
-/** Excess return squashed into (−1, 1); the scale adapts to how far the benchmark itself moved. */
-function excessReturnScore(strategyRoi: number, benchmarkRoi: number): number {
-  const scale = 15 + 0.5 * Math.abs(benchmarkRoi);
-  return Math.tanh((strategyRoi - benchmarkRoi) / scale);
+/** Quantile of the fold scores the fitness is built on: a strategy is judged by its second-worst of five folds. */
+export const FOLD_QUANTILE = 0.25;
+/** A regime slice is only judged when it covers at least this share of the search period ... */
+export const REGIME_MIN_COVERAGE = 0.1;
+/** ... and the strategy opened at least this many trades in it. */
+export const REGIME_MIN_TRADES = 10;
+/** Annualised Sharpe below which a strategy has collapsed in a regime slice. */
+export const REGIME_COLLAPSE_SHARPE = -0.5;
+/** Fitness cost of each regime slice the strategy collapses in. */
+export const REGIME_COLLAPSE_PENALTY = 0.75;
+
+/** Linear-interpolation quantile (`q` in [0, 1]) of a list of numbers. */
+export function quantile(values: readonly number[], q: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+/** Risk-adjusted score of every fold of the search period, oldest first. */
+export function foldScores(m: SearchMetrics): number[] {
+  return m.folds.map(riskAdjusted);
+}
+
+/** Regime slices that carry enough bars and trades to be judged. */
+export function testableRegimes(regimes: readonly RegimeMetrics[] | null): RegimeMetrics[] {
+  return (regimes ?? []).filter((r) => r.coverage >= REGIME_MIN_COVERAGE && r.trades >= REGIME_MIN_TRADES);
+}
+
+/** Testable regime slices in which the strategy collapsed (annualised Sharpe below `REGIME_COLLAPSE_SHARPE`). */
+export function collapsedRegimes(regimes: readonly RegimeMetrics[] | null): RegimeMetrics[] {
+  return testableRegimes(regimes).filter((r) => r.sharpe < REGIME_COLLAPSE_SHARPE);
+}
+
+/**
+ * True when ALL of a strategy's profit comes from one regime: at least two regime slices are
+ * testable, exactly one of them made money, and the strategy collapsed in every other one.
+ * Such a strategy is a bet on that regime continuing, not an edge – it is disqualified.
+ */
+export function isSingleRegime(regimes: readonly RegimeMetrics[] | null): boolean {
+  const testable = testableRegimes(regimes);
+  if (testable.length < 2) return false;
+  const winners = testable.filter((r) => r.sharpe > 0);
+  if (winners.length !== 1) return false;
+  return testable.every((r) => r === winners[0] || r.sharpe < REGIME_COLLAPSE_SHARPE);
 }
 
 /**
  * Per-asset score, everything except the deflated-Sharpe term (which changes as
  * more strategies are tried and is therefore added separately – see `deflatedTerm`):
  *
- *   + 0.35 × train risk-adjusted return (0.6 Sortino + 0.4 Sharpe, clamped)
- *   + 1.50 × validation excess return over Buy & Hold (squashed to ±1)
- *   + 0.75 × search-period excess return over Buy & Hold (squashed to ±1)
+ *   + 1.50 × 25th percentile of the five fold scores (each 0.6 Sortino + 0.4 Sharpe, clamped)
+ *   + 0.25 × median fold score
  *   − drawdown penalty beyond 20%, steeper beyond 45% (intrabar drawdown)
- *   − 0.75 when the strategy lost money on the training segment
- *   − consistency penalty when train and validation behaviour diverge
+ *   − 0.75 for every regime slice (bull, bear, high volatility) the strategy collapses in
+ *
+ * Every fold is judged on its own and the score rests on the second-worst of the five, so one
+ * lucky year cannot carry a strategy that fails in the others. Nothing here rewards raw return
+ * over Buy & Hold: that is a bet on the market's direction in a given window, not a sign of edge.
  */
-export function assetBaseScore(m: SearchMetrics, benchmark: SearchMetrics): number {
-  const trainRisk = riskAdjusted(m.train);
-  const validationRisk = riskAdjusted(m.validation);
-  let score =
-    0.35 * trainRisk +
-    1.5 * excessReturnScore(m.validation.roi, benchmark.validation.roi) +
-    0.75 * excessReturnScore(m.search.roi, benchmark.search.roi);
+export function assetBaseScore(m: SearchMetrics): number {
+  const folds = foldScores(m);
+  let score = 1.5 * quantile(folds, FOLD_QUANTILE) + 0.25 * median(folds);
   const dd = m.search.maxDrawdown / 100;
   score -= 4 * Math.max(0, dd - 0.2) + 6 * Math.max(0, dd - 0.45);
-  if (m.train.roi <= 0) score -= 0.75;
-  score -= 0.4 * Math.max(0, Math.abs(validationRisk - trainRisk) - 1);
+  score -= REGIME_COLLAPSE_PENALTY * collapsedRegimes(m.regimes).length;
   return score;
 }
 
@@ -1146,6 +1358,8 @@ export interface FitnessInputs {
   primaryValidationTrades: number;
   /** Lowest search-period trades-per-year rate across every asset scored. */
   minTradesPerYear: number;
+  /** True when the primary asset makes all of its money in a single market regime (see `isSingleRegime`). */
+  singleRegime: boolean;
   /** Share of assets that were profitable on validation (0–1). */
   profitableShare: number;
   /** Number of tunable parameters. */
@@ -1160,7 +1374,8 @@ export interface FitnessInputs {
  * Composite fitness used to rank strategies (higher is better).
  *
  *   UNFIT (disqualified) below 100 trades or 60 validation trades on the primary asset, or
- *   below 25 trades per year on any asset – see the gates above; otherwise
+ *   below 25 trades per year on any asset – see the gates above – or when the primary asset makes
+ *   all of its money in one market regime and collapses in the others; otherwise
  *
  *   median of the per-asset scores (a single asset when the Robust universe is off)
  *   − 1.0 when fewer than 2/3 of the universe is profitable on validation
@@ -1168,7 +1383,7 @@ export interface FitnessInputs {
  *   − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
  */
 export function combineFitness(f: FitnessInputs): number {
-  if (f.assetScores.length === 0 || !passesTradeGates(f)) return UNFIT;
+  if (f.assetScores.length === 0 || !passesTradeGates(f) || f.singleRegime) return UNFIT;
   let score = median(f.assetScores);
   if (f.assetScores.length > 1 && f.profitableShare < 2 / 3 - 1e-9) score -= 1;
   score -= 0.15 * Math.max(0, f.params - FREE_PARAMETERS);
@@ -1177,6 +1392,18 @@ export function combineFitness(f: FitnessInputs): number {
     if (f.validationWinRate < breakeven + 10) score -= 0.75;
   }
   return Number.isFinite(score) ? score : UNFIT;
+}
+
+/**
+ * Rank fitness after the parameter-neighbourhood check: the strategy's own fitness, capped at the
+ * MEDIAN fitness of its one-grid-step neighbours. A broad plateau (neighbours about as good) keeps
+ * its score; an isolated spike (neighbours much worse) is pulled down to what its neighbourhood
+ * supports. The cap can only lower a score, so it never lifts a strategy over the leaderboard floor.
+ */
+export function plateauFitness(point: number, neighbours: readonly number[]): number {
+  if (neighbours.length === 0) return point;
+  const m = median(neighbours);
+  return m < point ? m : point;
 }
 
 /** True when a strategy clears every hard minimum-trade gate. */

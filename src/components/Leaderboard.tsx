@@ -245,7 +245,7 @@ const COLUMNS: Column[] = [
   {
     key: 'fitness',
     label: 'Score',
-    title: 'Composite fitness: deflated validation Sharpe and excess return, minus penalties for few trades, complexity and drawdown',
+    title: 'Composite fitness: deflated validation Sharpe and the 25th-percentile fold score, minus drawdown, regime-collapse and complexity penalties, capped at the median of the one-step parameter neighbours',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
     render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,

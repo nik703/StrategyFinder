@@ -29,7 +29,8 @@ import {
   benchmarkEquity,
   evaluateSearch,
   holdoutMetrics,
-  MIN_HOLDOUT_TRADES,
+  holdoutShortfalls,
+  median,
   MIN_TRADES,
   MIN_TRADES_PER_YEAR,
   MIN_VALIDATION_TRADES,
@@ -42,8 +43,10 @@ import {
   createContext,
   evaluateCandidate,
   fitnessOf,
+  rankFitness,
   sampleCurve,
   scoreAssets,
+  scoreNeighbours,
   tradesPerYear,
   type Asset,
   type AssetScore,
@@ -51,6 +54,7 @@ import {
   type EvalContext,
   type EvaluatorBatch,
   type EvaluatorReply,
+  type NeighbourScore,
   type PortLike,
 } from '../engine/evaluation';
 import {
@@ -66,7 +70,7 @@ import {
   type GenomeLimits,
   type Rng,
 } from '../engine/genome';
-import { expectedMaxSharpe, RunningStats, sharpeConfidenceInterval } from '../lib/stats';
+import { expectedMaxSharpe, RunningStats } from '../lib/stats';
 import {
   DEFAULT_MAX_STAGNATION,
   LEADERBOARD_SIZE,
@@ -206,6 +210,8 @@ interface Entry {
   /** Sampled equity returns, used to detect behavioural clones. */
   returns: Float32Array;
   scores: AssetScore[];
+  /** One-grid-step parameter neighbours, kept so the neighbourhood cap is re-applied whenever the hurdle moves. */
+  neighbours: NeighbourScore[];
 }
 
 /** A run's state. The scoring context (`assets` = the universe, primary first) is shared with the evaluator pool. */
@@ -373,8 +379,10 @@ function rescoreBoard(s: Session): void {
   s.hurdleVariance = s.trials.variance;
   s.hurdle = expectedMaxSharpe(s.hurdleTrials, s.hurdleVariance);
   for (const entry of s.board) {
-    const { fitness, dsr } = fitnessOf(s, entry.result.genome, entry.scores);
+    const { fitness, point, neighbourMedian, dsr } = rankFitness(s, entry.result.genome, entry.scores, entry.neighbours);
     entry.result.fitness = fitness;
+    entry.result.pointFitness = point;
+    entry.result.neighbourMedian = neighbourMedian;
     entry.result.dsr = dsr;
   }
   s.board.sort((a, b) => b.result.fitness - a.result.fitness);
@@ -481,13 +489,7 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
 
   const notes: string[] = [];
   if (result.dsr < 0.95) notes.push(`Deflated Sharpe ${pct(result.dsr)} is under 95%: not distinguishable from the luckiest of the strategies tried.`);
-  const [ciLow] = sharpeConfidenceInterval(holdout, s.assets[0].periodsPerYear);
-  if (!(ciLow > 0)) notes.push(`The holdout Sharpe's 95% confidence interval reaches ${fixed(ciLow)}: it includes zero.`);
-  const bench = finalBenchmark(s).holdout;
-  if (bench !== null && !(holdout.sharpe > bench.sharpe)) {
-    notes.push(`Holdout Sharpe ${fixed(holdout.sharpe)} does not beat Buy & Hold's ${fixed(bench.sharpe)}.`);
-  }
-  if (holdout.trades < MIN_HOLDOUT_TRADES) notes.push(`Only ${holdout.trades} holdout trades (at least ${MIN_HOLDOUT_TRADES} needed).`);
+  notes.push(...holdoutShortfalls(holdout, finalBenchmark(s).holdout, s.assets[0].periodsPerYear));
   if (report.sensitivity.fragile) notes.push('A ±20% change of one parameter costs more than half of the return.');
   if (!report.topTrades.profitable) notes.push(`Unprofitable without its ${report.topTrades.removed} best trades.`);
   if (report.crossAsset !== null && report.crossAsset.share < 2 / 3 - 1e-9) {
@@ -517,7 +519,7 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     const asset = s.assets[a];
     // Train / validation figures stay exactly what the search ranked on: a backtest that ends at
     // the holdout boundary (any open trade is closed there, with costs) ...
-    const m = evaluateSearch(asset.ind, base.genome, s.settings, asset.ws, asset.split, asset.periodsPerYear);
+    const m = evaluateSearch(asset.ind, base.genome, s.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
     // ... and only the holdout comes from a backtest over the whole history.
     runBacktest(asset.ind, base.genome, s.settings, asset.ws);
     assets[a] = {
@@ -533,6 +535,8 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     search: primary.search,
     train: primary.train,
     validation: primary.validation,
+    folds: primary.folds,
+    regimes: primary.regimes,
     holdout: primary.holdout,
     alpha: primary.search.roi - s.assets[0].benchmark.search.roi,
     equity,
@@ -762,7 +766,8 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
 
   /** Insert an evaluated candidate into the leaderboard if it qualifies. Returns true when the top fitness improved. */
   const consider = (genome: StrategyGenome, evaluated: CandidateResult): boolean => {
-    const { scores, complete, fitness, dsr } = evaluated;
+    const { scores, complete, dsr, pointFitness } = evaluated;
+    let { fitness, neighbours } = evaluated;
     const primaryMetrics = scores[0].metrics;
     // Every evaluated strategy is a trial, whether or not it makes the leaderboard.
     s.trials.push(primaryMetrics.validation.sharpeRaw);
@@ -771,10 +776,18 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       if (isUndersampled(scores)) s.undersampled++;
       return false;
     }
+    if (board.length >= LEADERBOARD_SIZE && pointFitness <= board[board.length - 1].result.fitness) return false;
+    if (neighbours === null) {
+      // Rare: the candidate did not beat the round's frozen floor, but the board has since shrunk.
+      // Nothing enters the board without its neighbourhood cap.
+      neighbours = scoreNeighbours(s, genome);
+      fitness = rankFitness(s, genome, scores, neighbours).fitness;
+    }
     const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return false;
 
     const { search, validation } = primaryMetrics;
+    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.genome, nb.scores).fitness);
     const fingerprint = `${search.trades}|${search.netPnl.toFixed(2)}|${search.maxDrawdown.toFixed(4)}|${validation.netPnl.toFixed(2)}`;
     if (board.some((e) => e.fingerprint === fingerprint)) return false;
 
@@ -811,15 +824,21 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       fingerprint,
       returns,
       scores,
+      neighbours,
       result: {
         id: `S-${iteration}`,
         genome,
         fitness,
+        pointFitness,
+        neighbourMedian: neighbourValues.length > 0 ? median(neighbourValues) : null,
+        neighbourCount: neighbourValues.length,
         dsr,
         params: countParameters(genome, limits),
         search: primaryMetrics.search,
         train: primaryMetrics.train,
         validation: primaryMetrics.validation,
+        folds: primaryMetrics.folds,
+        regimes: primaryMetrics.regimes,
         holdout: null,
         alpha: search.roi - primary.benchmark.search.roi,
         equity,
