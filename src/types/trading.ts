@@ -259,6 +259,14 @@ export interface BacktestSettings {
   sizing: SizingSetting;
   /** Perpetual-funding cost charged on the notional of every open position per bar, in percent (0 = off). */
   fundingPctPerBar: number;
+  /**
+   * Volatility-scaled slippage. Every fill slips by the larger of `slippagePct` and this multiple of
+   * ATR(14) as a percentage of price, read on the last CLOSED candle so it is known before the fill.
+   * Absent or 0 = fixed slippage only.
+   */
+  slippageAtrMult?: number;
+  /** Borrow / financing cost charged on the notional of SHORT positions only, in percent per bar. Absent = 0. */
+  borrowPctPerBar?: number;
 }
 
 export interface PerformanceMetrics {
@@ -369,7 +377,10 @@ export interface StrategyResult {
   assets: AssetResult[];
   /** Filled in when the run ends, or on demand through an `analyze` request. */
   robustness: RobustnessReport | null;
+  /** Only ever set for the one strategy whose holdout was locked and revealed. */
   verdict: Verdict | null;
+  /** Why the locked strategy is not Robust (empty when it is). Absent until the holdout is revealed. */
+  verdictNotes?: string[];
 }
 
 export interface BenchmarkResult {
@@ -445,13 +456,27 @@ export type WorkerRequest =
   /** An evaluator worker died: finish the run on the optimiser thread. */
   | { type: 'pool-failed' }
   /** Robustness analysis of one strategy. `universe` supplies extra assets for the cross-asset test. */
-  | { type: 'analyze'; strategyId: string; genome: StrategyGenome; universe?: NamedDataset[] };
+  | { type: 'analyze'; strategyId: string; genome: StrategyGenome; universe?: NamedDataset[] }
+  /**
+   * Lock ONE strategy of the final leaderboard as the run's answer and reveal its holdout.
+   * Allowed once per run, only after the search has ended. `priorReveals` is how often this holdout
+   * period had already been revealed (from the persistent holdout log); `simulated` marks fallback data.
+   * Both stop the strategy from being rated Robust.
+   */
+  | { type: 'lock'; strategyId: string; priorReveals: number; simulated: boolean };
 
 export interface ProgressSnapshot {
   iteration: number;
   stagnation: number;
   bestFitness: number | null;
-  bestRoi: number | null;
+  /** Highest deflated Sharpe ratio on the leaderboard (0–1). */
+  bestDsr: number | null;
+  /** Annualised validation Sharpe of the strategy with the highest deflated Sharpe. */
+  bestDsrSharpe: number | null;
+  /** Annualised validation Sharpe the luckiest of the strategies tried so far is expected to reach by chance. */
+  hurdleSharpe: number;
+  /** Candidates disqualified by the hard minimum-trade gates. */
+  undersampled: number;
   itersPerSec: number;
   elapsedMs: number;
 }
@@ -462,9 +487,12 @@ export type WorkerResponse =
   | { type: 'ready'; benchmark: BenchmarkResult; axis: ChartAxis; barsPerYear: number }
   | ({ type: 'progress' } & ProgressSnapshot)
   | { type: 'leaderboard'; iteration: number; strategies: StrategyResult[] }
-  /** The run has ended: the holdout is revealed for the final leaderboard and the benchmark. */
+  /** The run has ended. The holdout stays sealed until the user locks one strategy (see `lock`). */
   | ({ type: 'done'; reason: StopReason; strategies: StrategyResult[]; benchmark: BenchmarkResult } & ProgressSnapshot)
+  /** `verdict` is null for every strategy except the locked one. */
   | { type: 'analysis'; strategyId: string; report: RobustnessReport; verdict: Verdict | null }
+  /** The locked strategy with its holdout, robustness report and verdict, plus the Buy & Hold holdout. */
+  | { type: 'locked'; strategy: StrategyResult; benchmark: BenchmarkResult }
   | { type: 'error'; message: string };
 
 export type EngineStatus = 'idle' | 'loading' | 'optimizing' | 'stopped' | 'converged' | 'error';

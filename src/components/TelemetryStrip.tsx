@@ -1,20 +1,25 @@
 /**
  * Live telemetry: engine status, iteration counter, stagnation progress
- * (X / N iterations without improvement), best strategy vs. Buy & Hold
- * and the market-data source.
+ * (X / N iterations without improvement), the best deflated Sharpe ratio
+ * against the luck hurdle, and the market-data source.
+ *
+ * The headline is deliberately NOT a return figure: in-sample returns of the
+ * best of thousands of tried strategies are inflated by selection, while the
+ * deflated Sharpe accounts for how many were tried.
  */
 
 import { CircleCheck, CircleDot, Database, Loader2, OctagonX, TriangleAlert } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { RunContext } from '../lib/config';
-import { fmtDate, fmtDuration, fmtInt, fmtPct, toneClass } from '../lib/format';
+import { fmtDate, fmtDuration, fmtInt, fmtNum, fmtPct } from '../lib/format';
 import { type EngineStatus, type ProgressSnapshot } from '../types/trading';
 import { cx, Panel } from './ui';
 
 interface TelemetryStripProps {
   status: EngineStatus;
   telemetry: ProgressSnapshot;
-  benchmarkRoi: number | null;
+  /** Buy & Hold Sharpe over the validation segment, for comparison. */
+  benchmarkSharpe: number | null;
   context: RunContext | null;
   /** Stagnation limit of the current (or next) run. */
   maxStagnation: number;
@@ -67,13 +72,14 @@ function Tile({ label, children, className }: { label: string; children: ReactNo
   );
 }
 
-export default function TelemetryStrip({ status, telemetry, benchmarkRoi, context, maxStagnation }: TelemetryStripProps): JSX.Element {
+export default function TelemetryStrip({ status, telemetry, benchmarkSharpe, context, maxStagnation }: TelemetryStripProps): JSX.Element {
   const badge = STATUS[status];
   const badgeLabel = status === 'converged' ? `Converged at ${fmtInt(maxStagnation)}` : badge.label;
   const stagnation = Math.min(telemetry.stagnation, maxStagnation);
   const stagnationPct = (stagnation / maxStagnation) * 100;
   const hasRun = telemetry.iteration > 0;
-  const alpha = telemetry.bestRoi !== null && benchmarkRoi !== null ? telemetry.bestRoi - benchmarkRoi : null;
+  const dsr = telemetry.bestDsr;
+  const dsrTone = dsr === null ? 'text-ink-3' : dsr >= 0.95 ? 'text-up' : dsr >= 0.5 ? 'text-warn' : 'text-ink';
 
   return (
     <Panel className="grid grid-cols-1 divide-y divide-line sm:grid-cols-2 sm:divide-y-0 xl:grid-cols-[1.05fr_0.8fr_1.5fr_1.45fr_1.4fr] xl:divide-x">
@@ -127,25 +133,28 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
         </div>
       </Tile>
 
-      <Tile label="Best strategy ROI vs. Buy & Hold ROI">
+      <Tile label="Best deflated Sharpe">
         <div className="flex items-baseline gap-3">
-          <div>
-            <span className={cx('num text-2xl font-semibold leading-7', toneClass(telemetry.bestRoi))}>
-              {fmtPct(telemetry.bestRoi, true)}
-            </span>
-          </div>
-          <span className="text-xs text-ink-3">vs</span>
-          <div>
-            <span className="num text-lg font-medium leading-7 text-ink-2">{fmtPct(benchmarkRoi, true)}</span>
-          </div>
+          <span className={cx('num text-2xl font-semibold leading-7', dsrTone)}>{dsr === null ? '–' : fmtPct(dsr * 100, false, 0)}</span>
+          <span className="text-xs text-ink-3">{dsr === null ? '' : dsr >= 0.95 ? 'distinguishable from luck' : 'not distinguishable from luck'}</span>
         </div>
-        <div className="num mt-1 text-xs text-ink-3">
-          {alpha === null ? (
-            'Alpha appears once a strategy is found'
+        <div className="num mt-1 truncate text-xs text-ink-3">
+          {telemetry.bestDsrSharpe === null ? (
+            hasRun && telemetry.undersampled > 0 ? (
+              `${fmtInt(telemetry.undersampled)} candidates rejected for too few trades`
+            ) : (
+              'Appears once a strategy clears the trade gates'
+            )
           ) : (
             <>
-              Alpha <span className={cx('font-medium', toneClass(alpha))}>{fmtPct(alpha, true)}</span> · best fitness{' '}
-              <span className="text-ink-2">{telemetry.bestFitness === null ? '–' : telemetry.bestFitness.toFixed(2)}</span>
+              Validation Sharpe <span className="text-ink-2">{fmtNum(telemetry.bestDsrSharpe)}</span> vs luck hurdle{' '}
+              <span className="text-ink-2">{fmtNum(telemetry.hurdleSharpe)}</span>
+              {benchmarkSharpe !== null && (
+                <>
+                  {' '}
+                  · B&amp;H <span className="text-ink-2">{fmtNum(benchmarkSharpe)}</span>
+                </>
+              )}
             </>
           )}
         </div>

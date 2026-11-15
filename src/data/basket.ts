@@ -66,6 +66,9 @@ function toTyped(series: CandleSeries): OHLCV {
   };
 }
 
+/** Trailing window, in bars, over which each basket leg's volume is normalised. */
+export const VOLUME_NORM_WINDOW = 100;
+
 /**
  * Build the tradable dataset.
  *
@@ -76,12 +79,27 @@ function toTyped(series: CandleSeries): OHLCV {
  * combined into a buy-and-hold index that starts at 100:
  *
  *     unitsᵢ   = weightᵢ × 100 / openᵢ[0]
- *     basket X = Σ unitsᵢ × Xᵢ        for X ∈ {open, high, low, close}
+ *     basket X = Σ unitsᵢ × Xᵢ        for X ∈ {open, close}
  *
  * Weights therefore describe the allocation at inception and drift with
- * prices afterwards, exactly like a real buy-and-hold portfolio. The basket
- * high/low are the sums of component highs/lows (a conservative envelope),
- * and volume is the weight-averaged relative volume of the components.
+ * prices afterwards, exactly like a real buy-and-hold portfolio.
+ *
+ * High / low. Summing component highs (or lows) would assume every leg peaks at
+ * the same instant – a price the basket almost never trades at, which lets
+ * take-profits fill on prices that never existed. Instead the basket range is
+ * its body (open ↔ close, which the basket certainly traded) widened by the
+ * root-sum-square of the legs' wicks:
+ *
+ *     high = max(open, close) + √Σ (unitsᵢ × (highᵢ − max(openᵢ, closeᵢ)))²
+ *     low  = min(open, close) − √Σ (unitsᵢ × (min(openᵢ, closeᵢ) − lowᵢ))²
+ *
+ * This always lies inside the summed envelope, never inside the body, equals the
+ * real candle for a single leg, and keeps the low above Σ unitsᵢ × lowᵢ > 0.
+ *
+ * Volume is the weight-averaged RELATIVE volume of the components. Each leg's
+ * volume is divided by its own trailing mean over the last `VOLUME_NORM_WINDOW`
+ * bars (bar i only uses bars ≤ i), so no later volume – least of all the
+ * holdout's – leaks into earlier candles.
  */
 export function buildDataset(
   seriesBySymbol: Readonly<Record<string, CandleSeries>>,
@@ -130,6 +148,9 @@ export function buildDataset(
     v: new Float64Array(n),
   };
   const units: number[] = [];
+  // Squared dollar wicks of the legs, summed per bar (see the high / low note above).
+  const upperWick = new Float64Array(n);
+  const lowerWick = new Float64Array(n);
 
   legs.forEach((leg, legIndex) => {
     const { series, component } = leg;
@@ -140,19 +161,36 @@ export function buildDataset(
     const unit = (component.weight * 100) / firstOpen;
     units.push(unit);
 
-    let volumeSum = 0;
-    for (const row of rows) volumeSum += series.v[row];
-    const meanVolume = volumeSum / n;
-
+    // Trailing (causal) mean volume of this leg over the shared bars.
+    let windowSum = 0;
     for (let i = 0; i < n; i++) {
       const row = rows[i];
-      data.o[i] += unit * series.o[row];
-      data.h[i] += unit * series.h[row];
-      data.l[i] += unit * series.l[row];
-      data.c[i] += unit * series.c[row];
-      if (meanVolume > 0) data.v[i] += component.weight * (series.v[row] / meanVolume) * 1_000_000;
+      const o = series.o[row];
+      const c = series.c[row];
+      data.o[i] += unit * o;
+      data.c[i] += unit * c;
+      const up = unit * (series.h[row] - Math.max(o, c));
+      const down = unit * (Math.min(o, c) - series.l[row]);
+      upperWick[i] += up > 0 ? up * up : 0;
+      lowerWick[i] += down > 0 ? down * down : 0;
+
+      const volume = series.v[row] > 0 ? series.v[row] : 0;
+      windowSum += volume;
+      if (i >= VOLUME_NORM_WINDOW) {
+        const old = series.v[rows[i - VOLUME_NORM_WINDOW]];
+        windowSum -= old > 0 ? old : 0;
+      }
+      const mean = windowSum / Math.min(i + 1, VOLUME_NORM_WINDOW);
+      if (mean > 0) data.v[i] += component.weight * (volume / mean) * 1_000_000;
     }
   });
+
+  for (let i = 0; i < n; i++) {
+    const o = data.o[i];
+    const c = data.c[i];
+    data.h[i] = Math.max(o, c) + Math.sqrt(upperWick[i]);
+    data.l[i] = Math.min(o, c) - Math.sqrt(lowerWick[i]);
+  }
 
   return { label, components: [...components], units, data, sources, isBasket: true };
 }

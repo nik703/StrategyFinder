@@ -1,6 +1,7 @@
 /** UI-level run configuration and the immutable context captured when a run starts. */
 
 import { normalizeWeights, TICKER_PATTERN } from '../data/basket';
+import type { HoldoutWindow } from './holdoutLog';
 import {
   DEFAULT_CRYPTO_UNIVERSE,
   DEFAULT_MAX_STAGNATION,
@@ -34,7 +35,10 @@ export interface RunConfig {
   range: HistoryRange;
   capital: number;
   feePct: number;
+  /** Fixed slippage floor per fill, in percent. */
   slippagePct: number;
+  /** Volatility-scaled slippage: each fill slips at least this multiple of ATR(14) as a % of price. */
+  slippageAtrMult: number;
   tradeMode: TradeMode;
   /** Stop after this many consecutive iterations without improvement. */
   maxStagnation: number;
@@ -42,8 +46,13 @@ export interface RunConfig {
   sizingMode: 'fixed' | 'compound' | 'full';
   /** Share of capital lost when a trade is stopped out, in percent. */
   riskPct: number;
-  /** Perpetual funding charged on open positions, in percent per 8 hours (0 = off). */
+  /**
+   * Perpetual funding charged on every open position, in percent per 8 hours (0 = off).
+   * Applies to crypto in Long/Short mode, where shorting means trading a perpetual.
+   */
   fundingPct8h: number;
+  /** Borrow fee charged on short stock / ETF positions, in percent per year (Long/Short mode only). */
+  borrowPctYear: number;
   /** Score every strategy on a whole universe of assets instead of one. */
   robustUniverse: boolean;
   /** Comma-separated tickers of the universe. */
@@ -51,7 +60,12 @@ export interface RunConfig {
 }
 
 export const MAX_UNIVERSE_ASSETS = 8;
+/** Typical perpetual funding rate (≈ 11% a year). */
 export const DEFAULT_FUNDING_PCT_8H = 0.01;
+/** Retail borrow cost of shorting stocks and ETFs, in percent per year. */
+export const DEFAULT_BORROW_PCT_YEAR = 2;
+/** Default volatility-scaled slippage: 0.03 × ATR% (≈ 0.09% on daily BTC, ≈ 0.18% on daily DOGE). */
+export const DEFAULT_SLIPPAGE_ATR_MULT = 0.03;
 
 export const isCrypto = (symbol: string): boolean => /-(USD|USDT|USDC)$/.test(symbol.trim().toUpperCase());
 
@@ -69,13 +83,17 @@ export const DEFAULT_CONFIG: RunConfig = {
   interval: '1d',
   range: '5y',
   capital: 10_000,
+  // 0.1% matches crypto taker fees and is conservative for commission-free stock brokers.
   feePct: 0.1,
   slippagePct: 0.05,
+  slippageAtrMult: DEFAULT_SLIPPAGE_ATR_MULT,
   tradeMode: 'long-only',
   maxStagnation: DEFAULT_MAX_STAGNATION,
   sizingMode: 'fixed',
   riskPct: 2,
-  fundingPct8h: 0,
+  // Financing is on by default; it only applies to Long/Short runs (Long-Only is treated as spot).
+  fundingPct8h: DEFAULT_FUNDING_PCT_8H,
+  borrowPctYear: DEFAULT_BORROW_PCT_YEAR,
   // On by default for crypto (the default ticker is BTC-USD).
   robustUniverse: true,
   universe: DEFAULT_CRYPTO_UNIVERSE.join(', '),
@@ -127,19 +145,44 @@ export function resolveAssets(config: RunConfig): ResolvedAssets {
   return { ok: true, components };
 }
 
+/** True when every traded instrument is a crypto pair (a crypto basket counts; a mixed basket does not). */
+export function tradesCrypto(config: RunConfig): boolean {
+  const symbols =
+    config.assetMode === 'single' ? [config.symbol] : config.basket.filter((row) => row.symbol.trim() !== '' && row.weight > 0).map((row) => row.symbol);
+  return symbols.length > 0 && symbols.every(isCrypto);
+}
+
+/** How Long/Short positions are financed for this configuration. */
+export type Financing = 'none' | 'funding' | 'borrow';
+
+/**
+ * Long-Only runs are treated as spot positions: no financing. Long/Short crypto is traded as a
+ * perpetual, so every position pays funding; Long/Short stocks pay a borrow fee on the shorts.
+ */
+export function financingFor(config: RunConfig): Financing {
+  if (config.tradeMode !== 'long-short') return 'none';
+  return tradesCrypto(config) ? 'funding' : 'borrow';
+}
+
+const MS_PER_YEAR = 365.25 * 86_400_000;
+
 export function settingsFrom(config: RunConfig): BacktestSettings {
+  const financing = financingFor(config);
+  const barMs = INTERVAL_MS[config.interval];
   return {
     initialCapital: config.capital,
     feePct: config.feePct,
     slippagePct: config.slippagePct,
+    slippageAtrMult: config.slippageAtrMult,
     tradeMode: config.tradeMode,
     sizing: {
       mode: config.sizingMode === 'full' ? 'full' : 'risk',
       riskPct: config.riskPct,
       compounding: config.sizingMode !== 'fixed',
     },
-    // The setting is quoted per 8 hours; the engine charges it per candle.
-    fundingPctPerBar: config.fundingPct8h * (INTERVAL_MS[config.interval] / (8 * 3_600_000)),
+    // Quoted per 8 hours (funding) and per year (borrow); the engine charges both per candle.
+    fundingPctPerBar: financing === 'funding' ? config.fundingPct8h * (barMs / (8 * 3_600_000)) : 0,
+    borrowPctPerBar: financing === 'borrow' ? config.borrowPctYear * (barMs / MS_PER_YEAR) : 0,
   };
 }
 
@@ -155,10 +198,12 @@ export interface RunContext {
   universe: string[];
   /** Instrument and venue actually traded, e.g. "XRPUSDT on Binance". */
   venue: string;
-  /** Identifies this dataset in the holdout log. */
-  fingerprint: string;
-  /** How many times this dataset's holdout had been revealed before this run. */
-  priorHoldoutViews: number;
+  /** Symbols and date range of this run's holdout, as recorded in the holdout log. */
+  holdoutWindow: HoldoutWindow;
+  /** Earlier reveals whose holdout overlaps this one (same symbols, overlapping dates). */
+  priorHoldoutReveals: number;
+  /** When the most recent of those reveals happened (ms), or null. */
+  lastHoldoutReveal: number | null;
   components: BasketComponent[];
   units: number[];
   isBasket: boolean;

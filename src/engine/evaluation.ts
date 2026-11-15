@@ -168,6 +168,23 @@ export function scoreAssets(ctx: EvalContext, genome: StrategyGenome, floor = -I
   return { scores, complete: true };
 }
 
+/** Average trades per year that asset `a` opened over its search period. */
+export function tradesPerYear(ctx: EvalContext, a: number, metrics: SearchMetrics): number {
+  const asset = ctx.assets[a];
+  const years = asset.split.holdoutStart / asset.periodsPerYear;
+  return years > 0 ? metrics.search.trades / years : 0;
+}
+
+/** Lowest trades-per-year rate over the scored assets (Infinity when none is scored). */
+function minTradesPerYear(ctx: EvalContext, scores: AssetScore[]): number {
+  let min = Infinity;
+  scores.forEach((score, a) => {
+    const rate = tradesPerYear(ctx, a, score.metrics);
+    if (rate < min) min = rate;
+  });
+  return min;
+}
+
 /** Highest fitness a partly scored strategy can still reach if every remaining asset turns out perfect. */
 function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetScore[]): number {
   const missing = ctx.assets.length - scores.length;
@@ -177,10 +194,13 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
     return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
   });
   for (let k = 0; k < missing; k++) assetScores.push(OPTIMISTIC);
+  // The primary asset is always scored first, so its trade counts are exact; unscored assets
+  // cannot lower the minimum trade rate below what the scored ones already show.
   return combineFitness({
     assetScores,
-    searchTrades: OPTIMISTIC,
-    validationTrades: OPTIMISTIC,
+    primaryTrades: scores[0].metrics.search.trades,
+    primaryValidationTrades: scores[0].metrics.validation.trades,
+    minTradesPerYear: minTradesPerYear(ctx, scores),
     profitableShare: profitable / ctx.assets.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
@@ -190,19 +210,16 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
 
 /** Fitness of a fully scored genome against the current selection-bias hurdle. */
 export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: AssetScore[]): { fitness: number; dsr: number } {
-  let searchTrades = 0;
-  let validationTrades = 0;
   let profitable = 0;
   const assetScores = scores.map((score) => {
-    searchTrades += score.metrics.search.trades;
-    validationTrades += score.metrics.validation.trades;
     if (score.metrics.validation.roi > 0) profitable++;
     return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
   });
   const fitness = combineFitness({
     assetScores,
-    searchTrades,
-    validationTrades,
+    primaryTrades: scores[0].metrics.search.trades,
+    primaryValidationTrades: scores[0].metrics.validation.trades,
+    minTradesPerYear: minTradesPerYear(ctx, scores),
     profitableShare: profitable / scores.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),

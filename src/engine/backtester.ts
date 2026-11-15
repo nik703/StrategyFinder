@@ -5,7 +5,11 @@
  * ---------------
  * • Signals are evaluated on the CLOSE of candle `t` and executed at the OPEN of
  *   candle `t + 1`. Nothing in a decision can see data it would not have had live.
- * • Every fill pays the configured fee and suffers adverse slippage.
+ * • Every fill pays the configured fee and suffers adverse slippage. Slippage is
+ *   volatility-scaled: the larger of the fixed rate and `slippageAtrMult` × ATR(14)
+ *   as a % of price, read on the last closed candle so it is known at the fill.
+ * • Open positions pay perpetual funding (both sides) and short positions pay a
+ *   borrow fee, per candle, when those run settings are non-zero.
  * • Stop-loss / take-profit orders are simulated intrabar from the entry candle
  *   onwards. A gap through the level fills at the open. When a candle touches
  *   both the stop and the target, the stop is assumed to fill first.
@@ -251,6 +255,9 @@ export class BacktestWorkspace {
  * Results are written into `ws`. Candles at or beyond `bars` are never read, so a
  * run limited to the search period cannot see the holdout.
  */
+/** ATR lookback used to scale slippage with volatility. */
+export const SLIPPAGE_ATR_PERIOD = 14;
+
 export function runBacktest(
   ind: IndicatorCache,
   genome: StrategyGenome,
@@ -263,6 +270,19 @@ export function runBacktest(
   const fee = settings.feePct / 100;
   const slip = settings.slippagePct / 100;
   const funding = settings.fundingPctPerBar / 100;
+  const borrow = (settings.borrowPctPerBar ?? 0) / 100;
+  const slipAtrMult = settings.slippageAtrMult ?? 0;
+  const slipAtrPct = slipAtrMult > 0 ? ind.atrPercent(SLIPPAGE_ATR_PERIOD) : null;
+  /**
+   * Adverse slippage (as a fraction) of a fill during candle `i`: the larger of the fixed rate and
+   * k × ATR% of candle `i − 1`, the last candle that had closed. During the ATR warm-up (NaN) the
+   * fixed rate applies.
+   */
+  const slipAt = (i: number): number => {
+    if (slipAtrPct === null) return slip;
+    const scaled = (slipAtrMult * slipAtrPct[i > 0 ? i - 1 : 0]) / 100;
+    return scaled > slip ? scaled : slip;
+  };
   const exit = genome.exit;
   const dynamic = exit.mode === 'dynamic';
   const allowShort = settings.tradeMode === 'long-short' && genome.shortEntry !== null;
@@ -348,7 +368,8 @@ export function runBacktest(
             ? (allowShort && goShort[p] === 1) || (hasLongExit && exitLong[p] === 1)
             : goLong[p] === 1 || (hasShortExit && exitShort[p] === 1));
         if (leave) {
-          const px = pos === 1 ? o * (1 - slip) : o * (1 + slip);
+          const sl = slipAt(i);
+          const px = pos === 1 ? o * (1 - sl) : o * (1 + sl);
           equity = equityAfterEntryFee + pos * qty * (px - entryPrice) - qty * px * fee;
           tradeEntryBar[trades] = entryBar;
           tradeExitBar[trades] = i;
@@ -370,7 +391,8 @@ export function runBacktest(
           const a = atr !== null ? atr[p] : 0;
           // Dynamic exits need a valid ATR on the signal candle.
           if (!dynamic || (a === a && a > 0)) {
-            const px = dir === 1 ? o * (1 + slip) : o * (1 - slip);
+            const sl = slipAt(i);
+            const px = dir === 1 ? o * (1 + sl) : o * (1 - sl);
             const stopDist = dynamic ? slMult * a : px * slPct;
             // Notional to deploy: risk-based or everything, never more than current equity.
             let notional = equity;
@@ -406,14 +428,14 @@ export function runBacktest(
       if (pos === 1) {
         hitStop = l <= stop;
         const hitTarget = h >= target;
-        if (hitStop) px = (o < stop ? o : stop) * (1 - slip);
-        else if (hitTarget) px = (o > target ? o : target) * (1 - slip);
+        if (hitStop) px = (o < stop ? o : stop) * (1 - slipAt(i));
+        else if (hitTarget) px = (o > target ? o : target) * (1 - slipAt(i));
         if (hitStop && hitTarget) ambiguous = 1;
       } else {
         hitStop = h >= stop;
         const hitTarget = l <= target;
-        if (hitStop) px = (o > stop ? o : stop) * (1 + slip);
-        else if (hitTarget) px = (o < target ? o : target) * (1 + slip);
+        if (hitStop) px = (o > stop ? o : stop) * (1 + slipAt(i));
+        else if (hitTarget) px = (o < target ? o : target) * (1 + slipAt(i));
         if (hitStop && hitTarget) ambiguous = 1;
       }
 
@@ -449,8 +471,9 @@ export function runBacktest(
             }
           }
         }
-        /* -- 3e. Perpetual funding on the open notional -------------------- */
+        /* -- 3e. Perpetual funding on the open notional, borrow fee on shorts -- */
         if (funding > 0) equityAfterEntryFee -= qty * c * funding;
+        if (borrow > 0 && pos === -1) equityAfterEntryFee -= qty * c * borrow;
       }
     }
 
@@ -478,7 +501,9 @@ export function runBacktest(
   /* ---- 4. Liquidate whatever is still open at the final close ------------ */
   if (pos !== 0 && n > 0) {
     const last = n - 1;
-    const px = pos === 1 ? C[last] * (1 - slip) : C[last] * (1 + slip);
+    // Market order on the final close: candle `last` has closed, so its own ATR is known.
+    const sl = slipAt(last + 1);
+    const px = pos === 1 ? C[last] * (1 - sl) : C[last] * (1 + sl);
     equity = equityAfterEntryFee + pos * qty * (px - entryPrice) - qty * px * fee;
     if (equity < 0) equity = 0;
     tradeEntryBar[trades] = entryBar;
@@ -1047,11 +1072,23 @@ export function benchmarkSearch(
 /*  Composite fitness                                                         */
 /* -------------------------------------------------------------------------- */
 
-/** Trades (Train + Validation, summed over all assets) below which the low-activity penalty applies. */
+/*
+ * Hard sample-size gates. A strategy below ANY of them is disqualified outright (fitness UNFIT):
+ * a few dozen trades cannot tell skill from luck, and a soft penalty can be bought back with one
+ * lucky validation year. The counts are per asset – never pooled across the universe.
+ */
+/** Minimum trades the primary asset must open over train + validation. */
 export const MIN_TRADES = 100;
-/** Validation trades (summed over all assets) below which the low-activity penalty applies. */
-export const MIN_VALIDATION_TRADES = 25;
-/** Fitness assigned to strategies that never trade. */
+/**
+ * Minimum trades the primary asset must open in the validation segment. With 60 trades a mean
+ * trade return is significant (t ≥ 2) only from a per-trade Sharpe of about 0.26 upwards.
+ */
+export const MIN_VALIDATION_TRADES = 60;
+/** Minimum average number of trades per year of the search period, on EVERY asset scored. */
+export const MIN_TRADES_PER_YEAR = 25;
+/** Holdout trades below which a locked strategy cannot be rated Robust. */
+export const MIN_HOLDOUT_TRADES = 30;
+/** Fitness assigned to strategies that never trade or fail a minimum-trade gate. */
 export const UNFIT = -1000;
 
 const clampTo = (v: number, min: number, max: number): number => (v < min ? min : v > max ? max : v);
@@ -1103,10 +1140,12 @@ export function deflatedTerm(d: DeflatedSharpe): number {
 export interface FitnessInputs {
   /** One score per asset: `assetBaseScore + deflatedTerm`. */
   assetScores: number[];
-  /** Train + Validation trades summed over every asset. */
-  searchTrades: number;
-  /** Validation trades summed over every asset. */
-  validationTrades: number;
+  /** Train + Validation trades of the primary asset. */
+  primaryTrades: number;
+  /** Validation trades of the primary asset. */
+  primaryValidationTrades: number;
+  /** Lowest search-period trades-per-year rate across every asset scored. */
+  minTradesPerYear: number;
   /** Share of assets that were profitable on validation (0–1). */
   profitableShare: number;
   /** Number of tunable parameters. */
@@ -1120,17 +1159,17 @@ export interface FitnessInputs {
 /**
  * Composite fitness used to rank strategies (higher is better).
  *
+ *   UNFIT (disqualified) below 100 trades or 60 validation trades on the primary asset, or
+ *   below 25 trades per year on any asset – see the gates above; otherwise
+ *
  *   median of the per-asset scores (a single asset when the Robust universe is off)
- *   − up to 6.0 for fewer than 100 trades, up to 2.0 for fewer than 25 validation trades
  *   − 1.0 when fewer than 2/3 of the universe is profitable on validation
  *   − 0.15 for every tunable parameter above 4
  *   − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
  */
 export function combineFitness(f: FitnessInputs): number {
-  if (f.searchTrades === 0 || f.assetScores.length === 0) return UNFIT;
+  if (f.assetScores.length === 0 || !passesTradeGates(f)) return UNFIT;
   let score = median(f.assetScores);
-  if (f.searchTrades < MIN_TRADES) score -= 6 * (1 - f.searchTrades / MIN_TRADES);
-  if (f.validationTrades < MIN_VALIDATION_TRADES) score -= 2 * (1 - f.validationTrades / MIN_VALIDATION_TRADES);
   if (f.assetScores.length > 1 && f.profitableShare < 2 / 3 - 1e-9) score -= 1;
   score -= 0.15 * Math.max(0, f.params - FREE_PARAMETERS);
   if (f.rewardToRisk !== null && f.rewardToRisk < 1) {
@@ -1138,6 +1177,13 @@ export function combineFitness(f: FitnessInputs): number {
     if (f.validationWinRate < breakeven + 10) score -= 0.75;
   }
   return Number.isFinite(score) ? score : UNFIT;
+}
+
+/** True when a strategy clears every hard minimum-trade gate. */
+export function passesTradeGates(f: Pick<FitnessInputs, 'primaryTrades' | 'primaryValidationTrades' | 'minTradesPerYear'>): boolean {
+  return (
+    f.primaryTrades >= MIN_TRADES && f.primaryValidationTrades >= MIN_VALIDATION_TRADES && f.minTradesPerYear >= MIN_TRADES_PER_YEAR
+  );
 }
 
 export function median(values: readonly number[]): number {

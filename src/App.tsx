@@ -5,7 +5,7 @@
  * every indicator, backtest and optimisation step runs in `optimizer.worker.ts`.
  */
 
-import { Activity, Info, Pin, TriangleAlert, X } from 'lucide-react';
+import { Activity, Info, Lock, Pin, TriangleAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ControlBar from './components/ControlBar';
 import EquityChart, { BENCHMARK_COLOR, STRATEGY_COLOR } from './components/EquityChart';
@@ -29,8 +29,8 @@ import {
   type RunConfig,
   type RunContext,
 } from './lib/config';
-import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
-import { datasetFingerprint, holdoutViews, recordHoldoutView } from './lib/holdoutLog';
+import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
+import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
@@ -72,7 +72,10 @@ const EMPTY_TELEMETRY: ProgressSnapshot = {
   iteration: 0,
   stagnation: 0,
   bestFitness: null,
-  bestRoi: null,
+  bestDsr: null,
+  bestDsrSharpe: null,
+  hurdleSharpe: 0,
+  undersampled: 0,
   itersPerSec: 0,
   elapsedMs: 0,
 };
@@ -85,13 +88,14 @@ interface ComparisonRow {
   benchmark?: boolean;
 }
 
+/** Risk-adjusted figures first; raw returns after them. */
 const COMPARISON_ROWS: ComparisonRow[] = [
-  { label: 'Net PnL', format: (m) => fmtUsd(m.netPnl, true), tone: (m) => toneClass(m.netPnl) },
-  { label: 'ROI', format: (m) => fmtPct(m.roi, true), tone: (m) => toneClass(m.roi) },
-  { label: 'CAGR', format: (m) => fmtPct(m.cagr, true), tone: (m) => toneClass(m.cagr) },
-  { label: 'Max drawdown', format: (m) => fmtPct(m.maxDrawdown) },
   { label: 'Sharpe ratio', format: (m) => fmtNum(m.sharpe) },
   { label: 'Sortino ratio', format: (m) => fmtNum(m.sortino) },
+  { label: 'Max drawdown', format: (m) => fmtPct(m.maxDrawdown) },
+  { label: 'CAGR', format: (m) => fmtPct(m.cagr, true), tone: (m) => toneClass(m.cagr) },
+  { label: 'ROI', format: (m) => fmtPct(m.roi, true), tone: (m) => toneClass(m.roi) },
+  { label: 'Net PnL', format: (m) => fmtUsd(m.netPnl, true), tone: (m) => toneClass(m.netPnl) },
   { label: 'Win rate', format: (m) => fmtPct(m.winRate), benchmark: false },
   { label: 'Profit factor', format: (m) => fmtNum(m.profitFactor), benchmark: false },
   { label: 'Trades', format: (m) => fmtInt(m.trades), benchmark: false },
@@ -117,6 +121,9 @@ export default function App(): JSX.Element {
   /** On-demand robustness reports, by strategy id. */
   const [analyses, setAnalyses] = useState<Record<string, Analysis>>({});
   const [pendingAnalyses, setPendingAnalyses] = useState<Record<string, boolean>>({});
+  /** The one strategy of this run whose holdout has been revealed. */
+  const [lockedId, setLockedId] = useState<string | null>(null);
+  const [lockPending, setLockPending] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
   /** Evaluator workers that score candidate strategies in parallel for the optimiser. */
@@ -197,17 +204,32 @@ export default function App(): JSX.Element {
           pendingProgress.current = null;
           finishedRef.current = true;
           setTelemetry(snapshot);
-          // The search is over: the final leaderboard and benchmark now include the holdout.
+          // The search is over. The holdout stays sealed until the user locks one strategy.
           setLeaderboard(strategies);
           setBenchmark(finalBenchmark);
           setPinned((current) => (current ? (strategies.find((s) => s.id === current.id) ?? null) : null));
           setAnalyses({});
           setPendingAnalyses({});
-          if (contextRef.current) recordHoldoutView(contextRef.current.fingerprint);
           setStatus(reason === 'converged' ? 'converged' : 'stopped');
           // The search is over, so the evaluator pool is no longer needed. The optimiser
           // worker stays alive to answer robustness-analysis requests.
           disposePool();
+          break;
+        }
+        case 'locked': {
+          const locked = message.strategy;
+          setLockPending(false);
+          setLockedId(locked.id);
+          setLeaderboard((current) => current.map((entry) => (entry.id === locked.id ? locked : entry)));
+          setPinned((current) => (current && current.id === locked.id ? locked : current));
+          setBenchmark(message.benchmark);
+          setAnalyses((current) => {
+            const next = { ...current };
+            delete next[locked.id];
+            return next;
+          });
+          // Persist the reveal: every later run whose holdout overlaps this one will be warned.
+          if (contextRef.current) recordHoldoutReveal(contextRef.current.holdoutWindow, locked.id);
           break;
         }
         case 'analysis':
@@ -217,6 +239,7 @@ export default function App(): JSX.Element {
         case 'error':
           setError(message.message);
           setPendingAnalyses({});
+          setLockPending(false);
           if (!finishedRef.current) {
             setStatus('error');
             disposeWorker();
@@ -258,6 +281,8 @@ export default function App(): JSX.Element {
     setModalOpen(false);
     setAnalyses({});
     setPendingAnalyses({});
+    setLockedId(null);
+    setLockPending(false);
 
     try {
       const tradedSymbols = assets.components.map((component) => component.symbol);
@@ -272,7 +297,9 @@ export default function App(): JSX.Element {
       for (const symbol of universe.symbols.slice(1)) {
         datasets.push({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data });
       }
-      const fingerprint = datasetFingerprint(symbols, config.interval, config.range, dataset.data.t[bars - 1]);
+      // Every symbol whose holdout this run can show, over the dates of the primary dataset's holdout.
+      const holdoutWindow = holdoutWindowFor(symbols, config.interval, dataset.data.t);
+      const earlier = priorReveals(holdoutWindow);
       const runContext: RunContext = {
         label: dataset.label,
         interval: config.interval,
@@ -281,8 +308,9 @@ export default function App(): JSX.Element {
         maxStagnation: config.maxStagnation,
         universe: datasets.map((entry) => entry.symbol),
         venue: venueLabel(tradedSymbols.map((symbol) => loaded.series[symbol])),
-        fingerprint,
-        priorHoldoutViews: holdoutViews(fingerprint),
+        holdoutWindow,
+        priorHoldoutReveals: earlier.reduce((sum, entry) => sum + entry.views, 0),
+        lastHoldoutReveal: earlier.length > 0 ? earlier[earlier.length - 1].revealedAt : null,
         components: dataset.components,
         units: dataset.units,
         isBasket: dataset.isBasket,
@@ -387,6 +415,25 @@ export default function App(): JSX.Element {
     worker.postMessage(request);
   }, []);
 
+  /** Lock ONE strategy of the finished run and reveal its holdout. The worker refuses a second lock. */
+  const lockStrategy = useCallback(
+    (strategy: StrategyResult) => {
+      const worker = workerRef.current;
+      const runContext = contextRef.current;
+      if (!worker || !runContext || lockedId !== null || lockPending) return;
+      if (status !== 'converged' && status !== 'stopped') return;
+      setLockPending(true);
+      const request: WorkerRequest = {
+        type: 'lock',
+        strategyId: strategy.id,
+        priorReveals: runContext.priorHoldoutReveals,
+        simulated: runContext.simulated,
+      };
+      worker.postMessage(request);
+    },
+    [lockedId, lockPending, status],
+  );
+
   const selectStrategy = useCallback((strategy: StrategyResult) => {
     setPinned(strategy);
     setModalOpen(true);
@@ -457,7 +504,7 @@ export default function App(): JSX.Element {
         maxStagnation={context?.maxStagnation ?? config.maxStagnation}
         status={status}
         telemetry={telemetry}
-        benchmarkRoi={benchmark?.search.roi ?? null}
+        benchmarkSharpe={benchmark?.validation.sharpe ?? null}
         context={context}
       />
 
@@ -482,15 +529,28 @@ export default function App(): JSX.Element {
         </div>
       )}
 
-      {context && context.priorHoldoutViews > 0 && (
+      {context && context.priorHoldoutReveals > 0 && (
         <div role="status" className="flex items-start gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2.5 text-sm text-warn">
           <Info size={16} className="mt-0.5 shrink-0" />
           <div className="min-w-0">
             <span className="font-semibold">
-              Holdout already viewed {context.priorHoldoutViews} time{context.priorHoldoutViews === 1 ? '' : 's'}. It is no longer unseen
-              data.
+              Holdout already spent: this period ({fmtDate(context.holdoutWindow.start)} → {fmtDate(context.holdoutWindow.end)}) overlaps{' '}
+              {context.priorHoldoutReveals} earlier reveal{context.priorHoldoutReveals === 1 ? '' : 's'}
+              {context.lastHoldoutReveal !== null ? `, the last on ${fmtDate(context.lastHoldoutReveal)}` : ''}.
             </span>{' '}
-            Every run on the same symbols, timeframe, range and end date reveals the same holdout, so each look makes it a weaker test.
+            It is no longer untouched data, so no strategy from this run can be rated Robust. Any timeframe, range or end date over the
+            same symbols and dates counts.
+          </div>
+        </div>
+      )}
+
+      {finished && leaderboard.length > 0 && lockedId === null && (
+        <div role="status" className="flex items-start gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2.5 text-sm text-ink-2">
+          <Lock size={16} className="mt-0.5 shrink-0 text-accent-strong" />
+          <div className="min-w-0">
+            <span className="font-semibold text-ink">The holdout is still sealed.</span> Choose ONE strategy, open its breakdown and press{' '}
+            <span className="font-semibold text-ink">Lock &amp; reveal holdout</span>. Only that strategy&apos;s holdout is revealed, once,
+            and the reveal is recorded for every later run on the same symbols and dates.
           </div>
         </div>
       )}
@@ -555,7 +615,7 @@ export default function App(): JSX.Element {
         <Panel className="flex flex-col">
           <div className="border-b border-line px-4 py-3">
             <h2 className="text-sm font-semibold text-ink">Strategy vs. Buy &amp; Hold</h2>
-            <p className="text-xs text-ink-3">Train + validation · same candles, capital and costs</p>
+            <p className="text-xs text-ink-3">Train + validation (in-sample) · risk-adjusted first · same candles, capital and costs</p>
           </div>
           {benchmark ? (
             <div className="flex min-h-0 flex-1 flex-col">
@@ -606,10 +666,14 @@ export default function App(): JSX.Element {
                       · {displayed.params} params ·{' '}
                       {displayed.holdout ? (
                         <>
-                          holdout ROI{' '}
-                          <span className={cx('font-semibold', toneClass(displayed.holdout.roi))}>{fmtPct(displayed.holdout.roi, true)}</span> vs{' '}
-                          {fmtPct(benchmark.holdout?.roi ?? null, true)}
+                          holdout Sharpe{' '}
+                          <span className="font-semibold text-ink">{fmtNum(displayed.holdout.sharpe)}</span> vs B&amp;H{' '}
+                          {fmtNum(benchmark.holdout?.sharpe ?? null)}
                         </>
+                      ) : lockedId !== null ? (
+                        `holdout sealed (spent on ${lockedId})`
+                      ) : finished ? (
+                        'holdout sealed – lock one strategy to reveal it'
                       ) : (
                         'holdout sealed until the run ends'
                       )}
@@ -635,7 +699,13 @@ export default function App(): JSX.Element {
         </Panel>
       </div>
 
-      <Leaderboard strategies={leaderboard} selectedId={displayed?.id ?? null} onSelect={selectStrategy} status={status} />
+      <Leaderboard
+        strategies={leaderboard}
+        selectedId={displayed?.id ?? null}
+        lockedId={lockedId}
+        onSelect={selectStrategy}
+        status={status}
+      />
 
       <footer className="pb-2 text-[11px] leading-relaxed text-ink-3">
         StrategyFinder is a research tool. Backtests are hypothetical, are fitted to past data and do not guarantee future results. Nothing
@@ -652,6 +722,10 @@ export default function App(): JSX.Element {
           barsPerYear={barsPerYear}
           analysis={analyses[displayed.id] ?? null}
           analysisPending={pendingAnalyses[displayed.id] === true}
+          finished={finished}
+          lockedId={lockedId}
+          lockPending={lockPending}
+          onLock={() => lockStrategy(displayed)}
           onClose={closeModal}
         />
       )}

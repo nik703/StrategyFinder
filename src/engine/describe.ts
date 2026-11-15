@@ -417,12 +417,24 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
       text: `Every open position pays ${trimPct(settings.fundingPctPerBar)}% of its notional per candle as perpetual funding.`,
     });
   }
+  const borrow = settings.borrowPctPerBar ?? 0;
+  if (borrow > 0 && settings.tradeMode === 'long-short') {
+    bullets.push({
+      title: 'Short borrow',
+      text: `Every open short pays a borrow fee of ${trimPct(borrow)}% of its notional per candle.`,
+    });
+  }
 
+  const atrMult = settings.slippageAtrMult ?? 0;
+  const slippage =
+    atrMult > 0
+      ? `slippage of ${trimPct(settings.slippagePct)}% or ${trimPct(atrMult)} × ATR(14) as a % of price, whichever is larger (volatility-scaled)`
+      : `${trimPct(settings.slippagePct)}% slippage`;
   bullets.push({
     title: 'Execution',
     text:
       `Signals are read on the close of candle t and filled at the open of candle t+1 (no look-ahead). ` +
-      `Every fill pays a ${trimPct(settings.feePct)}% fee plus ${trimPct(settings.slippagePct)}% slippage. ` +
+      `Every fill pays a ${trimPct(settings.feePct)}% fee plus ${slippage}. ` +
       `If a candle touches both the stop and the target, the stop is assumed to fill first.`,
   });
 

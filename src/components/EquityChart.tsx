@@ -104,7 +104,7 @@ const splitDividerPlugin: Plugin<'line', SplitOptions> = {
       ctx.font = `500 10px ${FONT}`;
       ctx.fillStyle = 'rgba(127, 138, 165, 0.95)';
       const room = chartArea.right - xHoldout - 12;
-      const lines = ['Sealed until', 'the run ends'];
+      const lines = ['Sealed until one', 'strategy is locked'];
       if (lines.every((line) => ctx.measureText(line).width <= room)) {
         lines.forEach((line, index) => ctx.fillText(line, (xHoldout + chartArea.right) / 2, chartArea.top + height / 2 - 8 + index * 14));
       }

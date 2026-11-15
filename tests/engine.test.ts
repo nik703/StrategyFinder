@@ -13,6 +13,8 @@ import {
   evaluateSearch,
   holdoutMetrics,
   MIN_TRADES,
+  MIN_TRADES_PER_YEAR,
+  MIN_VALIDATION_TRADES,
   runBacktest,
   searchMetrics,
   segmentMetrics,
@@ -573,14 +575,33 @@ describe('backtester', () => {
     expect(s.roi).toBeCloseTo((1.01 ** 100 - 1) * 100, 6);
   });
 
-  it('ranks by a fitness that penalises inactivity, complexity, poor payoff and deep drawdowns', () => {
-    const base = { assetScores: [2], searchTrades: 150, validationTrades: 40, profitableShare: 1, params: 4, rewardToRisk: 2, validationWinRate: 50 };
+  it('ranks by a fitness that disqualifies small samples and penalises complexity, poor payoff and deep drawdowns', () => {
+    const base = {
+      assetScores: [2],
+      primaryTrades: 150,
+      primaryValidationTrades: 70,
+      minTradesPerYear: 40,
+      profitableShare: 1,
+      params: 4,
+      rewardToRisk: 2,
+      validationWinRate: 50,
+    };
     const score = combineFitness(base);
     expect(score).toBe(2);
-    expect(combineFitness({ ...base, searchTrades: MIN_TRADES / 2 })).toBeCloseTo(score - 3, 9);
-    expect(combineFitness({ ...base, validationTrades: 5 })).toBeLessThan(score);
+    // Hard gates: one trade short of any minimum disqualifies, however good the rest looks.
+    expect(MIN_TRADES).toBe(100);
+    expect(MIN_VALIDATION_TRADES).toBe(60);
+    expect(MIN_TRADES_PER_YEAR).toBe(25);
+    expect(combineFitness({ ...base, primaryTrades: MIN_TRADES })).toBe(score);
+    expect(combineFitness({ ...base, primaryTrades: MIN_TRADES - 1 })).toBe(UNFIT);
+    expect(combineFitness({ ...base, primaryValidationTrades: MIN_VALIDATION_TRADES })).toBe(score);
+    expect(combineFitness({ ...base, primaryValidationTrades: MIN_VALIDATION_TRADES - 1 })).toBe(UNFIT);
+    expect(combineFitness({ ...base, minTradesPerYear: MIN_TRADES_PER_YEAR })).toBe(score);
+    expect(combineFitness({ ...base, minTradesPerYear: MIN_TRADES_PER_YEAR - 0.1 })).toBe(UNFIT);
+    // The audit's noise champions (17–55 validation trades) can never rank, even with a perfect score.
+    for (const trades of [17, 32, 55]) expect(combineFitness({ ...base, assetScores: [50], primaryValidationTrades: trades })).toBe(UNFIT);
+    expect(combineFitness({ ...base, primaryTrades: 0 })).toBe(UNFIT);
     expect(combineFitness({ ...base, params: 8 })).toBeCloseTo(score - 0.6, 9);
-    expect(combineFitness({ ...base, searchTrades: 0 })).toBe(UNFIT);
     // Reward:risk below 1 needs a win rate 10 points above break-even (66.7% at 0.5:1).
     expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 70 })).toBeCloseTo(score - 0.75, 9);
     expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 80 })).toBe(score);
@@ -1185,5 +1206,119 @@ describe('fallback data and baskets', () => {
       expect(basket.data.h[i]).toBeGreaterThanOrEqual(Math.max(basket.data.o[i], basket.data.c[i]) - 1e-9);
       expect(basket.data.l[i]).toBeLessThanOrEqual(Math.min(basket.data.o[i], basket.data.c[i]) + 1e-9);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+describe('stage 1: execution friction and basket hygiene', () => {
+  /** Shorts every bar (the long rule can never fire), so funding / borrow can be checked on shorts alone. */
+  const ALWAYS_SHORT = (maxBarsInTrade: number | null): StrategyGenome => ({
+    archetype: 'TREND',
+    longEntry: { logic: 'AND', conditions: [{ ind: 'RSI', period: 14, op: 'lt', level: -1 }] },
+    shortEntry: { logic: 'AND', conditions: [{ ind: 'VOLUME', period: 10, op: 'gt', level: 0.5 }] },
+    exit: { mode: 'static', stopLossPct: 15, takeProfitPct: 30 },
+    maxBarsInTrade,
+  });
+
+  it('scales slippage with the ATR of the last closed candle, never below the fixed floor', () => {
+    // 40 calm candles with a ±2 range, a breakout close on bar 30 and the entry at bar 31's open.
+    const n = 40;
+    const closes = Array.from({ length: n }, (_, i) => (i < 30 ? 100 : 110 + i - 30));
+    const opens = closes.map((_, i) => (i === 31 ? 111 : i > 0 ? closes[i - 1] : 100));
+    const data = candles(
+      opens,
+      closes.map((c, i) => Math.max(c, opens[i]) + 2),
+      closes.map((c, i) => Math.min(c, opens[i]) - 2),
+      closes,
+    );
+    const genome: StrategyGenome = {
+      archetype: 'TREND',
+      longEntry: { logic: 'AND', conditions: [{ ind: 'PRICE_MA', maType: 'SMA', period: 5, op: 'cross_above' }] },
+      shortEntry: null,
+      exit: { mode: 'static', stopLossPct: 15, takeProfitPct: 30 },
+      maxBarsInTrade: null,
+    };
+    const ind = new IndicatorCache(data);
+    const atrPct = ind.atrPercent(14);
+    const k = 0.5;
+    const ws = new BacktestWorkspace(n);
+    runBacktest(ind, genome, { ...FREE, slippagePct: 0.05, slippageAtrMult: k }, ws);
+    expect(ws.tradeEntryBar[0]).toBe(31);
+    // Full sizing and no fee: equity on the entry bar = capital × close / entry price.
+    const entryPx = (10_000 * closes[31]) / ws.equity[31];
+    const expectedSlip = Math.max(0.0005, (k * atrPct[30]) / 100);
+    expect(expectedSlip).toBeGreaterThan(0.0005); // the volatility term is the binding one here
+    expect(entryPx).toBeCloseTo(opens[31] * (1 + expectedSlip), 6);
+
+    // A tiny multiple falls back to the fixed floor; k = 0 is exactly the old fixed-slippage model.
+    runBacktest(ind, genome, { ...FREE, slippagePct: 0.05, slippageAtrMult: 1e-6 }, ws);
+    expect((10_000 * closes[31]) / ws.equity[31]).toBeCloseTo(opens[31] * 1.0005, 6);
+    const real = dataset('ETH-USD');
+    const a = new BacktestWorkspace(real.c.length);
+    const b = new BacktestWorkspace(real.c.length);
+    runBacktest(new IndicatorCache(real), TREND, SETTINGS, a);
+    runBacktest(new IndicatorCache(real), TREND, { ...SETTINGS, slippageAtrMult: 0 }, b);
+    expect(Array.from(b.equity)).toEqual(Array.from(a.equity));
+    // More volatility-scaled slippage can only cost money.
+    runBacktest(new IndicatorCache(real), TREND, { ...SETTINGS, slippageAtrMult: 0.05 }, b);
+    expect(b.equity[real.c.length - 1]).toBeLessThan(a.equity[real.c.length - 1]);
+  });
+
+  it('charges the short borrow fee on shorts only', () => {
+    const n = 30;
+    const flat = new Array<number>(n).fill(100);
+    const data = candles(flat, flat, flat, flat);
+    const ws = new BacktestWorkspace(n);
+    const shortSettings: BacktestSettings = { ...FREE, tradeMode: 'long-short', borrowPctPerBar: 0.1 };
+    runBacktest(new IndicatorCache(data), ALWAYS_SHORT(5), shortSettings, ws);
+    expect(ws.tradeDir[0]).toBe(-1);
+    // 0.1% of notional for each of the 5 closes the short is open.
+    expect(ws.tradePnl[0]).toBeCloseTo(-50, 6);
+    runBacktest(new IndicatorCache(data), ALWAYS_LONG({ mode: 'static', stopLossPct: 15, takeProfitPct: 30 }, 5), { ...FREE, borrowPctPerBar: 0.1 }, ws);
+    expect(ws.tradeDir[0]).toBe(1);
+    expect(ws.tradePnl[0]).toBeCloseTo(0, 9);
+  });
+
+  it('builds basket highs and lows that stay inside the summed envelope and contain the body', () => {
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const series = Object.fromEntries(symbols.map((s) => [s, generateSyntheticCandles(s, '1d', '1y', NOW)]));
+    const components = normalizeWeights(symbols.map((symbol) => ({ symbol, weight: 1 })));
+    const basket = buildDataset(series, components);
+    const { o, h, l, c, t } = basket.data;
+    let tighter = 0;
+    for (let i = 0; i < t.length; i++) {
+      let sumHigh = 0;
+      let sumLow = 0;
+      components.forEach((component, k) => {
+        const row = series[component.symbol].t.indexOf(t[i]);
+        sumHigh += basket.units[k] * series[component.symbol].h[row];
+        sumLow += basket.units[k] * series[component.symbol].l[row];
+      });
+      expect(h[i]).toBeGreaterThanOrEqual(Math.max(o[i], c[i]) - 1e-9);
+      expect(l[i]).toBeLessThanOrEqual(Math.min(o[i], c[i]) + 1e-9);
+      expect(h[i]).toBeLessThanOrEqual(sumHigh + 1e-9);
+      expect(l[i]).toBeGreaterThanOrEqual(sumLow - 1e-9);
+      expect(l[i]).toBeGreaterThan(0);
+      if (h[i] < sumHigh - 1e-9 || l[i] > sumLow + 1e-9) tighter++;
+    }
+    // The impossible "every leg peaks at once" envelope is no longer used.
+    expect(tighter).toBeGreaterThan(t.length * 0.9);
+  });
+
+  it('normalises basket volume with trailing data only, so later volume cannot leak backwards', () => {
+    const symbols = ['BTC-USD', 'ETH-USD'];
+    const series = Object.fromEntries(symbols.map((s) => [s, generateSyntheticCandles(s, '1d', '1y', NOW)]));
+    const components = normalizeWeights(symbols.map((symbol) => ({ symbol, weight: 1 })));
+    const before = buildDataset(series, components).data;
+    const n = before.t.length;
+    const cut = Math.floor(n * 0.8); // the holdout boundary
+    // Multiply every holdout volume by 1,000: nothing before the boundary may change.
+    const spiked = { ...series, 'ETH-USD': { ...series['ETH-USD'], v: series['ETH-USD'].v.map((v, i) => (i >= cut ? v * 1000 : v)) } };
+    const after = buildDataset(spiked, components).data;
+    for (let i = 0; i < cut; i++) expect(after.v[i]).toBe(before.v[i]);
+    expect(after.v[n - 1]).not.toBe(before.v[n - 1]);
+    // Prices are untouched by volume.
+    expect(Array.from(after.c)).toEqual(Array.from(before.c));
   });
 });

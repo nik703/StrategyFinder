@@ -7,10 +7,13 @@
  *
  * Honest by construction
  * ----------------------
- * • The data is split Train 60% / Validation 20% / Holdout 20%. While the search
- *   runs, every backtest stops at the holdout boundary – the holdout is never
- *   simulated, scored or sent anywhere. It is evaluated once, for the final
- *   leaderboard, when the run ends.
+ * • The data is split Train 60% / Validation 20% / Holdout 20%. Every backtest of
+ *   the search stops at the holdout boundary, and the holdout stays sealed when the
+ *   run ends. The user then locks ONE strategy of the final leaderboard and only
+ *   that strategy's holdout is simulated and revealed – once per run. Revealing
+ *   the whole board would turn the holdout into one more selection set.
+ * • Strategies with too few trades are disqualified outright (see the gates in
+ *   `backtester.ts`).
  * • Fitness is built on the Deflated Sharpe Ratio of the validation segment, so
  *   the bar rises with every strategy that is tried.
  * • With a "Robust universe" the same rules are backtested on every asset and the
@@ -26,6 +29,10 @@ import {
   benchmarkEquity,
   evaluateSearch,
   holdoutMetrics,
+  MIN_HOLDOUT_TRADES,
+  MIN_TRADES,
+  MIN_TRADES_PER_YEAR,
+  MIN_VALIDATION_TRADES,
   runBacktest,
   segmentMetrics,
   UNFIT,
@@ -37,6 +44,7 @@ import {
   fitnessOf,
   sampleCurve,
   scoreAssets,
+  tradesPerYear,
   type Asset,
   type AssetScore,
   type CandidateResult,
@@ -58,7 +66,7 @@ import {
   type GenomeLimits,
   type Rng,
 } from '../engine/genome';
-import { expectedMaxSharpe, RunningStats } from '../lib/stats';
+import { expectedMaxSharpe, RunningStats, sharpeConfidenceInterval } from '../lib/stats';
 import {
   DEFAULT_MAX_STAGNATION,
   LEADERBOARD_SIZE,
@@ -157,9 +165,20 @@ scope.onmessage = (event) => {
       if (!session) throw new Error('No optimisation run is available to analyse.');
       if (message.universe) addUniverse(session, message.universe);
       const report = analyze(session, message.genome);
-      // The verdict needs the holdout, which only exists once the run has ended.
-      const verdict = session.finished ? verdictFor(report, finalResult(session, message.strategyId, message.genome)) : null;
+      // A verdict needs the holdout, and only the locked strategy's holdout is ever revealed.
+      const locked = session.locked !== null && session.locked.id === message.strategyId ? session.finals.get(message.strategyId) : undefined;
+      const verdict = locked ? judge(session, report, locked).verdict : null;
       scope.postMessage({ type: 'analysis', strategyId: message.strategyId, report, verdict });
+    } catch (error) {
+      fail(error);
+    }
+    return;
+  }
+  if (message.type === 'lock') {
+    try {
+      if (!session) throw new Error('No optimisation run is available.');
+      const strategy = lockStrategy(session, message.strategyId, message.priorReveals, message.simulated);
+      scope.postMessage({ type: 'locked', strategy, benchmark: finalBenchmark(session) });
     } catch (error) {
       fail(error);
     }
@@ -201,8 +220,12 @@ interface Session extends EvalContext {
   hurdleVariance: number;
   board: Entry[];
   finished: boolean;
-  /** Final results by id, including the holdout (only after the run has ended). */
+  /** The one strategy whose holdout was revealed, and what was known about that holdout at the time. */
+  locked: { id: string; priorReveals: number; simulated: boolean } | null;
+  /** Final (holdout-revealed) results by id – only ever holds the locked strategy. */
   finals: Map<string, StrategyResult>;
+  /** Candidates disqualified by the minimum-trade gates. */
+  undersampled: number;
 }
 
 function addUniverse(s: Session, universe: NamedDataset[]): void {
@@ -430,16 +453,52 @@ function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
 }
 
 /**
- * Overall verdict.
- *   Overfit – it lost money on the holdout, or its deflated Sharpe says "probably luck" (< 0.5).
- *   Fragile – it survives the holdout but fails a robustness test or its deflated Sharpe is below 0.95.
- *   Robust  – everything holds.
+ * Verdict of the locked strategy, with the reasons it falls short of Robust.
+ *
+ *   Overfit – deflated Sharpe under 50% ("probably luck"), or the holdout lost money or had a
+ *             non-positive Sharpe.
+ *   Robust  – ALL of the following hold:
+ *             • deflated Sharpe of the validation segment ≥ 95%;
+ *             • holdout Sharpe 95% confidence interval entirely above zero;
+ *             • holdout Sharpe above Buy & Hold's holdout Sharpe (risk-adjusted, not raw return);
+ *             • at least `MIN_HOLDOUT_TRADES` holdout trades;
+ *             • ±20% parameter sensitivity, top-trade removal and cross-asset tests all pass;
+ *             • the holdout period had never been revealed before (untouched data);
+ *             • the run used live market data, not the simulated fallback.
+ *   Fragile – anything in between.
  */
-function verdictFor(report: RobustnessReport, result: StrategyResult): Verdict {
-  if ((result.holdout !== null && result.holdout.roi <= 0) || result.dsr < 0.5) return 'Overfit';
-  const crossOk = report.crossAsset === null || report.crossAsset.share >= 2 / 3 - 1e-9;
-  if (report.sensitivity.fragile || !report.topTrades.profitable || !crossOk || result.dsr < 0.95) return 'Fragile';
-  return 'Robust';
+function judge(s: Session, report: RobustnessReport, result: StrategyResult): { verdict: Verdict; notes: string[] } {
+  const holdout = result.holdout;
+  if (holdout === null) throw new Error('A verdict needs the revealed holdout.');
+  const pct = (x: number): string => `${(x * 100).toFixed(1)}%`;
+  const fixed = (x: number): string => x.toFixed(2);
+
+  const overfit: string[] = [];
+  if (result.dsr < 0.5) overfit.push(`Deflated Sharpe ${pct(result.dsr)} is under 50%: the validation result is most likely luck.`);
+  if (holdout.roi <= 0) overfit.push(`Lost money on the holdout (${holdout.roi.toFixed(1)}%).`);
+  else if (holdout.sharpe <= 0) overfit.push(`Holdout Sharpe ${fixed(holdout.sharpe)} is not positive.`);
+  if (overfit.length > 0) return { verdict: 'Overfit', notes: overfit };
+
+  const notes: string[] = [];
+  if (result.dsr < 0.95) notes.push(`Deflated Sharpe ${pct(result.dsr)} is under 95%: not distinguishable from the luckiest of the strategies tried.`);
+  const [ciLow] = sharpeConfidenceInterval(holdout, s.assets[0].periodsPerYear);
+  if (!(ciLow > 0)) notes.push(`The holdout Sharpe's 95% confidence interval reaches ${fixed(ciLow)}: it includes zero.`);
+  const bench = finalBenchmark(s).holdout;
+  if (bench !== null && !(holdout.sharpe > bench.sharpe)) {
+    notes.push(`Holdout Sharpe ${fixed(holdout.sharpe)} does not beat Buy & Hold's ${fixed(bench.sharpe)}.`);
+  }
+  if (holdout.trades < MIN_HOLDOUT_TRADES) notes.push(`Only ${holdout.trades} holdout trades (at least ${MIN_HOLDOUT_TRADES} needed).`);
+  if (report.sensitivity.fragile) notes.push('A ±20% change of one parameter costs more than half of the return.');
+  if (!report.topTrades.profitable) notes.push(`Unprofitable without its ${report.topTrades.removed} best trades.`);
+  if (report.crossAsset !== null && report.crossAsset.share < 2 / 3 - 1e-9) {
+    notes.push(`Profitable on only ${Math.round(report.crossAsset.share * 100)}% of the other assets (two thirds needed).`);
+  }
+  const lock = s.locked;
+  if (lock !== null && lock.priorReveals > 0) {
+    notes.push(`This holdout period had already been revealed ${lock.priorReveals} time${lock.priorReveals === 1 ? '' : 's'}: it is no longer untouched data.`);
+  }
+  if (lock !== null && lock.simulated) notes.push('The run used simulated fallback data, not real market data.');
+  return { verdict: notes.length === 0 ? 'Robust' : 'Fragile', notes };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -480,33 +539,40 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     assets,
   };
   const robustness = analyze(s, base.genome);
-  return { ...result, robustness, verdict: verdictFor(robustness, result) };
+  const { verdict, notes } = judge(s, robustness, result);
+  return { ...result, robustness, verdict, verdictNotes: notes };
 }
 
-/** Final (holdout-revealed) result for a strategy, computing it when it is not on the final leaderboard. */
-function finalResult(s: Session, id: string, genome: StrategyGenome): StrategyResult {
-  const known = s.finals.get(id);
-  if (known) return known;
-  const { scores } = scoreAssets(s, genome);
-  const { fitness, dsr } = fitnessOf(s, genome, scores);
-  const primary = scores[0].metrics;
-  const result = revealHoldout(s, {
-    id,
-    genome,
-    fitness,
-    dsr,
-    params: countParameters(genome, s.limits),
-    ...primary,
-    holdout: null,
-    alpha: primary.search.roi - s.assets[0].benchmark.search.roi,
-    equity: new Float32Array(0),
-    foundAt: 0,
-    assets: [],
-    robustness: null,
-    verdict: null,
-  });
+/**
+ * Lock `id` as the run's final strategy and reveal its holdout. Only one strategy per run, only
+ * from the final leaderboard, only once the search has ended. Locking the same strategy again
+ * returns the same result without a second reveal.
+ */
+function lockStrategy(s: Session, id: string, priorReveals: number, simulated: boolean): StrategyResult {
+  if (!s.finished) throw new Error('The holdout can only be revealed after the run has ended.');
+  if (s.locked !== null) {
+    const known = s.finals.get(s.locked.id);
+    if (s.locked.id === id && known) return known;
+    throw new Error(`This run's holdout has already been spent on strategy ${s.locked.id}. Only one strategy per run can be revealed.`);
+  }
+  const entry = s.board.find((e) => e.result.id === id);
+  if (!entry) throw new Error('Only a strategy on the final leaderboard can be locked.');
+  s.locked = { id, priorReveals: Math.max(0, Math.floor(priorReveals)), simulated };
+  const result = revealHoldout(s, entry.result);
   s.finals.set(id, result);
   return result;
+}
+
+/** Buy & Hold with the holdout still sealed: the curve stops at the holdout boundary. */
+function sealedBenchmark(s: Session): BenchmarkResult {
+  const primary = s.assets[0];
+  return {
+    search: primary.benchmark.search,
+    train: primary.benchmark.train,
+    validation: primary.benchmark.validation,
+    holdout: null,
+    equity: sampleCurve(primary.benchmark.equity, s.axis, s.axis.holdoutPos),
+  };
 }
 
 function finalBenchmark(s: Session): BenchmarkResult {
@@ -602,7 +668,9 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     hurdleVariance: 0,
     board: [],
     finished: false,
+    locked: null,
     finals: new Map(),
+    undersampled: 0,
   };
   session = s;
   const { mode, limits, board } = s;
@@ -624,13 +692,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   // The live benchmark stops at the holdout boundary, exactly like the strategy curves.
   scope.postMessage({
     type: 'ready',
-    benchmark: {
-      search: primary.benchmark.search,
-      train: primary.benchmark.train,
-      validation: primary.benchmark.validation,
-      holdout: null,
-      equity: sampleCurve(primary.benchmark.equity, axis, axis.holdoutPos),
-    },
+    benchmark: sealedBenchmark(s),
     axis,
     barsPerYear: primary.periodsPerYear,
   });
@@ -645,14 +707,22 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const startedAt = performance.now();
   let lastBatchAt = startedAt;
 
-  const snapshot = (): ProgressSnapshot => ({
-    iteration,
-    stagnation,
-    bestFitness: board.length > 0 ? board[0].result.fitness : null,
-    bestRoi: board.length > 0 ? board[0].result.search.roi : null,
-    itersPerSec,
-    elapsedMs: performance.now() - startedAt,
-  });
+  const annualiser = Math.sqrt(primary.periodsPerYear);
+  const snapshot = (): ProgressSnapshot => {
+    let leader: StrategyResult | null = null;
+    for (const entry of board) if (leader === null || entry.result.dsr > leader.dsr) leader = entry.result;
+    return {
+      iteration,
+      stagnation,
+      bestFitness: board.length > 0 ? board[0].result.fitness : null,
+      bestDsr: leader ? leader.dsr : null,
+      bestDsrSharpe: leader ? leader.validation.sharpe : null,
+      hurdleSharpe: s.hurdle * annualiser,
+      undersampled: s.undersampled,
+      itersPerSec,
+      elapsedMs: performance.now() - startedAt,
+    };
+  };
 
   const postBoard = (): void => {
     scope.postMessage({ type: 'leaderboard', iteration, strategies: board.map((e) => e.result) });
@@ -683,6 +753,13 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     return sampleCurve(primary.ws.equity, axis, axis.holdoutPos);
   };
 
+  /** True when a fully scored candidate fails a hard minimum-trade gate. */
+  const isUndersampled = (scores: AssetScore[]): boolean => {
+    const primaryMetrics = scores[0].metrics;
+    if (primaryMetrics.search.trades < MIN_TRADES || primaryMetrics.validation.trades < MIN_VALIDATION_TRADES) return true;
+    return scores.some((score, a) => tradesPerYear(s, a, score.metrics) < MIN_TRADES_PER_YEAR);
+  };
+
   /** Insert an evaluated candidate into the leaderboard if it qualifies. Returns true when the top fitness improved. */
   const consider = (genome: StrategyGenome, evaluated: CandidateResult): boolean => {
     const { scores, complete, fitness, dsr } = evaluated;
@@ -690,7 +767,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // Every evaluated strategy is a trial, whether or not it makes the leaderboard.
     s.trials.push(primaryMetrics.validation.sharpeRaw);
     if (!complete) return false;
-    if (fitness <= UNFIT) return false;
+    if (fitness <= UNFIT) {
+      if (isUndersampled(scores)) s.undersampled++;
+      return false;
+    }
     const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return false;
 
@@ -793,15 +873,11 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
 
   const finish = (reason: StopReason): void => {
     pool.close();
-    // The search is over: only now is the holdout simulated, for the final leaderboard.
+    // The search is over, but the holdout stays sealed: the user locks ONE strategy to reveal it.
     rescoreBoard(s);
     s.finished = true;
-    const strategies = board.map((entry) => {
-      const final = revealHoldout(s, entry.result);
-      s.finals.set(final.id, final);
-      return final;
-    });
-    scope.postMessage({ type: 'done', reason, strategies, benchmark: finalBenchmark(s), ...snapshot() });
+    const strategies = board.map((entry) => entry.result);
+    scope.postMessage({ type: 'done', reason, strategies, benchmark: sealedBenchmark(s), ...snapshot() });
   };
 
   for (;;) {

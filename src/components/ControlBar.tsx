@@ -1,6 +1,7 @@
 /**
  * Top control bar: asset / basket builder, timeframe, history range, capital,
- * costs, trade mode, position sizing, funding, the Robust universe and the
+ * costs (fee, fixed and volatility-scaled slippage), trade mode, position
+ * sizing, Long/Short financing (perp funding or stock borrow), the Robust universe and the
  * Start / Stop buttons.
  */
 
@@ -8,7 +9,9 @@ import { Info, Loader2, Play, Plus, Square, X } from 'lucide-react';
 import { useId } from 'react';
 import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import {
+  DEFAULT_BORROW_PCT_YEAR,
   DEFAULT_FUNDING_PCT_8H,
+  financingFor,
   isCrypto,
   MAX_BASKET_ASSETS,
   MAX_UNIVERSE_ASSETS,
@@ -293,6 +296,7 @@ export default function ControlBar({
   // A ticker with its own chip (preset or saved) is not repeated in the free-text field.
   const hasChip = isPreset || savedTickers.includes(config.symbol);
   const subHour = config.interval === '15m' || config.interval === '30m';
+  const financing = financingFor(config);
   const tradesStocks =
     config.assetMode === 'single'
       ? !isCrypto(config.symbol)
@@ -450,7 +454,7 @@ export default function ControlBar({
           className="w-[92px]"
         />
         <NumberField
-          label="Slippage"
+          label="Slippage floor"
           suffix="%"
           value={config.slippagePct}
           min={0}
@@ -458,8 +462,21 @@ export default function ControlBar({
           step={0.01}
           onChange={(slippagePct) => onChange({ slippagePct })}
           disabled={busy}
-          className="w-[92px]"
+          className="w-[100px]"
         />
+        <div title="Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. 0 = fixed slippage only.">
+          <NumberField
+            label="Vol. slippage"
+            suffix="× ATR"
+            value={config.slippageAtrMult}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={(slippageAtrMult) => onChange({ slippageAtrMult })}
+            disabled={busy}
+            className="w-[112px]"
+          />
+        </div>
         <NumberField
           label="Stagnation limit"
           value={config.maxStagnation}
@@ -536,29 +553,52 @@ export default function ControlBar({
           disabled={busy || config.sizingMode === 'full'}
           className="w-[100px]"
         />
-        <div>
-          <FieldLabel>Perp funding</FieldLabel>
-          <div className="flex items-center gap-2">
-            <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
-              <input
-                type="checkbox"
-                checked={config.fundingPct8h > 0}
-                disabled={busy}
-                onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
-                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
-              />
-              Charge funding
-            </label>
-            {config.fundingPct8h > 0 && (
-              <NumberFieldInline
-                ariaLabel="Funding rate per 8 hours"
-                value={config.fundingPct8h}
-                onChange={(fundingPct8h) => onChange({ fundingPct8h })}
-                disabled={busy}
-              />
-            )}
+        {financing === 'none' ? (
+          <div>
+            <FieldLabel>Financing</FieldLabel>
+            <p className="flex h-9 items-center text-xs text-ink-3" title="Long-Only runs are treated as spot positions">
+              Long-Only spot: none
+            </p>
           </div>
-        </div>
+        ) : financing === 'funding' ? (
+          <div>
+            <FieldLabel>Perp funding (L/S crypto)</FieldLabel>
+            <div className="flex items-center gap-2">
+              <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
+                <input
+                  type="checkbox"
+                  checked={config.fundingPct8h > 0}
+                  disabled={busy}
+                  onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
+                  className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+                />
+                Charge funding
+              </label>
+              {config.fundingPct8h > 0 && (
+                <NumberFieldInline
+                  ariaLabel="Funding rate per 8 hours"
+                  value={config.fundingPct8h}
+                  onChange={(fundingPct8h) => onChange({ fundingPct8h })}
+                  disabled={busy}
+                />
+              )}
+            </div>
+          </div>
+        ) : (
+          <div title={`Borrow fee on short stock / ETF positions, per year (default ${DEFAULT_BORROW_PCT_YEAR}%).`}>
+            <NumberField
+              label="Short borrow / yr"
+              suffix="%"
+              value={config.borrowPctYear}
+              min={0}
+              max={100}
+              step={0.25}
+              onChange={(borrowPctYear) => onChange({ borrowPctYear })}
+              disabled={busy}
+              className="w-[120px]"
+            />
+          </div>
+        )}
         <div className="min-w-[260px] flex-1">
           <FieldLabel>Robust universe</FieldLabel>
           <div className="flex items-center gap-2">

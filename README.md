@@ -87,8 +87,12 @@ history for about 730 days, so stock requests longer than that are shortened (th
 ### Backtester
 
 - Signals are evaluated on the close of candle `t` and filled at the open of candle `t+1`.
-- Every fill pays the fee (default 0.1% per side) and slippage (default 0.05%). Perpetual funding can be
-  charged on open positions (off by default, 0.01% per 8h when switched on).
+- Every fill pays the fee (default 0.1% per side) and **volatility-scaled slippage**: the larger of a fixed
+  floor (default 0.05%) and a multiple of ATR(14) as a % of price (default 0.03 ×), read on the last closed
+  candle. Volatile candles and volatile assets cost more to trade.
+- **Long/Short runs pay financing by default.** Crypto is shorted as a perpetual: every open position pays
+  funding (default 0.01% per 8h). Stock and ETF shorts pay a borrow fee (default 2% a year). Long-Only runs
+  are treated as spot positions and pay no financing.
 - **Sizing is a run setting, not something the optimiser tunes.** Default: risk 2% of the starting capital at
   the stop, no compounding, exposure capped at 1× equity. Options: compounding, or 100% of equity.
 - Stops and targets are simulated intrabar from the entry candle. A gap through a level fills at the open.
@@ -104,10 +108,14 @@ Data is split chronologically: **Train 60% / Validation 20% / Holdout 20%**.
 
 - The search sees train and validation only. While a run is live, every backtest stops at the holdout
   boundary; the holdout is not simulated, scored or sent to the UI.
-- When the run ends (Stop or converged) the final leaderboard is evaluated on the holdout once, and the
-  holdout part of the chart appears.
-- A holdout is only unseen once. The app counts reveals per dataset (symbols, timeframe, range, end date) in
-  `localStorage` and warns on later runs: "Holdout already viewed N times. It is no longer unseen data."
+- **The holdout stays sealed when the run ends.** You choose ONE strategy of the final leaderboard and press
+  *Lock & reveal holdout*. Only that strategy's holdout is simulated and shown, once per run; every other
+  strategy stays sealed, so the holdout can never be used to pick a winner (there is no holdout column to
+  sort on).
+- A holdout is only unseen once. Every reveal is recorded in `localStorage` with its symbols and holdout
+  **date window**. A later run whose holdout overlaps an earlier reveal on any shared symbol is warned, and
+  none of its strategies can be rated Robust. A new end date, or another range or timeframe over the same
+  dates, does not reset the log.
 
 ### Strategy genome
 
@@ -137,7 +145,7 @@ a configurable number of consecutive iterations without a better top score (defa
 
 **Robust universe** (on by default for crypto): the same rules are backtested separately on every asset of
 a universe (default BTC, ETH, SOL, XRP, ADA, DOGE; editable). Fitness is the median per-asset score, trade
-counts are summed across assets, and there is a penalty when fewer than 2/3 of the assets are profitable on
+counts are gated per asset (never pooled), and there is a penalty when fewer than 2/3 of the assets are profitable on
 validation. The leaderboard and chart show the primary asset.
 
 Fitness (higher is better), per asset:
@@ -151,11 +159,13 @@ Fitness (higher is better), per asset:
 − penalty for a loss on the training segment, and for train / validation divergence
 ```
 
-then, across assets:
+then, across assets, after the **hard sample-size gates**: a strategy is disqualified outright with fewer
+than 100 train + validation trades or 60 validation trades on the primary asset, or fewer than 25 trades a
+year on any asset. Daily candles over 1–2 years rarely allow that many trades; use 4h / 1h candles or a
+longer history.
 
 ```
   median of the per-asset scores
-− up to 6.0 for fewer than 100 trades, up to 2.0 for fewer than 25 validation trades
 − 1.0 when fewer than 2/3 of the universe is profitable on validation
 − 0.15 for each tunable parameter above 4
 − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
@@ -187,8 +197,11 @@ When a run ends (or on demand from the strategy drawer) each strategy is tested 
 - **Top-trade removal:** net PnL without the 5 best trades.
 - **Cross-asset:** the exact rules, untuned, on every universe asset.
 
-Verdict: **Overfit** when it lost money on the holdout or its deflated Sharpe is below 50%; **Fragile**
-when it survives the holdout but fails a test above or its deflated Sharpe is below 95%; **Robust** otherwise.
+Verdict (only the locked strategy gets one): **Overfit** when its deflated Sharpe is below 50% or it lost
+money (or had a non-positive Sharpe) on the holdout. **Robust** only when ALL of these hold: deflated Sharpe
+≥ 95%; holdout Sharpe 95% confidence interval above zero; holdout Sharpe above Buy & Hold's; at least 30
+holdout trades; every test above passes; the holdout period was never revealed before; live (not simulated)
+data. **Fragile** otherwise; the drawer lists every unmet condition.
 
 ## Read this before trusting a result
 
@@ -198,7 +211,8 @@ when it survives the holdout but fails a test above or its deflated Sharpe is be
   the best strategy's deflated Sharpe stayed at or below 16%, every listed strategy was labelled Overfit,
   and the mean holdout Sharpe was −0.36.
 - **The holdout is a one-shot test.** Re-running on the same dataset and picking the run whose holdout looks
-  best turns the holdout into training data. The reveal counter exists to make that visible.
+  best turns the holdout into training data. The reveal log makes that visible and blocks a Robust verdict
+  on a holdout that has been seen before.
 - **The holdout confidence interval is wide.** The drawer shows the 95% interval for the holdout Sharpe; with
   a few dozen trades it usually includes zero.
 - **Daily bars cannot resolve intrabar order.** The "ambiguous candles" count shows how many trades relied on
@@ -228,7 +242,7 @@ src/workers/optimizer.worker.ts   Optimisation loop (Web Worker)
 src/workers/evaluator.worker.ts   Evaluator pool member: scores candidate strategies
 src/engine/evaluation.ts          Shared scoring code and the evaluator protocol
 src/lib/stats.ts                  Deflated Sharpe Ratio, confidence intervals
-src/lib/holdoutLog.ts             Holdout reveal counter
+src/lib/holdoutLog.ts             Holdout reveal log (symbols + date window, overlap matching)
 src/data/                         Data loader, offline generator, basket builder
 src/components/                   ControlBar, TelemetryStrip, EquityChart, Leaderboard, StrategyModal
 src/App.tsx                       Dashboard and worker orchestration
