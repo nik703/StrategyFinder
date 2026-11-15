@@ -13,6 +13,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
 import { MIN_TRADES, MIN_TRADES_PER_YEAR, MIN_VALIDATION_TRADES } from '../engine/backtester';
 import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
+import { overfittingRisk } from '../lib/risk';
 import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type Verdict } from '../types/trading';
 import { cx, Panel, Pill } from './ui';
 
@@ -29,6 +30,8 @@ type SortKey =
   | 'rank'
   | 'params'
   | 'dsr'
+  | 'haircut'
+  | 'risk'
   | 'valSharpe'
   | 'sortino'
   | 'verdict'
@@ -123,6 +126,36 @@ const COLUMNS: Column[] = [
         {fmtPct(strategy.dsr * 100, false, 0)}
       </span>
     ),
+  },
+  {
+    key: 'haircut',
+    label: 'Haircut Sharpe',
+    title:
+      'Validation Sharpe after a Bonferroni haircut for every strategy tried on this data window, in any run or session (Harvey & Liu). 0 = fully explained by multiple testing.',
+    align: 'right',
+    value: ({ strategy }) => strategy.haircutSharpe ?? -Infinity,
+    render: ({ strategy }) => (
+      <span className={strategy.haircutSharpe !== undefined && strategy.haircutSharpe > 0 ? 'text-ink' : 'text-ink-3'}>
+        {strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)}
+      </span>
+    ),
+  },
+  {
+    key: 'risk',
+    label: 'Overfit risk',
+    title: 'Overfitting risk score 0–100: selection bias, multiple testing, parameter spike, fold inconsistency, regime collapse, thin sample. Open a row for the breakdown.',
+    align: 'right',
+    value: ({ strategy }) => overfittingRisk(strategy).score,
+    firstDir: 'asc',
+    render: ({ strategy }) => {
+      const risk = overfittingRisk(strategy);
+      return (
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          <span className="num font-semibold text-ink">{risk.score}</span>
+          <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level}</Pill>
+        </span>
+      );
+    },
   },
   {
     key: 'valSharpe',

@@ -15,6 +15,7 @@ import {
   REGIME_COLLAPSE_PENALTY,
   REGIME_HIGH_VOL,
   testableRegimes,
+  tradeLogHash,
   type SearchMetrics,
   BacktestWorkspace,
   barsPerYear,
@@ -45,6 +46,12 @@ import {
 } from '../src/engine/describe';
 import {
   conditionRole,
+  conformsTo,
+  filterConforms,
+  gaussian,
+  HYPOTHESES,
+  hypothesisUnsupported,
+  triggerConforms,
   countParameters,
   crossoverGenomes,
   DEFAULT_LIMITS,
@@ -66,10 +73,12 @@ import {
 } from '../src/engine/genome';
 import { atr, bollinger, ema, IndicatorCache, rsi, sma, stochastic, supertrend } from '../src/engine/indicators';
 import { generatePineScript } from '../src/engine/pine';
-import { deflatedSharpe, expectedMaxSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
+import { deflatedSharpe, expectedMaxSharpe, haircutSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
+import { overfittingRisk } from '../src/lib/risk';
 import {
   clampRange,
   HOLDOUT_FRACTION,
+  HYPOTHESIS_IDS,
   rangeAllowed,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
@@ -263,7 +272,7 @@ const DIP: StrategyGenome = normalizeGenome(
       logic: 'AND',
       conditions: [
         { ind: 'RSI', period: 14, op: 'lt', level: 45 },
-        { ind: 'PRICE_MA', maType: 'EMA', period: 100, op: 'gt' },
+        { ind: 'PRICE_MA', maType: 'EMA', period: 112, op: 'gt' },
       ],
     },
     shortEntry: null,
@@ -519,7 +528,7 @@ describe('backtester', () => {
       const regimes = regimeMask(data.c, split, ppy);
       const fb = foldBounds(split);
       for (let i = 0; i < 400; i++) {
-        const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
+        const genome = randomGenome(rng, mode, DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
         // Search-period run (what the optimiser does) and a full run (what the holdout reveal does).
         for (const bars of [split.holdoutStart, n]) {
           runBacktest(ind, genome, settings, ws, bars);
@@ -598,7 +607,7 @@ describe('backtester', () => {
     const b = new Uint8Array(n);
     let pairs = 0;
     for (let i = 0; i < 600; i++) {
-      const genome = randomGenome(rng, 'long-only', DEFAULT_LIMITS);
+      const genome = randomGenome(rng, 'long-only', DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
       const { conditions } = genome.longEntry;
       const limit = 1 + Math.floor(rng() * (n - 1));
       out.fill(7); // sentinel: nothing beyond `limit` may be written
@@ -822,10 +831,13 @@ function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): 
   expect(countParameters(genome)).toBeLessThanOrEqual(MAX_PARAMETERS);
   expect('sizing' in genome).toBe(false);
 
-  // Archetype.
+  // Hypothesis (search-built genomes) or archetype (hand-built ones).
   const [trigger, second] = genome.longEntry.conditions;
   const role = conditionRole(trigger);
-  if (genome.archetype === 'TREND') {
+  if (genome.hypothesis !== undefined) {
+    expect(conformsTo(genome)).toBe(true);
+    expect(genome.archetype).toBe(HYPOTHESES[genome.hypothesis].archetype);
+  } else if (genome.archetype === 'TREND') {
     expect(role).toBe('TREND_UP');
     if (second) expect(conditionRole(second)).toBe('FILTER');
   } else {
@@ -936,32 +948,84 @@ describe('genome', () => {
     );
   });
 
-  it('generates, mutates and recombines only coherent, capped, on-grid genomes', () => {
+  it('generates, mutates and recombines only genomes built from the run\'s hypothesis', () => {
     const rng = mulberry32(42);
+    const families = new Set<string>();
     for (const mode of ['long-only', 'long-short'] as const) {
-      let genome = randomGenome(rng, mode, DEFAULT_LIMITS);
-      const kinds = new Set<string>();
-      const archetypes = new Set<string>();
-      let reversals = 0;
-      let timeStops = 0;
-      for (let i = 0; i < 4000; i++) {
-        const r = rng();
-        if (r < 0.2) genome = randomGenome(rng, mode, DEFAULT_LIMITS);
-        else if (r < 0.3) genome = crossoverGenomes(rng, genome, randomGenome(rng, mode, DEFAULT_LIMITS), mode, DEFAULT_LIMITS);
-        else genome = mutateGenome(rng, genome, mode, DEFAULT_LIMITS, 1 + Math.floor(rng() * 3));
-        assertValid(genome, mode);
-        for (const c of genome.longEntry.conditions) kinds.add(c.ind);
-        archetypes.add(genome.archetype);
-        if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit) reversals++;
-        if (genome.maxBarsInTrade !== null) timeStops++;
-        // Repair and normalisation are idempotent; signatures are stable.
-        expect(genomeSignature(repairGenome(genome, mode, DEFAULT_LIMITS, rng))).toBe(genomeSignature(genome));
-        expect(normalizeGenome(genome, mode, DEFAULT_LIMITS)).toEqual(genome);
+      for (const h of HYPOTHESIS_IDS) {
+        let genome = randomGenome(rng, mode, DEFAULT_LIMITS, h);
+        let reversals = 0;
+        let timeStops = 0;
+        let filters = 0;
+        for (let i = 0; i < 1000; i++) {
+          const r = rng();
+          if (r < 0.2) genome = randomGenome(rng, mode, DEFAULT_LIMITS, h);
+          else if (r < 0.3) genome = crossoverGenomes(rng, genome, randomGenome(rng, mode, DEFAULT_LIMITS, h), mode, DEFAULT_LIMITS);
+          else genome = mutateGenome(rng, genome, mode, DEFAULT_LIMITS, 1 + Math.floor(rng() * 3));
+          assertValid(genome, mode);
+          // Nothing leaves the hypothesis: the same primitive, and a filter that never changes direction.
+          expect(genome.hypothesis).toBe(h);
+          expect(triggerConforms(genome.longEntry.conditions[0], h)).toBe(true);
+          const filter = genome.longEntry.conditions[1];
+          if (filter) {
+            filters++;
+            expect(filterConforms(filter, h, DEFAULT_LIMITS)).toBe(true);
+          } else {
+            expect(HYPOTHESES[h].filterRequired).toBe(false);
+          }
+          for (const c of genome.longEntry.conditions) families.add(c.ind);
+          if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit) reversals++;
+          if (genome.maxBarsInTrade !== null) timeStops++;
+          // Repair and normalisation are idempotent; signatures are stable.
+          expect(genomeSignature(repairGenome(genome, mode, DEFAULT_LIMITS, rng))).toBe(genomeSignature(genome));
+          expect(normalizeGenome(genome, mode, DEFAULT_LIMITS)).toEqual(genome);
+        }
+        // Only trend following may exit on a reversal of its trigger.
+        if (h === 'TREND_FOLLOWING') expect(reversals).toBeGreaterThan(20);
+        else expect(reversals).toBe(0);
+        expect(timeStops).toBeGreaterThan(20);
+        expect(filters).toBeGreaterThan(100);
       }
-      expect(kinds.size).toBe(11); // every indicator family is reachable
-      expect(archetypes.size).toBe(2);
-      expect(reversals).toBeGreaterThan(50);
-      expect(timeStops).toBeGreaterThan(50);
+    }
+    // The redundant families are gone: four hypotheses are built from exactly five primitives.
+    expect([...families].sort()).toEqual(['ADX', 'BB', 'PRICE_MA', 'RSI', 'VOLUME']);
+  });
+
+  it('never produces a mutation identical to its parent', () => {
+    const rng = mulberry32(99);
+    let total = 0;
+    for (const mode of ['long-only', 'long-short'] as const) {
+      for (const h of HYPOTHESIS_IDS) {
+        for (let i = 0; i < 1500; i++) {
+          const parent = randomGenome(rng, mode, DEFAULT_LIMITS, h);
+          const child = mutateGenome(rng, parent, mode, DEFAULT_LIMITS, 1);
+          expect(genomeSignature(child)).not.toBe(genomeSignature(parent));
+          expect(conformsTo(child)).toBe(true);
+          total++;
+        }
+      }
+    }
+    expect(total).toBe(12_000);
+    // Hand-built genomes have no hypothesis to stay inside, so they cannot be mutated.
+    expect(() => mutateGenome(rng, TREND, 'long-only', DEFAULT_LIMITS)).toThrow(/hypothesis/);
+  });
+
+  it('describes every hypothesis and rejects the ones the data cannot support', () => {
+    for (const h of HYPOTHESIS_IDS) {
+      const info = HYPOTHESES[h];
+      expect(info.id).toBe(h);
+      expect(info.rationale.length).toBeGreaterThan(40);
+      expect(info.replaces.length).toBeGreaterThan(10);
+      expect(hypothesisUnsupported(h, DEFAULT_LIMITS)).toBeNull();
+    }
+    // A 100-bar trend filter needs history.
+    expect(hypothesisUnsupported('DIP_IN_UPTREND', { maxLookback: 60, hasVolume: true })).toMatch(/560 candles/);
+    expect(hypothesisUnsupported('TREND_FOLLOWING', { maxLookback: 60, hasVolume: true })).toBeNull();
+    // The lookback grid is geometric: roughly √2 per step and no near-duplicates (the old grid had 20 and 21).
+    for (let k = 1; k < LOOKBACK_GRID.length; k++) {
+      const ratio = LOOKBACK_GRID[k] / LOOKBACK_GRID[k - 1];
+      expect(ratio).toBeGreaterThan(1.2);
+      expect(ratio).toBeLessThan(1.5);
     }
   });
 
@@ -985,12 +1049,16 @@ describe('genome', () => {
     };
     const fixed = repairGenome(mess, 'long-short', DEFAULT_LIMITS, rng);
     assertValid(fixed, 'long-short');
+    // Indicator soup is migrated onto a hypothesis: a trend genome becomes trend following on its EMA primitive.
+    expect(fixed.hypothesis).toBe('TREND_FOLLOWING');
+    expect(fixed.longEntry.conditions[0].ind).toBe('PRICE_MA');
     expect(fixed.longEntry.conditions.length).toBeLessThanOrEqual(2);
     // 2.4 / 1.6 ATR snaps to 2.5 / 1.5: the target is not 1 ATR beyond the stop, so the trail is dropped.
     expect(fixed.exit).toMatchObject({ stopAtrMult: 2.5, takeProfitAtrMult: 1.5, trailing: false });
     expect(fixed.maxBarsInTrade).toBe(10);
 
-    // A valid mean-reversion version of the same idea survives intact.
+    // A Supertrend fade inside a slow uptrend is the dip-buy idea: its trigger becomes the RSI primitive,
+    // and its slow-uptrend filter is kept (on the EMA primitive, snapped to the geometric grid).
     const fade = repairGenome(
       {
         archetype: 'MEAN_REVERSION',
@@ -998,7 +1066,7 @@ describe('genome', () => {
           logic: 'AND',
           conditions: [
             { ind: 'SUPERTREND', period: 10, mult: 3, op: 'cross_below' },
-            { ind: 'PRICE_MA', maType: 'SMA', period: 200, op: 'gt' },
+            { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' },
           ],
         },
         shortEntry: null,
@@ -1009,12 +1077,33 @@ describe('genome', () => {
       DEFAULT_LIMITS,
       rng,
     );
-    expect(groupFormula(fade.longEntry)).toBe('Close crosses below Supertrend(10,3.0) AND Close > SMA(200)');
-    expect(groupFormula(fade.shortEntry!)).toBe('Close crosses above Supertrend(10,3.0) AND Close < SMA(200)');
-    expect(countParameters(fade)).toBe(7); // 2 + 1 + ATR period, stop, target + time stop
+    assertValid(fade, 'long-short');
+    expect(fade.hypothesis).toBe('DIP_IN_UPTREND');
+    expect(fade.longEntry.conditions[0].ind).toBe('RSI');
+    expect(groupFormula({ logic: 'AND', conditions: [fade.longEntry.conditions[1]] })).toBe('Close > EMA(200)');
 
-    // Parameter cap: MACD (3) + Bollinger bandwidth (3) + ATR exit (3) + time stop (1) = 10 → trimmed to ≤ 8.
-    const heavy = repairGenome(
+    // A genome already built from a hypothesis's primitives survives repair intact.
+    const dip: StrategyGenome = {
+      archetype: 'MEAN_REVERSION',
+      hypothesis: 'DIP_IN_UPTREND',
+      longEntry: {
+        logic: 'AND',
+        conditions: [
+          { ind: 'RSI', period: 14, op: 'lt', level: 30 },
+          { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' },
+        ],
+      },
+      shortEntry: null,
+      exit: dynamicExit(2.5, 3, false),
+      maxBarsInTrade: 20,
+    };
+    const kept = repairGenome(dip, 'long-short', DEFAULT_LIMITS, rng);
+    expect(groupFormula(kept.longEntry)).toBe('RSI(14) < 30 AND Close > EMA(200)');
+    expect(groupFormula(kept.shortEntry!)).toBe('RSI(14) > 70 AND Close < EMA(200)');
+    expect(countParameters(kept)).toBe(7); // 2 + 1 + ATR period, stop, target + time stop
+
+    // Parameter cap on a hand-built genome: MACD (3) + Bollinger bandwidth (3) + ATR exit (3) + time stop (1) = 10 → ≤ 8.
+    const heavy = normalizeGenome(
       {
         archetype: 'TREND',
         longEntry: {
@@ -1030,43 +1119,45 @@ describe('genome', () => {
       },
       'long-only',
       DEFAULT_LIMITS,
-      rng,
     );
     expect(countParameters(heavy)).toBeLessThanOrEqual(MAX_PARAMETERS);
     expect(heavy.maxBarsInTrade).toBeNull();
+    // Repairing it puts it on a hypothesis, which can never exceed the cap.
+    expect(countParameters(repairGenome(heavy, 'long-only', DEFAULT_LIMITS, rng))).toBeLessThanOrEqual(MAX_PARAMETERS);
   });
 
   it('respects dataset limits (short histories, missing volume)', () => {
     const rng = mulberry32(7);
     const limits = { maxLookback: 50, hasVolume: false };
-    let genome = randomGenome(rng, 'long-short', limits);
-    for (let i = 0; i < 2000; i++) {
-      genome = rng() < 0.3 ? randomGenome(rng, 'long-short', limits) : mutateGenome(rng, genome, 'long-short', limits, 2);
-      expect(isCoherent(genome, limits)).toBe(true);
-      for (const c of conditionsOf(genome)) {
-        expect(c.ind).not.toBe('VOLUME');
-        for (const lookback of numericParams(c)) expect(lookback).toBeLessThanOrEqual(50);
+    for (const h of ['TREND_FOLLOWING', 'VOL_BREAKOUT', 'RANGE_REVERSION'] as const) {
+      let genome = randomGenome(rng, 'long-short', limits, h);
+      for (let i = 0; i < 700; i++) {
+        genome = rng() < 0.3 ? randomGenome(rng, 'long-short', limits, h) : mutateGenome(rng, genome, 'long-short', limits, 2);
+        expect(isCoherent(genome, limits)).toBe(true);
+        for (const c of conditionsOf(genome)) {
+          expect(c.ind).not.toBe('VOLUME'); // no usable volume: the breakout runs without its confirmation filter
+          for (const lookback of numericParams(c)) expect(lookback).toBeLessThanOrEqual(50);
+        }
       }
-      // No 100-bar regime filter is possible, so the optional second condition must be a FILTER.
-      const second = genome.longEntry.conditions[1];
-      if (second) expect(conditionRole(second)).toBe('FILTER');
     }
+    // No 100-bar trend filter fits, so the dip-buy hypothesis is refused rather than run without its filter.
+    expect(hypothesisUnsupported('DIP_IN_UPTREND', limits)).not.toBeNull();
   });
 
   it('enumerates ±20% single-parameter neighbours on the grids', () => {
+    const base = normalizeGenome(DIP, 'long-only', DEFAULT_LIMITS);
     const variants = parameterVariants(DIP, 'long-only', DEFAULT_LIMITS);
     // RSI period, RSI level, stop %, target % → two neighbours each; the 100-bar regime filter can only move up.
     expect(variants.length).toBeGreaterThanOrEqual(8);
-    const base = genomeSignature(DIP);
     const signatures = new Set(variants.map(genomeSignature));
     expect(signatures.size).toBe(variants.length);
-    expect(signatures.has(base)).toBe(false);
+    expect(signatures.has(genomeSignature(base))).toBe(false);
     for (const variant of variants) {
       assertValid(variant, 'long-only');
       expect(variant.archetype).toBe(DIP.archetype);
       // Exactly one number differs from the original.
       const a = JSON.stringify(variant).match(/-?\d+(\.\d+)?/g) ?? [];
-      const b = JSON.stringify(DIP).match(/-?\d+(\.\d+)?/g) ?? [];
+      const b = JSON.stringify(base).match(/-?\d+(\.\d+)?/g) ?? [];
       expect(a.length).toBe(b.length);
       expect(a.filter((value, index) => value !== b[index]).length).toBe(1);
     }
@@ -1119,7 +1210,7 @@ describe('descriptions and Pine export', () => {
   });
 
   it('renders formulas and coherent plain-English rules', () => {
-    expect(groupFormula(DIP.longEntry)).toBe('RSI(14) < 45 AND Close > EMA(100)');
+    expect(groupFormula(DIP.longEntry)).toBe('RSI(14) < 45 AND Close > EMA(112)');
     expect(indicatorBadges(DIP)).toEqual(['RSI', 'EMA']);
     expect(indicatorBadges(TREND)).toEqual(['Supertrend', 'ATR']);
     const entry = describeLongEntry(DIP);
@@ -1150,7 +1241,7 @@ describe('descriptions and Pine export', () => {
       for (const sizing of [RISK.sizing, SETTINGS.sizing, { mode: 'risk', riskPct: 1, compounding: true }] as const) {
         const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
         for (let i = 0; i < 150; i++) {
-          const genome = randomGenome(rng, mode, DEFAULT_LIMITS);
+          const genome = randomGenome(rng, mode, DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
           const script = generatePineScript(resultFor(genome, settings), ctx(settings));
           expect(script.startsWith('//@version=5\n')).toBe(true);
           expect(script).toContain('strategy("StrategyFinder S-1 | XRP-USD 1d"');
@@ -1199,7 +1290,7 @@ describe('descriptions and Pine export', () => {
     expect(staticScript).toContain('stopLossPct   = input.float(4.0, "Stop loss %"');
     expect(staticScript).toContain('takeProfitPct = input.float(10.0, "Take profit %"');
     expect(staticScript).toContain('longCond1 = rsi_14 < 45');
-    expect(staticScript).toContain('longCond2 = close > ema_100');
+    expect(staticScript).toContain('longCond2 = close > ema_112');
     expect(staticScript).toContain('riskPct       = input.float(2.0, "Risk per trade (%)"');
     expect(staticScript).toContain('compound      = input.bool(false,');
     expect(staticScript).toContain('riskCapital  = compound ? math.max(strategy.equity, 0) : strategy.initial_capital');
@@ -1445,5 +1536,118 @@ describe('stage 1: execution friction and basket hygiene', () => {
     expect(after.v[n - 1]).not.toBe(before.v[n - 1]);
     // Prices are untouched by volume.
     expect(Array.from(after.c)).toEqual(Array.from(before.c));
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+describe('stage 3: multiple testing, deduplication and risk', () => {
+  const metrics = (sharpeAnnual: number, years: number, ppy = 365): PerformanceMetrics => ({
+    ...emptyMetrics(),
+    bars: Math.round(years * ppy),
+    sharpeRaw: sharpeAnnual / Math.sqrt(ppy),
+    sharpe: sharpeAnnual,
+    skew: 0,
+    kurtosis: 3,
+  });
+
+  it('haircuts the Sharpe ratio for the number of trials (Harvey & Liu, Bonferroni)', () => {
+    const m = metrics(2, 1);
+    const one = haircutSharpe(m, 1, 365);
+    const many = haircutSharpe(m, 10_000, 365);
+    // A single trial keeps nearly all of it; ten thousand trials take a lot more away.
+    expect(one.haircut).toBeLessThan(0.15);
+    expect(many.haircut).toBeGreaterThan(one.haircut);
+    expect(many.sharpe).toBeLessThan(one.sharpe);
+    // Bonferroni: the adjusted p-value is N × p, capped at 1.
+    expect(many.adjustedP).toBeCloseTo(Math.min(1, many.pValue * 10_000), 12);
+    // Monotone in the number of trials.
+    let previous = Infinity;
+    for (const n of [1, 10, 100, 1000, 10_000]) {
+      const h = haircutSharpe(m, n, 365).sharpe;
+      expect(h).toBeLessThanOrEqual(previous + 1e-12);
+      previous = h;
+    }
+    // A Sharpe fully explained by luck keeps nothing; a negative one is not "improved" by the haircut.
+    expect(haircutSharpe(metrics(0.5, 1), 5000, 365)).toMatchObject({ sharpe: 0, haircut: 1 });
+    expect(haircutSharpe(metrics(-1, 2), 10, 365).haircut).toBe(1);
+    // Far in the tail (huge t-statistic) nothing measurable is removed and nothing overflows.
+    const huge = haircutSharpe(metrics(20, 10), 10_000, 365);
+    expect(Number.isFinite(huge.sharpe)).toBe(true);
+    expect(huge.sharpe).toBeGreaterThan(15);
+  });
+
+  it('seeds and merges trial statistics exactly as if every trial had been pushed', () => {
+    const rng = mulberry32(3);
+    const values = Array.from({ length: 500 }, () => gaussian(rng) * 0.7 + 0.1);
+    const all = new RunningStats();
+    for (const v of values) all.push(v);
+    const a = new RunningStats();
+    const b = new RunningStats();
+    values.slice(0, 180).forEach((v) => a.push(v));
+    values.slice(180).forEach((v) => b.push(v));
+    const merged = RunningStats.from(a);
+    merged.merge(b);
+    expect(merged.count).toBe(all.count);
+    expect(merged.mean).toBeCloseTo(all.mean, 12);
+    expect(merged.variance).toBeCloseTo(all.variance, 12);
+    // Scaling (per-bar ↔ annualised) scales the mean linearly and the variance quadratically.
+    const scaled = RunningStats.from(all.scaled(Math.sqrt(365)));
+    expect(scaled.mean).toBeCloseTo(all.mean * Math.sqrt(365), 9);
+    expect(scaled.variance).toBeCloseTo(all.variance * 365, 9);
+    // Seeding with earlier trials raises the selection-bias hurdle.
+    const fresh = expectedMaxSharpe(all.count, all.variance);
+    const seeded = RunningStats.from({ count: 9000, mean: all.mean, m2: all.variance * 8999 });
+    for (const v of values) seeded.push(v);
+    expect(expectedMaxSharpe(seeded.count, seeded.variance)).toBeGreaterThan(fresh);
+  });
+
+  it('fingerprints trade logs: identical trades match, different trades do not', () => {
+    const data = dataset('ETH-USD');
+    const n = data.c.length;
+    const ind = new IndicatorCache(data);
+    const ws = new BacktestWorkspace(n);
+    runBacktest(ind, TREND, SETTINGS, ws);
+    const a = tradeLogHash(ws, n);
+    runBacktest(ind, TREND, SETTINGS, ws);
+    expect(tradeLogHash(ws, n)).toBe(a);
+    // Only trades opened before `bars` count.
+    expect(tradeLogHash(ws, 0)).toMatch(/^0:/);
+    runBacktest(ind, DIP, SETTINGS, ws);
+    expect(tradeLogHash(ws, n)).not.toBe(a);
+    // Higher fees change only the PnL – still a different trade log.
+    runBacktest(ind, TREND, { ...SETTINGS, feePct: 0.3 }, ws);
+    expect(tradeLogHash(ws, n)).not.toBe(a);
+  });
+
+  it('scores overfitting risk from the evidence, 0 (low) to 100 (high)', () => {
+    const data = dataset();
+    const split = splitFor(data.c.length);
+    const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, barsPerYear(data.t));
+    const base: StrategyResult = {
+      id: 'S-1', genome: TREND, fitness: 1, params: 4, dsr: 0.97, ...m, holdout: null, alpha: 0,
+      equity: new Float32Array(0), foundAt: 1, assets: [], robustness: null, verdict: null,
+      pointFitness: 1, neighbourMedian: 1, neighbourCount: 6, haircutSharpe: 1.4, haircut: 0.1,
+      folds: Array.from({ length: 5 }, () => ({ ...emptyMetrics(), roi: 3 })), regimes: [],
+      search: { ...m.search, trades: 400 },
+    };
+    const good = overfittingRisk(base);
+    expect(good.components.reduce((sum, c) => sum + c.weight, 0)).toBe(100);
+    expect(good.level).toBe('low');
+    const bad = overfittingRisk({
+      ...base, dsr: 0.02, haircut: 1, pointFitness: 3, neighbourMedian: 0.2,
+      folds: Array.from({ length: 5 }, (_, k) => ({ ...emptyMetrics(), roi: k === 0 ? 40 : -2 })),
+      search: { ...base.search, trades: 110 },
+    });
+    expect(bad.level).toBe('high');
+    expect(bad.score).toBeGreaterThan(80);
+    expect(bad.score).toBeLessThanOrEqual(100);
+    // "Most likely luck" (DSR under 50%) is high risk even when the weighted sum is modest.
+    const lucky = overfittingRisk({ ...base, dsr: 0.3 });
+    expect(lucky.score).toBeLessThan(65);
+    expect(lucky.level).toBe('high');
+    // Each component moves the score in the right direction on its own.
+    expect(overfittingRisk({ ...base, dsr: 0.1 }).score).toBeGreaterThan(good.score);
+    expect(overfittingRisk({ ...base, neighbourMedian: -1 }).score).toBeGreaterThan(good.score);
   });
 });

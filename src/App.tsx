@@ -6,7 +6,7 @@
  */
 
 import { Activity, Info, Lock, Pin, TriangleAlert, X } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ControlBar from './components/ControlBar';
 import EquityChart, { BENCHMARK_COLOR, STRATEGY_COLOR } from './components/EquityChart';
 import Leaderboard from './components/Leaderboard';
@@ -24,6 +24,7 @@ import {
   parseUniverse,
   resolveAssets,
   resolveUniverse,
+  runSymbols,
   settingsFrom,
   venueLabel,
   type RunConfig,
@@ -31,12 +32,14 @@ import {
 } from './lib/config';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
+import { budgetStatus, estimateSearchWindow, priorTrials, recordRunTrials, searchWindowFor } from './lib/trialLedger';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
   clampRange,
   DEFAULT_CRYPTO_UNIVERSE,
   DEFAULT_STOCK_UNIVERSE,
+  WINDOW_TRIAL_BUDGET,
   type BenchmarkResult,
   type ChartAxis,
   type EngineStatus,
@@ -44,6 +47,7 @@ import {
   type PerformanceMetrics,
   type ProgressSnapshot,
   type RobustnessReport,
+  type StopReason,
   type StrategyResult,
   type Verdict,
   type WorkerRequest,
@@ -71,6 +75,11 @@ const DEFAULT_UNIVERSES = [DEFAULT_CRYPTO_UNIVERSE.join(', '), DEFAULT_STOCK_UNI
 const EMPTY_TELEMETRY: ProgressSnapshot = {
   iteration: 0,
   stagnation: 0,
+  evaluations: 0,
+  windowTrials: 0,
+  dsrStall: 0,
+  duplicates: 0,
+  runTrials: { count: 0, mean: 0, m2: 0 },
   bestFitness: null,
   bestDsr: null,
   bestDsrSharpe: null,
@@ -121,6 +130,12 @@ export default function App(): JSX.Element {
   /** On-demand robustness reports, by strategy id. */
   const [analyses, setAnalyses] = useState<Record<string, Analysis>>({});
   const [pendingAnalyses, setPendingAnalyses] = useState<Record<string, boolean>>({});
+  /** Why the last run ended. */
+  const [stopReason, setStopReason] = useState<StopReason | null>(null);
+  /** Bumped whenever this tab writes the trial ledger, so the budget meter re-reads it. */
+  const [ledgerVersion, setLedgerVersion] = useState(0);
+  /** When this run's trials were last written to the ledger. */
+  const lastLedgerWrite = useRef(0);
   /** The one strategy of this run whose holdout has been revealed. */
   const [lockedId, setLockedId] = useState<string | null>(null);
   const [lockPending, setLockPending] = useState(false);
@@ -192,6 +207,12 @@ export default function App(): JSX.Element {
         case 'progress': {
           const { type: _type, ...snapshot } = message;
           queueProgress(snapshot);
+          // Persist this run's trials as they accrue (at most once a second), so a reload keeps them.
+          const now = Date.now();
+          if (contextRef.current && now - lastLedgerWrite.current >= 1000) {
+            lastLedgerWrite.current = now;
+            recordRunTrials(contextRef.current.trialWindow, contextRef.current.runId, snapshot.runTrials, contextRef.current.hypothesis);
+          }
           break;
         }
         case 'leaderboard':
@@ -210,7 +231,12 @@ export default function App(): JSX.Element {
           setPinned((current) => (current ? (strategies.find((s) => s.id === current.id) ?? null) : null));
           setAnalyses({});
           setPendingAnalyses({});
-          setStatus(reason === 'converged' ? 'converged' : 'stopped');
+          if (contextRef.current) {
+            recordRunTrials(contextRef.current.trialWindow, contextRef.current.runId, snapshot.runTrials, contextRef.current.hypothesis);
+            setLedgerVersion((v) => v + 1);
+          }
+          setStopReason(reason);
+          setStatus(reason === 'stopped' ? 'stopped' : 'converged');
           // The search is over, so the evaluator pool is no longer needed. The optimiser
           // worker stays alive to answer robustness-analysis requests.
           disposePool();
@@ -283,6 +309,9 @@ export default function App(): JSX.Element {
     setPendingAnalyses({});
     setLockedId(null);
     setLockPending(false);
+    setStopReason(null);
+    lastLedgerWrite.current = 0;
+    const ledgerRunId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 
     try {
       const tradedSymbols = assets.components.map((component) => component.symbol);
@@ -300,12 +329,28 @@ export default function App(): JSX.Element {
       // Every symbol whose holdout this run can show, over the dates of the primary dataset's holdout.
       const holdoutWindow = holdoutWindowFor(symbols, config.interval, dataset.data.t);
       const earlier = priorReveals(holdoutWindow);
+      // Every trial already spent on this search period – in any run, any session – counts against it.
+      const trialWindow = searchWindowFor(symbols, config.interval, dataset.data.t);
+      const prior = priorTrials(trialWindow);
+      if (prior.count >= WINDOW_TRIAL_BUDGET) {
+        setError(
+          `The trial budget of this data window is spent (${fmtInt(prior.count)} of ${fmtInt(WINDOW_TRIAL_BUDGET)} evaluations over ` +
+            `${prior.runs} runs). More search on the same data can only find luckier noise – wait for new data or test other assets.`,
+        );
+        setLedgerVersion((v) => v + 1);
+        setStatus('idle');
+        return;
+      }
       const runContext: RunContext = {
         label: dataset.label,
         interval: config.interval,
         range: config.range,
         settings,
-        maxStagnation: config.maxStagnation,
+        maxEvaluations: Math.min(config.maxEvaluations, WINDOW_TRIAL_BUDGET - prior.count),
+        hypothesis: config.hypothesis,
+        runId: ledgerRunId,
+        trialWindow,
+        priorTrials: prior,
         universe: datasets.map((entry) => entry.symbol),
         venue: venueLabel(tradedSymbols.map((symbol) => loaded.series[symbol])),
         holdoutWindow,
@@ -357,7 +402,15 @@ export default function App(): JSX.Element {
 
       const request: WorkerRequest = {
         type: 'start',
-        payload: { datasets, settings, maxStagnation: config.maxStagnation, ports },
+        payload: {
+          datasets,
+          settings,
+          hypothesis: config.hypothesis,
+          maxEvaluations: config.maxEvaluations,
+          priorTrials: { count: prior.count, mean: prior.mean, m2: prior.m2 },
+          windowBudget: WINDOW_TRIAL_BUDGET,
+          ports,
+        },
       };
       worker.postMessage(request, ports);
       setStatus('optimizing');
@@ -453,6 +506,33 @@ export default function App(): JSX.Element {
   const displayedRank = rankOf(displayed);
   const revealed = benchmark?.holdout != null;
   const finished = status === 'converged' || status === 'stopped';
+  const busy = status === 'loading' || status === 'optimizing';
+
+  /**
+   * Trial budget of the active data window. While a run is live (or its results are shown and the
+   * selection is unchanged) it is the run's exact window: earlier trials plus this run's. Otherwise
+   * it is estimated from the selected assets, timeframe and range, read from the persistent ledger.
+   */
+  const budget = useMemo(() => {
+    void ledgerVersion; // re-read the ledger after this tab wrote it
+    const symbols = runSymbols(config);
+    const sameSelection =
+      context !== null &&
+      context.interval === config.interval &&
+      context.range === config.range &&
+      [...symbols].sort().join('+') === context.trialWindow.symbols.join('+');
+    if (context && (busy || sameSelection)) {
+      const used = busy || finished ? context.priorTrials.count + telemetry.evaluations : priorTrials(context.trialWindow).count;
+      return { status: budgetStatus(context.trialWindow, used), estimated: false };
+    }
+    if (symbols.length === 0) return null;
+    const window = estimateSearchWindow(symbols, config.interval, config.range, Date.now());
+    return { status: budgetStatus(window, priorTrials(window).count), estimated: true };
+  }, [config, context, busy, finished, telemetry.evaluations, ledgerVersion]);
+  const budgetBlocked =
+    !busy && budget !== null && budget.status.level === 'exhausted'
+      ? `The trial budget of this data window is spent (${fmtInt(budget.status.used)} of ${fmtInt(budget.status.limit)} evaluations). Search on the same data is disabled – pick other assets, another period, or wait for new data.`
+      : null;
 
   // Opening the breakdown requests a robustness report: once while the run is live
   // (no verdict yet) and once after it has ended (with the holdout and other assets).
@@ -498,10 +578,13 @@ export default function App(): JSX.Element {
         status={status}
         onStart={() => void start()}
         onStop={stop}
+        budgetBlocked={budgetBlocked}
       />
 
       <TelemetryStrip
-        maxStagnation={context?.maxStagnation ?? config.maxStagnation}
+        maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
+        stopReason={stopReason}
+        budget={budget}
         status={status}
         telemetry={telemetry}
         benchmarkSharpe={benchmark?.validation.sharpe ?? null}
@@ -718,7 +801,7 @@ export default function App(): JSX.Element {
           rank={displayedRank}
           benchmark={benchmark}
           context={context}
-          testedCount={telemetry.iteration}
+          testedCount={telemetry.evaluations}
           barsPerYear={barsPerYear}
           analysis={analyses[displayed.id] ?? null}
           analysisPending={pendingAnalyses[displayed.id] === true}

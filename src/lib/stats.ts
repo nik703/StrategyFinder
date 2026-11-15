@@ -109,7 +109,19 @@ export function sharpeConfidenceInterval(
 export class RunningStats {
   count = 0;
   mean = 0;
-  private m2 = 0;
+  /** Sum of squared deviations from the mean. */
+  m2 = 0;
+
+  /** Statistics that start from an existing summary (e.g. the trials of earlier sessions). */
+  static from(summary: { count: number; mean: number; m2: number }): RunningStats {
+    const stats = new RunningStats();
+    if (summary.count > 0 && Number.isFinite(summary.mean) && Number.isFinite(summary.m2)) {
+      stats.count = Math.floor(summary.count);
+      stats.mean = summary.mean;
+      stats.m2 = Math.max(0, summary.m2);
+    }
+    return stats;
+  }
 
   push(value: number): void {
     this.count++;
@@ -118,8 +130,69 @@ export class RunningStats {
     this.m2 += delta * (value - this.mean);
   }
 
+  /** Fold another summary into this one (Chan et al.'s parallel update): as if every value had been pushed here. */
+  merge(other: { count: number; mean: number; m2: number }): void {
+    if (!(other.count > 0)) return;
+    if (this.count === 0) {
+      this.count = other.count;
+      this.mean = other.mean;
+      this.m2 = other.m2;
+      return;
+    }
+    const count = this.count + other.count;
+    const delta = other.mean - this.mean;
+    this.m2 += other.m2 + (delta * delta * this.count * other.count) / count;
+    this.mean += (delta * other.count) / count;
+    this.count = count;
+  }
+
+  /** The same statistics with every value multiplied by `factor` (e.g. per-bar ↔ annualised Sharpe). */
+  scaled(factor: number): { count: number; mean: number; m2: number } {
+    return { count: this.count, mean: this.mean * factor, m2: this.m2 * factor * factor };
+  }
+
   /** Sample variance (0 with fewer than two observations). */
   get variance(): number {
     return this.count > 1 ? this.m2 / (this.count - 1) : 0;
   }
+}
+
+export interface HaircutSharpe {
+  /** Annualised Sharpe that survives the multiple-testing correction (0 when nothing survives). */
+  sharpe: number;
+  /** Share of the observed Sharpe removed (0–1; 1 = entirely explained by the number of trials). */
+  haircut: number;
+  /** Two-sided p-value of the observed Sharpe on its own. */
+  pValue: number;
+  /** The same p-value after the Bonferroni correction for `trials` tests. */
+  adjustedP: number;
+}
+
+/**
+ * Haircut Sharpe ratio (Harvey & Liu, 2015, "Backtesting"). The observed Sharpe is turned into a
+ * t-statistic (with the same skew- and kurtosis-aware standard error as the deflated Sharpe), its
+ * p-value is multiplied by the number of strategies tried (Bonferroni – the conservative member of
+ * the family Harvey & Liu use; for the best of N strategies Holm's correction is identical), and
+ * the corrected p-value is turned back into the Sharpe it would correspond to. A strategy whose
+ * Sharpe is fully explained by the number of trials keeps a haircut Sharpe of 0.
+ */
+export function haircutSharpe(
+  m: Pick<PerformanceMetrics, 'sharpeRaw' | 'bars' | 'skew' | 'kurtosis'>,
+  trials: number,
+  periodsPerYear: number,
+): HaircutSharpe {
+  const se = sharpeStandardError(m.sharpeRaw, m.bars, m.skew, m.kurtosis);
+  const annualise = Math.sqrt(periodsPerYear);
+  if (!Number.isFinite(se) || se <= 0 || !(m.sharpeRaw > 0)) {
+    return { sharpe: Math.min(0, m.sharpeRaw * annualise), haircut: 1, pValue: 1, adjustedP: 1 };
+  }
+  const t = m.sharpeRaw / se;
+  const observed = m.sharpeRaw * annualise;
+  const pValue = Math.min(1, 2 * normalCdf(-t));
+  const adjustedP = Math.min(1, pValue * Math.max(1, trials));
+  // Far in the tail the p-value underflows: nothing measurable is left to haircut.
+  if (adjustedP < 1e-15) return { sharpe: observed, haircut: 0, pValue, adjustedP };
+  const tAdjusted = adjustedP >= 1 ? 0 : Math.min(t, inverseNormalCdf(1 - adjustedP / 2));
+  const sharpe = Math.max(0, tAdjusted * se) * annualise;
+  return { sharpe, haircut: Math.min(1, Math.max(0, 1 - sharpe / observed)), pValue, adjustedP };
 }

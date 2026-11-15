@@ -22,17 +22,20 @@ import {
 } from '../lib/config';
 import {
   HISTORY_RANGES,
+  HYPOTHESIS_IDS,
   INTERVALS,
-  MAX_MAX_STAGNATION,
   MAX_RANGE,
-  MIN_MAX_STAGNATION,
+  MIN_RUN_EVALUATIONS,
   rangeAllowed,
+  WINDOW_TRIAL_BUDGET,
   YAHOO_MAX_DAYS,
   type EngineStatus,
   type HistoryRange,
+  type Hypothesis,
   type Interval,
   type TradeMode,
 } from '../types/trading';
+import { HYPOTHESES } from '../engine/genome';
 import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
 
 interface ControlBarProps {
@@ -45,6 +48,8 @@ interface ControlBarProps {
   status: EngineStatus;
   onStart: () => void;
   onStop: () => void;
+  /** Set when the trial budget of the selected data window is spent: Start is then disabled with this reason. */
+  budgetBlocked: string | null;
 }
 
 /** Colours for the allocation bar (identity only – not a chart series). */
@@ -62,6 +67,11 @@ function rangeOptions(interval: Interval): { value: HistoryRange; label: string;
     };
   });
 }
+const HYPOTHESIS_OPTIONS: { value: Hypothesis; label: string; title: string }[] = HYPOTHESIS_IDS.map((id) => ({
+  value: id,
+  label: HYPOTHESES[id].label,
+  title: `${HYPOTHESES[id].rationale}\nTrigger: ${HYPOTHESES[id].trigger}\n${HYPOTHESES[id].filter}`,
+}));
 const MODE_OPTIONS: { value: TradeMode; label: string }[] = [
   { value: 'long-only', label: 'Long-Only' },
   { value: 'long-short', label: 'Long/Short' },
@@ -289,6 +299,7 @@ export default function ControlBar({
   status,
   onStart,
   onStop,
+  budgetBlocked,
 }: ControlBarProps): JSX.Element {
   const listId = useId();
   const busy = status === 'loading' || status === 'optimizing';
@@ -477,16 +488,18 @@ export default function ControlBar({
             className="w-[112px]"
           />
         </div>
-        <NumberField
-          label="Stagnation limit"
-          value={config.maxStagnation}
-          min={MIN_MAX_STAGNATION}
-          max={MAX_MAX_STAGNATION}
-          step={500}
-          onChange={(maxStagnation) => onChange({ maxStagnation: Math.round(maxStagnation) })}
-          disabled={busy}
-          className="w-[124px]"
-        />
+        <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs.`}>
+          <NumberField
+            label="Evaluations / run"
+            value={config.maxEvaluations}
+            min={MIN_RUN_EVALUATIONS}
+            max={WINDOW_TRIAL_BUDGET}
+            step={500}
+            onChange={(maxEvaluations) => onChange({ maxEvaluations: Math.round(maxEvaluations) })}
+            disabled={busy}
+            className="w-[124px]"
+          />
+        </div>
         <div>
           <FieldLabel>Mode</FieldLabel>
           <Segmented
@@ -502,7 +515,8 @@ export default function ControlBar({
           <button
             type="button"
             onClick={onStart}
-            disabled={busy}
+            disabled={busy || budgetBlocked !== null}
+            title={budgetBlocked ?? undefined}
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-white transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
           >
             {status === 'loading' ? (
@@ -529,6 +543,29 @@ export default function ControlBar({
             runs on this timeframe are short. Crypto loads the full {config.range} from Binance.
           </p>
         )}
+      </div>
+      {budgetBlocked !== null && !busy && (
+        <p role="alert" className="mt-3 flex items-start gap-1.5 text-xs text-down">
+          <Info size={13} className="mt-0.5 shrink-0" />
+          {budgetBlocked}
+        </p>
+      )}
+      {/* Hypothesis – what the run tests; the search only tunes its numbers */}
+      <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">
+        <div>
+          <FieldLabel>Market hypothesis</FieldLabel>
+          <Segmented
+            ariaLabel="Market hypothesis"
+            options={HYPOTHESIS_OPTIONS}
+            value={config.hypothesis}
+            onChange={(hypothesis) => onChange({ hypothesis })}
+            disabled={busy}
+          />
+        </div>
+        <p className="min-w-[260px] flex-1 pt-5 text-xs leading-relaxed text-ink-3">
+          <span className="font-semibold text-ink-2">{HYPOTHESES[config.hypothesis].label}.</span> {HYPOTHESES[config.hypothesis].rationale}{' '}
+          <span className="text-ink-2">Trigger:</span> {HYPOTHESES[config.hypothesis].trigger} {HYPOTHESES[config.hypothesis].filter}
+        </p>
       </div>
       {/* Row 3 – risk and robustness (run settings the optimiser cannot tune) */}
       <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">

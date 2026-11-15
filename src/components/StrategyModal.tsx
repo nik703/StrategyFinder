@@ -16,7 +16,9 @@ import {
   listIndicators,
   type RuleDescription,
 } from '../engine/describe';
-import { FREE_PARAMETERS, MAX_PARAMETERS } from '../engine/genome';
+import { FREE_PARAMETERS, HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
+import { overfittingRisk } from '../lib/risk';
+import StabilityHeatmap from './StabilityHeatmap';
 import { MIN_HOLDOUT_TRADES } from '../engine/backtester';
 import { generatePineScript } from '../engine/pine';
 import type { RunContext } from '../lib/config';
@@ -32,7 +34,7 @@ interface StrategyModalProps {
   rank: number | null;
   benchmark: BenchmarkResult;
   context: RunContext;
-  /** Total number of strategies the optimiser has evaluated so far. */
+  /** Strategies this run has evaluated (earlier runs on the window are in `context.priorTrials`). */
   testedCount: number;
   barsPerYear: number;
   /** Result of an on-demand `analyze` request; overrides the report carried by the strategy. */
@@ -188,6 +190,8 @@ export default function StrategyModal({
   const report = analysis?.report ?? strategy.robustness;
   const verdict = analysis?.verdict ?? strategy.verdict;
   const revealed = strategy.holdout !== null;
+  const risk = useMemo(() => overfittingRisk(strategy), [strategy]);
+  const hypothesis = genome.hypothesis ? HYPOTHESES[genome.hypothesis] : null;
 
   // Close on Escape, lock background scroll, and move focus into the dialog.
   useEffect(() => {
@@ -261,7 +265,7 @@ export default function StrategyModal({
                 Strategy {strategy.id}
               </h2>
               {rank !== null ? <Pill tone="accent">Rank #{rank}</Pill> : <Pill>No longer in Top 25</Pill>}
-              <Pill tone="bench">{ARCHETYPE_LABEL[genome.archetype]}</Pill>
+              <Pill tone="bench">{hypothesis ? hypothesis.label : ARCHETYPE_LABEL[genome.archetype]}</Pill>
               <Pill tone={genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exit.mode}</Pill>
               <Pill>{genome.shortEntry ? 'Long/Short' : 'Long-Only'}</Pill>
               <Pill tone={strategy.params > FREE_PARAMETERS ? 'warn' : 'neutral'}>{strategy.params} params</Pill>
@@ -287,20 +291,55 @@ export default function StrategyModal({
           {/* Headline numbers: selection-bias-aware and risk-adjusted first; raw return last and labelled in-sample. */}
           <div className="grid grid-cols-2 gap-2 px-5 pb-2 sm:grid-cols-3">
             <StatTile
+              label="Overfit risk"
+              value={`${risk.score} · ${risk.level}`}
+              tone={risk.level === 'low' ? 'text-up' : risk.level === 'moderate' ? 'text-warn' : 'text-down'}
+            />
+            <StatTile
               label="Deflated Sharpe"
               value={fmtPct(strategy.dsr * 100, false, 0)}
               tone={strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink'}
             />
+            <StatTile label="Haircut Sharpe" value={strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)} />
             <StatTile label="Validation Sharpe" value={fmtNum(strategy.validation.sharpe)} />
-            <StatTile label="Sortino (in-sample)" value={fmtNum(strategy.search.sortino)} />
             <StatTile label="Max drawdown" value={fmtPct(strategy.search.maxDrawdown)} />
             <StatTile label="Trades (validation)" value={`${fmtInt(strategy.search.trades)} (${fmtInt(strategy.validation.trades)})`} />
-            <StatTile label="ROI (in-sample)" value={fmtPct(strategy.search.roi, true)} tone="text-ink-2" />
           </div>
           <p className="px-5 pb-5 text-[11px] text-ink-3">
-            Except for the deflated Sharpe, these figures cover train + validation – the 80% of history the search optimised on, so they
-            are biased upwards. Excess ROI vs. Buy &amp; Hold over that period: {fmtPct(strategy.alpha, true)}.
+            The deflated and haircut Sharpe account for all {fmtInt(context.priorTrials.count + testedCount)} strategies tried on this data
+            window across every run. The other figures cover train + validation – the 80% of history the search optimised on, so they are
+            biased upwards: in-sample ROI {fmtPct(strategy.search.roi, true)}, {fmtPct(strategy.alpha, true)} vs. Buy &amp; Hold.
           </p>
+
+          <Section title="Overfitting risk" hint="0 = low · 100 = high">
+            <div className="flex flex-wrap items-baseline gap-3">
+              <span className="num text-3xl font-semibold text-ink">{risk.score}</span>
+              <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level} risk</Pill>
+              <span className="text-xs text-ink-3">
+                {risk.level === 'low'
+                  ? 'The evidence that this is more than a lucky fit is comparatively strong.'
+                  : risk.level === 'moderate'
+                    ? 'Some of the evidence points to a fit of past noise.'
+                    : 'Most of the evidence points to a fit of past noise – treat it as unproven.'}
+              </span>
+            </div>
+            <ul className="mt-3 space-y-1.5">
+              {risk.components.map((component) => (
+                <li key={component.key} className="grid grid-cols-[150px_minmax(0,1fr)_44px] items-center gap-3 text-xs">
+                  <span className="text-ink-2" title={`${component.weight} of 100 points`}>
+                    {component.label} <span className="text-ink-3">· {component.weight}</span>
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
+                      <span className="block h-full rounded-full bg-ink-3" style={{ width: `${component.risk * 100}%` }} />
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-ink-3">{component.detail}</span>
+                  </span>
+                  <span className="num text-right font-semibold text-ink">{Math.round(component.weight * component.risk)}</span>
+                </li>
+              ))}
+            </ul>
+          </Section>
 
           {context.simulated && (
             <div className="mx-5 mb-5 flex gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
@@ -312,8 +351,14 @@ export default function StrategyModal({
             </div>
           )}
 
-          <Section title="The idea" hint={ARCHETYPE_LABEL[genome.archetype]}>
+          <Section title="The idea" hint={hypothesis ? `Hypothesis: ${hypothesis.label}` : ARCHETYPE_LABEL[genome.archetype]}>
+            {hypothesis && (
+              <p className="mb-2 text-sm leading-relaxed text-ink">
+                <span className="font-semibold">{hypothesis.label}.</span> {hypothesis.rationale}
+              </p>
+            )}
             <p className="text-sm leading-relaxed text-ink-2">{describeArchetype(genome)}</p>
+            {hypothesis && <p className="mt-2 text-xs text-ink-3">One primitive per idea: it stands in for {hypothesis.replaces}</p>}
           </Section>
 
           <Section
@@ -489,7 +534,7 @@ export default function StrategyModal({
               <div>
                 <p>
                   <span className="font-semibold text-ink">Selection bias.</span>{' '}
-                  <span className="num">{fmtInt(testedCount)}</span> strategies have been tried on this data. Deflated Sharpe Ratio of the
+                  <span className="num">{fmtInt(context.priorTrials.count + testedCount)}</span> strategies have been tried on this data window (all runs). Deflated Sharpe Ratio of the
                   validation segment: <span className="num font-semibold text-ink">{fmtPct(strategy.dsr * 100, false, 1)}</span> – the
                   probability that the validation Sharpe of <span className="num">{fmtNum(strategy.validation.sharpe)}</span> is real
                   rather than the luckiest of that many attempts. Below 95% it is not statistically distinguishable from luck.
@@ -511,6 +556,18 @@ export default function StrategyModal({
                 ) : null}
               </div>
             </div>
+          </Section>
+
+          <Section title="Parameter stability" hint="Train + validation · primary asset">
+            {report?.stability ? (
+              <StabilityHeatmap grid={report.stability} />
+            ) : report ? (
+              <p className="text-sm text-ink-3">This strategy has no tunable parameter to map.</p>
+            ) : (
+              <p className="flex items-center gap-2 text-sm text-ink-3">
+                <Loader2 size={15} className="animate-spin" /> Mapping the parameter neighbourhood…
+              </p>
+            )}
           </Section>
 
           <Section title="Robustness" hint="Tested on train + validation; the holdout is not used">

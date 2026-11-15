@@ -5,6 +5,7 @@ import {
   BacktestWorkspace,
   barsPerYear,
   benchmarkEquity,
+  tradeLogHash,
   evaluateSearch,
   FOLDS,
   holdoutMetrics,
@@ -19,9 +20,15 @@ import {
 import { attachEvaluator } from '../src/engine/evaluation';
 import { IndicatorCache } from '../src/engine/indicators';
 import { countParameters, gaussian, isCoherent, MAX_PARAMETERS, mirrorGroup, mulberry32 } from '../src/engine/genome';
+import { deflatedSharpeAgainst } from '../src/lib/stats';
 import {
-  DEFAULT_MAX_STAGNATION,
+  DEFAULT_RUN_EVALUATIONS,
   DEFAULT_SIZING,
+  DSR_PATIENCE,
+  HYPOTHESIS_IDS,
+  WINDOW_TRIAL_BUDGET,
+  type Hypothesis,
+  type TrialStats,
   LEADERBOARD_SIZE,
   PROGRESS_EVERY,
   type BacktestSettings,
@@ -84,7 +91,16 @@ function randomWalk(n: number, seed: number, sigma = 0.02, drift = 0): NamedData
 function runOptimizer(
   datasets: NamedDataset[],
   settings: BacktestSettings,
-  options: { seed: number; stopAfterIterations?: number; maxStagnation?: number; ports?: MessagePort[]; batchSize?: number },
+  options: {
+    seed: number;
+    hypothesis?: Hypothesis;
+    stopAfterIterations?: number;
+    maxEvaluations?: number;
+    priorTrials?: TrialStats;
+    windowBudget?: number;
+    ports?: MessagePort[];
+    batchSize?: number;
+  },
 ): Promise<WorkerResponse[]> {
   return new Promise((resolve) => {
     const messages: WorkerResponse[] = [];
@@ -111,7 +127,10 @@ function runOptimizer(
           datasets,
           settings,
           seed: options.seed,
-          maxStagnation: options.maxStagnation,
+          hypothesis: options.hypothesis ?? 'TREND_FOLLOWING',
+          maxEvaluations: options.maxEvaluations,
+          priorTrials: options.priorTrials,
+          windowBudget: options.windowBudget,
           ports: options.ports,
           batchSize: options.batchSize,
         },
@@ -176,9 +195,14 @@ describe('optimizer worker', () => {
 
     // Progress every 25 iterations.
     const progress = ofType(messages, 'progress');
-    expect(progress.length).toBeGreaterThan(200);
+    expect(progress.length).toBeGreaterThan(10);
     progress.slice(0, -1).forEach((p, index) => expect(p.iteration).toBe((index + 1) * PROGRESS_EVERY));
-    for (const p of progress) expect(p.stagnation).toBeLessThanOrEqual(DEFAULT_MAX_STAGNATION);
+    for (const p of progress) {
+      expect(p.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
+      expect(p.windowTrials).toBe(p.evaluations); // no earlier runs on this window
+      expect(p.dsrStall).toBeLessThanOrEqual(DSR_PATIENCE);
+      expect(p.runTrials.count).toBe(p.evaluations);
+    }
 
     // While the run is live nothing about the holdout leaves the worker.
     const boards = ofType(messages, 'leaderboard');
@@ -194,12 +218,19 @@ describe('optimizer worker', () => {
       assertConstraints(board.strategies, 'long-short');
     }
 
-    // Converged at the default limit (5,000). The holdout is STILL sealed: nothing is revealed for the board.
+    // The run ends on its own: early stop (no DSR gain for 500 evaluations) or its 2,000-evaluation budget.
+    // The holdout is STILL sealed: nothing is revealed for the board.
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
-    expect(done.reason).toBe('converged');
-    expect(DEFAULT_MAX_STAGNATION).toBe(5000);
-    expect(done.stagnation).toBe(DEFAULT_MAX_STAGNATION);
+    expect(DEFAULT_RUN_EVALUATIONS).toBe(2000);
+    expect(DSR_PATIENCE).toBe(500);
+    expect(['converged', 'budget']).toContain(done.reason);
+    if (done.reason === 'converged') expect(done.dsrStall).toBe(DSR_PATIENCE);
+    else expect(done.evaluations).toBe(DEFAULT_RUN_EVALUATIONS);
+    expect(done.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
+    // Repeated genomes and repeated trade logs were skipped, not counted as trials.
+    expect(done.iteration).toBeGreaterThan(done.evaluations);
+    expect(done.duplicates).toBeGreaterThan(0);
     expect(done.benchmark.holdout).toBeNull();
     expect(done.benchmark.equity.length).toBe(axis.holdoutPos);
 
@@ -237,6 +268,20 @@ describe('optimizer worker', () => {
       expect(s.fitness).toBeLessThanOrEqual((s.pointFitness as number) + 1e-12);
       expect(s.fitness).toBeCloseTo(plateauFitness(s.pointFitness as number, [s.neighbourMedian as number]), 9);
     }
+    // Every listed strategy tests the run's hypothesis, and no two of them share a trade log.
+    const btc = dataset('BTC-USD', '1d', '5y');
+    const btcSplit = splitFor(btc.data.c.length);
+    const btcInd = new IndicatorCache(btc.data);
+    const btcWs = new BacktestWorkspace(btc.data.c.length);
+    const logs = new Set<string>();
+    for (const s of final) {
+      expect(s.genome.hypothesis).toBe('TREND_FOLLOWING');
+      expect(s.haircutSharpe).toBeDefined();
+      expect(s.haircut ?? -1).toBeGreaterThanOrEqual(0);
+      runBacktest(btcInd, s.genome, settings, btcWs, btcSplit.holdoutStart);
+      logs.add(tradeLogHash(btcWs, btcSplit.holdoutStart));
+    }
+    expect(logs.size).toBe(final.length);
     // The cap actually bites on part of the board: those strategies were spikes at their exact parameters.
     expect(final.filter((s) => (s.pointFitness as number) > s.fitness + 1e-9).length).toBeGreaterThan(0);
 
@@ -294,7 +339,6 @@ describe('optimizer worker', () => {
     expect(done.reason).toBe('stopped');
     expect(done.iteration).toBeGreaterThanOrEqual(300);
     expect(done.iteration).toBeLessThan(300 + 4 * PROGRESS_EVERY);
-    expect(done.stagnation).toBeLessThan(DEFAULT_MAX_STAGNATION);
     expect(done.strategies.length).toBeGreaterThan(0);
     assertConstraints(done.strategies, 'long-only');
     // Stopping ends the search but keeps the holdout sealed until one strategy is locked.
@@ -323,7 +367,10 @@ describe('optimizer worker', () => {
         if (message.type === 'done') resolve(message);
       };
       scope.onmessage?.({
-        data: { type: 'start', payload: { datasets: [dataset('NVDA', '1h', '1y')], settings: settingsFor('long-only'), seed: 8, maxStagnation: 300 } },
+        data: {
+          type: 'start',
+          payload: { datasets: [dataset('NVDA', '1h', '1y')], settings: settingsFor('long-only'), hypothesis: 'TREND_FOLLOWING', seed: 8, maxEvaluations: 300 },
+        },
       });
     });
     expect(replies).toHaveLength(1);
@@ -336,18 +383,61 @@ describe('optimizer worker', () => {
     if (done.strategies.length > 0) expect(lock(done.strategies[0].id).type).toBe('locked');
   }, 120_000);
 
-  it('honours a custom stagnation limit', async () => {
-    const messages = await runOptimizer([dataset('SPY', '1d', '2y')], settingsFor('long-only'), { seed: 3, maxStagnation: 300 });
+  it('honours a custom evaluation limit', async () => {
+    const messages = await runOptimizer([dataset('SPY', '1d', '2y')], settingsFor('long-only'), { seed: 3, maxEvaluations: 300 });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.reason).toBe('budget');
+    expect(done.evaluations).toBe(300);
+  }, 120_000);
+
+  it('counts the trials of earlier sessions: they raise the hurdle, lower every DSR and use up the window budget', async () => {
+    const eth = dataset('ETH-USD', '4h', '2y');
+    const settings = settingsFor('long-only');
+    const fresh = (await runOptimizer([eth], settings, { seed: 41, maxEvaluations: 600 })).pop() as Of<'done'>;
+    expect(fresh.type).toBe('done');
+    expect(fresh.windowTrials).toBe(fresh.evaluations);
+    // Pretend 9,700 trials with the same spread were spent on this window in earlier sessions.
+    const variance = fresh.runTrials.m2 / (fresh.runTrials.count - 1);
+    const prior: TrialStats = { count: 9_700, mean: fresh.runTrials.mean, m2: variance * 9_699 };
+    const messages = await runOptimizer([eth], settings, { seed: 41, maxEvaluations: 600, priorTrials: prior });
+    const ready = messages[0] as Of<'ready'>;
+    const later = messages[messages.length - 1] as Of<'done'>;
+    expect(later.type).toBe('done');
+    // Only 300 evaluations were left on the window: the run stops there, and the window is spent.
+    expect(later.evaluations).toBe(WINDOW_TRIAL_BUDGET - 9_700);
+    expect(later.reason).toBe('window-budget');
+    expect(later.windowTrials).toBe(WINDOW_TRIAL_BUDGET);
+    // The hurdle reflects every trial on the window, so each strategy's DSR is lower than it would be against this run's alone.
+    expect(later.hurdleSharpe).toBeGreaterThan(fresh.hurdleSharpe);
+    const freshHurdle = fresh.hurdleSharpe / Math.sqrt(ready.barsPerYear);
+    for (const s of later.strategies) {
+      expect(s.dsr).toBeLessThanOrEqual(deflatedSharpeAgainst(s.validation, freshHurdle).probability + 1e-12);
+    }
+    // A spent window refuses to start at all.
+    const refused = await runOptimizer([eth], settings, { seed: 41, priorTrials: { ...prior, count: WINDOW_TRIAL_BUDGET } });
+    const error = refused[refused.length - 1] as Of<'error'>;
+    expect(error.type).toBe('error');
+    expect(error.message).toMatch(/trial budget/);
+  }, 300_000);
+
+  it('stops early once 500 evaluations in a row fail to beat the best deflated Sharpe', async () => {
+    const messages = await runOptimizer([randomWalk(1826, 77, 0.035)], settingsFor('long-only'), {
+      seed: 5,
+      hypothesis: 'RANGE_REVERSION',
+      maxEvaluations: WINDOW_TRIAL_BUDGET,
+    });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.reason).toBe('converged');
-    expect(done.stagnation).toBe(300);
-  }, 120_000);
+    expect(done.dsrStall).toBe(DSR_PATIENCE);
+    expect(done.evaluations).toBeLessThan(WINDOW_TRIAL_BUDGET);
+    expect(done.evaluations).toBeGreaterThanOrEqual(DSR_PATIENCE);
+  }, 300_000);
 
   it('scores a Robust universe on every asset and answers analyze requests', async () => {
     // 4h candles: two years of daily candles cannot supply the minimum number of trades on every asset.
     const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD'].map((symbol) => dataset(symbol, '4h', '2y'));
     const settings = settingsFor('long-only');
-    const messages = await runOptimizer(universe, settings, { seed: 21, maxStagnation: 400 });
+    const messages = await runOptimizer(universe, settings, { seed: 21, maxEvaluations: 400 });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.strategies.length).toBeGreaterThan(0);
@@ -396,7 +486,7 @@ describe('optimizer worker', () => {
   it('keeps the train / validation figures unchanged when the locked strategy\'s holdout is revealed', async () => {
     const eth = dataset('ETH-USD', '4h', '2y');
     const settings = settingsFor('long-short');
-    const messages = await runOptimizer([eth], settings, { seed: 99, maxStagnation: 600 });
+    const messages = await runOptimizer([eth], settings, { seed: 99, maxEvaluations: 600 });
     const done = messages[messages.length - 1] as Of<'done'>;
     // The final figures must be exactly what the search ranked on: a backtest that stops at the holdout boundary.
     const split = splitFor(eth.data.c.length);
@@ -427,7 +517,7 @@ describe('optimizer worker', () => {
   it('gives identical results on an evaluator pool and on a single thread', async () => {
     const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD'].map((symbol) => dataset(symbol, '4h', '2y'));
     const settings = settingsFor('long-short');
-    const options = { seed: 314, maxStagnation: 500, batchSize: 75 };
+    const options = { seed: 314, maxEvaluations: 500, batchSize: 75 };
 
     const single = await runOptimizer(universe, settings, options);
 
@@ -460,10 +550,10 @@ describe('optimizer worker', () => {
 
   it('runs on 15m and 30m candles', async () => {
     for (const [symbol, interval, range] of [['SOL-USD', '30m', '1y'], ['AAPL', '15m', '1y']] as const) {
-      const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxStagnation: 300 });
+      const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxEvaluations: 300 });
       const done = messages[messages.length - 1] as Of<'done'>;
       expect(done.type, `${symbol} ${interval}`).toBe('done');
-      expect(done.reason).toBe('converged');
+      expect(['budget', 'converged']).toContain(done.reason);
       for (const s of done.strategies) expect(s.holdout).toBeNull();
       const ready = messages[0] as Of<'ready'>;
       if (interval === '30m') {
@@ -525,8 +615,8 @@ describe('acceptance: pure noise must not look like an edge', () => {
   }
 
   /** Run on noise, then reveal the holdout of every strategy on the final board (oracle only). */
-  async function revealWholeBoard(data: NamedDataset, seed: number): Promise<{ done: Of<'done'>; rows: BoardRow[] }> {
-    const messages = await runOptimizer([data], SETTINGS, { seed });
+  async function revealWholeBoard(data: NamedDataset, seed: number, hypothesis: Hypothesis): Promise<{ done: Of<'done'>; rows: BoardRow[] }> {
+    const messages = await runOptimizer([data], SETTINGS, { seed, hypothesis });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.reason).toBe('converged');
@@ -561,14 +651,19 @@ describe('acceptance: pure noise must not look like an edge', () => {
     const all: BoardRow[] = [];
     const lines: string[] = [];
     for (let k = 0; k < 6; k++) {
-      const { done, rows } = await revealWholeBoard(randomWalk(AUDIT_BARS, walkSeed + k, AUDIT_SIGMA, driftPerBar), 900 + k);
+      // Every hypothesis gets its turn on the noise.
+      const { done, rows } = await revealWholeBoard(
+        randomWalk(AUDIT_BARS, walkSeed + k, AUDIT_SIGMA, driftPerBar),
+        900 + k,
+        HYPOTHESIS_IDS[k % HYPOTHESIS_IDS.length],
+      );
       const top = lockTop(done);
       // Nothing on any board may look certified, and the locked #1 is never Robust.
       for (const row of rows) expect(row.dsr).toBeLessThan(0.95);
       if (top) expect(top.verdict).not.toBe('Robust');
       all.push(...rows);
       lines.push(
-        `run ${k}: ${done.iteration} iterations, board ${rows.length} | holdout ROI > 0: ${rows.filter((r) => r.holdoutRoi > 0).length} | ` +
+        `run ${k} (${HYPOTHESIS_IDS[k % HYPOTHESIS_IDS.length]}): ${done.evaluations} evaluations (${done.reason}), board ${rows.length} | holdout ROI > 0: ${rows.filter((r) => r.holdoutRoi > 0).length} | ` +
           `passes the holdout conditions: ${rows.filter((r) => r.holdoutPass).length} | locked #1 ${top?.verdict ?? 'n/a'}`,
       );
     }
@@ -582,7 +677,9 @@ describe('acceptance: pure noise must not look like an edge', () => {
 
   it('flags every strategy on the boards of driftless random walks as unproven', async () => {
     const rows = await nullBoards(0, 500);
-    expect(rows.length).toBeGreaterThan(100);
+    // One hypothesis per run: on five years of daily noise the breakout and dip-buy ideas cannot reach
+    // 60 validation trades, so the hard gates leave their boards empty and those runs stop early.
+    expect(rows.length).toBeGreaterThan(20);
     expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
     // A false positive is a strategy whose holdout meets the verdict's conditions: rare on noise.
     expect(rows.filter((r) => r.holdoutPass).length / rows.length).toBeLessThanOrEqual(0.1);
@@ -598,7 +695,7 @@ describe('acceptance: pure noise must not look like an edge', () => {
 
   it('does not certify noise on a trending asset, where most long strategies profit from drift alone', async () => {
     const rows = await nullBoards(AUDIT_DRIFT_PER_BAR, 600);
-    expect(rows.length).toBeGreaterThan(100);
+    expect(rows.length).toBeGreaterThan(20);
     expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
     // Audit baseline: 64% of these boards passed the old holdout test (a positive holdout return).
     // Under the current holdout conditions the false-positive rate must be a small fraction of that.

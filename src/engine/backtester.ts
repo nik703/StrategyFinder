@@ -1151,6 +1151,34 @@ export function searchMetrics(
   };
 }
 
+/**
+ * Fingerprint of the trade log a run produced before bar `bars`: every trade's entry bar, exit bar,
+ * direction and PnL to the cent. Two strategies with the same fingerprint traded identically, so
+ * the second one is not a new trial – it is the same bet written differently.
+ */
+export function tradeLogHash(ws: BacktestWorkspace, bars: number): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  let count = 0;
+  const mix = (x: number): void => {
+    h1 = Math.imul(h1 ^ x, 0x01000193);
+    h2 = Math.imul(h2 ^ x, 0x5bd1e995);
+    h2 ^= h2 >>> 15;
+  };
+  for (let k = 0; k < ws.tradeCount; k++) {
+    const entry = ws.tradeEntryBar[k];
+    if (entry >= bars) break;
+    count++;
+    const cents = Math.round(ws.tradePnl[k] * 100);
+    mix(entry);
+    mix(ws.tradeExitBar[k]);
+    mix(ws.tradeDir[k] & 0xff);
+    mix(cents | 0);
+    mix(Math.floor(cents / 4294967296) | 0);
+  }
+  return `${count}:${(h1 >>> 0).toString(36)}:${(h2 >>> 0).toString(36)}`;
+}
+
 /** Holdout metrics of a run that simulated the whole dataset. Only call this once the search has ended. */
 export function holdoutMetrics(
   equity: Float64Array,

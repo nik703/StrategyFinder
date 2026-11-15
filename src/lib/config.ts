@@ -2,14 +2,17 @@
 
 import { normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import type { HoldoutWindow } from './holdoutLog';
+import type { TrialWindow } from './trialLedger';
 import {
   DEFAULT_CRYPTO_UNIVERSE,
-  DEFAULT_MAX_STAGNATION,
+  DEFAULT_RUN_EVALUATIONS,
   DEFAULT_STOCK_UNIVERSE,
   INTERVAL_MS,
   type CandleSeries,
 } from '../types/trading';
 import type {
+  Hypothesis,
+  TrialStats,
   BacktestSettings,
   BasketComponent,
   DataSource,
@@ -40,8 +43,10 @@ export interface RunConfig {
   /** Volatility-scaled slippage: each fill slips at least this multiple of ATR(14) as a % of price. */
   slippageAtrMult: number;
   tradeMode: TradeMode;
-  /** Stop after this many consecutive iterations without improvement. */
-  maxStagnation: number;
+  /** The market hypothesis the next run tests. */
+  hypothesis: Hypothesis;
+  /** Evaluations (trials) the next run may spend. */
+  maxEvaluations: number;
   /** fixed: risk % of starting capital · compound: risk % of current equity · full: 100% of equity. */
   sizingMode: 'fixed' | 'compound' | 'full';
   /** Share of capital lost when a trade is stopped out, in percent. */
@@ -88,7 +93,8 @@ export const DEFAULT_CONFIG: RunConfig = {
   slippagePct: 0.05,
   slippageAtrMult: DEFAULT_SLIPPAGE_ATR_MULT,
   tradeMode: 'long-only',
-  maxStagnation: DEFAULT_MAX_STAGNATION,
+  hypothesis: 'TREND_FOLLOWING',
+  maxEvaluations: DEFAULT_RUN_EVALUATIONS,
   sizingMode: 'fixed',
   riskPct: 2,
   // Financing is on by default; it only applies to Long/Short runs (Long-Only is treated as spot).
@@ -107,6 +113,15 @@ export function parseUniverse(text: string): string[] {
     if (symbol && !out.includes(symbol)) out.push(symbol);
   }
   return out;
+}
+
+/** Every symbol a run with this configuration scores strategies on (traded assets and universe). */
+export function runSymbols(config: RunConfig): string[] {
+  const assets = resolveAssets(config);
+  if (!assets.ok) return [];
+  const traded = assets.components.map((component) => component.symbol);
+  const universe = resolveUniverse(config, traded[0]);
+  return [...new Set([...traded, ...(universe.ok ? universe.symbols : [])])];
 }
 
 export type ResolvedUniverse = { ok: true; symbols: string[] } | { ok: false; error: string };
@@ -192,8 +207,16 @@ export interface RunContext {
   interval: Interval;
   range: HistoryRange;
   settings: BacktestSettings;
-  /** Stagnation limit this run was started with. */
-  maxStagnation: number;
+  /** Evaluation limit this run was started with (capped by the window's remaining budget). */
+  maxEvaluations: number;
+  /** The market hypothesis this run tests. */
+  hypothesis: Hypothesis;
+  /** Identifies this run's record in the trial ledger. */
+  runId: string;
+  /** Symbols and dates of the search period, as recorded in the trial ledger. */
+  trialWindow: TrialWindow;
+  /** Trials spent on this window by earlier runs (from the trial ledger). */
+  priorTrials: TrialStats & { runs: number };
   /** Assets the run was scored on (the primary first); a single entry when the Robust universe is off. */
   universe: string[];
   /** Instrument and venue actually traded, e.g. "XRPUSDT on Binance". */

@@ -189,6 +189,14 @@ export type ConditionRole = 'TREND_UP' | 'TREND_DOWN' | 'OVERSOLD' | 'OVERBOUGHT
  */
 export type Archetype = 'TREND' | 'MEAN_REVERSION';
 
+/**
+ * The market hypothesis a run tests. Every run starts from exactly one, and every strategy it
+ * generates is built from that hypothesis's single trigger primitive and its fixed-direction filter
+ * (see `HYPOTHESES` in `engine/genome.ts`). The search tunes numbers; it does not shop for ideas.
+ */
+export type Hypothesis = 'TREND_FOLLOWING' | 'VOL_BREAKOUT' | 'DIP_IN_UPTREND' | 'RANGE_REVERSION';
+export const HYPOTHESIS_IDS: readonly Hypothesis[] = ['TREND_FOLLOWING', 'VOL_BREAKOUT', 'DIP_IN_UPTREND', 'RANGE_REVERSION'];
+
 /** Fixed-percentage stop loss and take profit, measured from the entry price. */
 export interface StaticExit {
   mode: 'static';
@@ -221,6 +229,8 @@ export type ExitGene = StaticExit | DynamicExit;
 
 export interface StrategyGenome {
   archetype: Archetype;
+  /** The run's market hypothesis. Absent only on hand-built genomes; the search always sets it. */
+  hypothesis?: Hypothesis;
   /** conditions[0] is the trigger, conditions[1] the optional filter. */
   longEntry: RuleGroup;
   /** Derived: the mirror image of `longEntry` in Long/Short mode, null in Long-Only mode. */
@@ -346,6 +356,25 @@ export interface AssetResult {
 
 export type Verdict = 'Robust' | 'Fragile' | 'Overfit';
 
+/**
+ * Parameter-stability map: the search-period Sharpe of the strategy over a grid of its two most
+ * sensitive parameters (the ones whose one-step neighbours move the result most), centred on the
+ * chosen values. A broad warm region is a plateau; a single hot cell is a spike.
+ */
+export interface StabilityGrid {
+  xLabel: string;
+  yLabel: string | null;
+  xValues: number[];
+  /** A single entry when the strategy has only one tunable parameter. */
+  yValues: number[];
+  /** `cells[row][col]`: annualised search-period Sharpe, or null where the combination is not a valid strategy. */
+  cells: (number | null)[][];
+  /** Same shape: true where the combination fails the minimum-trade gates. */
+  undersampled: boolean[][];
+  baseX: number;
+  baseY: number;
+}
+
 export interface RobustnessReport {
   sensitivity: {
     /** Number of ±20% single-parameter variants that were re-tested. */
@@ -366,6 +395,8 @@ export interface RobustnessReport {
     removed: number;
     profitable: boolean;
   };
+  /** Parameter-stability map (null when the strategy has no tunable parameter). */
+  stability?: StabilityGrid | null;
   /** Null when no other assets were available. */
   crossAsset: {
     rows: { symbol: string; roi: number; sharpe: number; trades: number; profitable: boolean }[];
@@ -386,6 +417,13 @@ export interface StrategyResult {
   neighbourMedian?: number | null;
   /** Number of one-grid-step neighbours that were backtested. */
   neighbourCount?: number;
+  /**
+   * Haircut Sharpe of the validation segment: the annualised Sharpe that survives a Bonferroni
+   * correction for every trial on this data window (Harvey & Liu). 0 when nothing survives.
+   */
+  haircutSharpe?: number;
+  /** Share of the validation Sharpe removed by the haircut (0–1; 1 = entirely explained by multiple testing). */
+  haircut?: number;
   /** Number of tunable numeric parameters. */
   params: number;
   /** Deflated Sharpe Ratio of the validation segment: probability that the Sharpe is real given every trial so far. */
@@ -445,11 +483,19 @@ export interface ChartAxis {
 /*  Optimiser worker protocol                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** Default number of consecutive non-improving iterations after which the optimiser declares convergence. */
-export const DEFAULT_MAX_STAGNATION = 5000;
-/** Bounds for the user-configurable stagnation limit. */
-export const MIN_MAX_STAGNATION = 100;
-export const MAX_MAX_STAGNATION = 1_000_000;
+/** Default number of strategy evaluations (trials) per run. */
+export const DEFAULT_RUN_EVALUATIONS = 2_000;
+/** Smallest per-run evaluation limit the controls accept. */
+export const MIN_RUN_EVALUATIONS = 100;
+/**
+ * Hard ceiling of evaluations per data window, summed over EVERY run and session whose search
+ * period overlaps it. Past this, more search on the same data can only find luckier noise.
+ */
+export const WINDOW_TRIAL_BUDGET = 10_000;
+/** Early stopping: a run ends after this many evaluations in a row fail to beat the best deflated Sharpe. */
+export const DSR_PATIENCE = 500;
+/** Safety stop: proposals in a row that yield no new (non-duplicate) evaluation, i.e. the search space is exhausted. */
+export const EXHAUSTION_LIMIT = 2_000;
 /** Size of the live leaderboard. */
 export const LEADERBOARD_SIZE = 25;
 /** The worker posts a progress message every N iterations. */
@@ -469,12 +515,28 @@ export interface NamedDataset {
   data: OHLCV;
 }
 
+/** Summary statistics of a set of trials: count, mean and sum of squared deviations of their ANNUALISED Sharpe. */
+export interface TrialStats {
+  count: number;
+  mean: number;
+  m2: number;
+}
+
 export interface OptimizerStartPayload {
   /** The primary asset first; more than one entry switches on Robust-universe scoring. */
   datasets: NamedDataset[];
   settings: BacktestSettings;
-  /** Stop after this many consecutive iterations without improvement (default 5,000). */
-  maxStagnation?: number;
+  /** The market hypothesis every strategy of this run is built from. */
+  hypothesis: Hypothesis;
+  /** Evaluations this run may spend (default 2,000, at most the window's remaining budget). */
+  maxEvaluations?: number;
+  /**
+   * Trials already spent on this data window by earlier runs (from the persistent trial ledger).
+   * They seed the selection-bias hurdle and count against `windowBudget`.
+   */
+  priorTrials?: TrialStats;
+  /** Evaluations allowed on this data window across all runs (default `WINDOW_TRIAL_BUDGET`). */
+  windowBudget?: number;
   /** Optional seed for reproducible runs. */
   seed?: number;
   /** Ports to evaluator workers (see `evaluator.worker.ts`); empty or absent = evaluate on the optimiser thread. */
@@ -499,8 +561,20 @@ export type WorkerRequest =
   | { type: 'lock'; strategyId: string; priorReveals: number; simulated: boolean };
 
 export interface ProgressSnapshot {
+  /** Candidates proposed, including duplicates that were not evaluated. */
   iteration: number;
+  /** Proposals since the top fitness last improved. */
   stagnation: number;
+  /** Unique strategies evaluated by this run – the trials it added. */
+  evaluations: number;
+  /** Trials on this data window across all runs, this one included. */
+  windowTrials: number;
+  /** Evaluations since a candidate last beat the best deflated Sharpe (early stop at `DSR_PATIENCE`). */
+  dsrStall: number;
+  /** Candidates dropped because their trade log repeated one already evaluated. */
+  duplicates: number;
+  /** This run's own trials, in annualised Sharpe units – persisted to the trial ledger. */
+  runTrials: TrialStats;
   bestFitness: number | null;
   /** Highest deflated Sharpe ratio on the leaderboard (0–1). */
   bestDsr: number | null;
@@ -514,7 +588,14 @@ export interface ProgressSnapshot {
   elapsedMs: number;
 }
 
-export type StopReason = 'stopped' | 'converged';
+/**
+ * stopped       – the user pressed Stop;
+ * converged     – early stop: no candidate beat the best deflated Sharpe for `DSR_PATIENCE` evaluations;
+ * budget        – the run's evaluation limit was reached;
+ * window-budget – the data window's cumulative trial budget is spent;
+ * exhausted     – the hypothesis's search space yields no new strategies.
+ */
+export type StopReason = 'stopped' | 'converged' | 'budget' | 'window-budget' | 'exhausted';
 
 export type WorkerResponse =
   | { type: 'ready'; benchmark: BenchmarkResult; axis: ChartAxis; barsPerYear: number }

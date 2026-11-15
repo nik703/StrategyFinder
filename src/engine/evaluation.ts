@@ -19,6 +19,7 @@ import {
   plateauFitness,
   regimeMask,
   splitFor,
+  tradeLogHash,
   UNFIT,
   type Regimes,
   type SearchMetrics,
@@ -62,7 +63,16 @@ export interface EvalContext {
   axis: ChartAxis;
   /** Per-bar Sharpe a strategy must beat to count as more than luck; frozen for a batch. */
   hurdle: number;
+  /** Trade-log fingerprints already evaluated in this run (frozen for a batch, see `tradeLogHash`). */
+  knownTrades: Set<string>;
 }
+
+/**
+ * Why a candidate was not scored:
+ *   inactive  – it never traded on the primary asset (nothing to rank, not a trial);
+ *   duplicate – its primary-asset trade log repeats one already evaluated (not a new trial).
+ */
+export type SkipReason = 'inactive' | 'duplicate';
 
 function validate(dataset: NamedDataset): void {
   const { data, symbol } = dataset;
@@ -161,19 +171,31 @@ const OPTIMISTIC = 1e9;
  * assets are scored, the best case for the rest still leaves the median capped.
  * The bound is exact, so pruning never changes which strategies are accepted.
  */
-export function scoreAssets(ctx: EvalContext, genome: StrategyGenome, floor = -Infinity): { scores: AssetScore[]; complete: boolean } {
+export function scoreAssets(
+  ctx: EvalContext,
+  genome: StrategyGenome,
+  floor = -Infinity,
+  dedupe = false,
+): { scores: AssetScore[]; complete: boolean; tradeHash: string | null; skip: SkipReason | null } {
   const total = ctx.assets.length;
   const scores: AssetScore[] = [];
+  let tradeHash: string | null = null;
   for (let a = 0; a < total; a++) {
     const asset = ctx.assets[a];
     const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
     scores.push({ base: assetBaseScore(metrics), metrics });
+    if (a === 0 && dedupe) {
+      // The primary asset decides whether this is a new bet at all, before any other work is spent on it.
+      tradeHash = tradeLogHash(asset.ws, asset.split.holdoutStart);
+      if (metrics.search.trades === 0) return { scores, complete: false, tradeHash, skip: 'inactive' };
+      if (ctx.knownTrades.has(tradeHash)) return { scores, complete: false, tradeHash, skip: 'duplicate' };
+    }
     // The median of `total` values is settled by its lower half: bounding needs more than half of them.
     if (floor > -Infinity && a + 1 < total && a + 1 > total >> 1 && fitnessCeiling(ctx, genome, scores) <= floor) {
-      return { scores, complete: false };
+      return { scores, complete: false, tradeHash, skip: null };
     }
   }
-  return { scores, complete: true };
+  return { scores, complete: true, tradeHash, skip: null };
 }
 
 /** Average trades per year that asset `a` opened over its search period. */
@@ -276,8 +298,12 @@ export function rankFitness(
 /** Outcome of evaluating one candidate during the search. */
 export interface CandidateResult {
   scores: AssetScore[];
-  /** False when scoring stopped early because the candidate provably cannot beat `floor`. */
+  /** False when scoring stopped early: the candidate provably cannot beat `floor`, or it was skipped. */
   complete: boolean;
+  /** Fingerprint of the primary-asset trade log. */
+  tradeHash: string | null;
+  /** Set when the candidate was not scored at all (it is then not a trial). */
+  skip: SkipReason | null;
   /** Rank fitness: `pointFitness` capped by the neighbourhood (equal to it when no neighbours were scored). */
   fitness: number;
   /** Fitness of the exact parameter values. */
@@ -298,17 +324,17 @@ export interface CandidateResult {
  * so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
  */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
-  const { scores, complete } = scoreAssets(ctx, genome, floor);
-  if (!complete) return { scores, complete, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
+  const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, floor, true);
+  if (!complete) return { scores, complete, tradeHash, skip, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
   const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
   if (!(point > floor) || point <= UNFIT) {
-    return { scores, complete, fitness: point, pointFitness: point, dsr, neighbours: null, curve: null };
+    return { scores, complete, tradeHash, skip, fitness: point, pointFitness: point, dsr, neighbours: null, curve: null };
   }
   // Sample the curve BEFORE the neighbours' backtests overwrite the primary workspace.
   const curve = sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos);
   const neighbours = scoreNeighbours(ctx, genome);
   const { fitness } = rankFitness(ctx, genome, scores, neighbours);
-  return { scores, complete, fitness, pointFitness: point, dsr, neighbours, curve: fitness > floor ? curve : null };
+  return { scores, complete, tradeHash, skip, fitness, pointFitness: point, dsr, neighbours, curve: fitness > floor ? curve : null };
 }
 
 /** Build a scoring context from raw datasets (the primary asset first). */
@@ -323,6 +349,7 @@ export function createContext(datasets: NamedDataset[], settings: BacktestSettin
     limits: deriveLimits(primary),
     axis: buildAxis(primary.data.t, primary.split),
     hurdle: 0,
+    knownTrades: new Set(),
   };
 }
 
@@ -348,6 +375,8 @@ export interface EvaluatorBatch {
   id: number;
   hurdle: number;
   floor: number;
+  /** Trade-log fingerprints registered since the previous batch: every evaluator keeps a full replica. */
+  knownTrades: string[];
   genomes: StrategyGenome[];
 }
 
@@ -374,6 +403,7 @@ export function attachEvaluator(port: PortLike, init: EvaluatorInit): void {
     try {
       ctx ??= createContext(init.datasets, init.settings, init.budgetBytes);
       ctx.hurdle = message.hurdle;
+      for (const hash of message.knownTrades) ctx.knownTrades.add(hash);
       const results = message.genomes.map((genome) => evaluateCandidate(ctx as EvalContext, genome, message.floor));
       const transfer: Transferable[] = [];
       for (const result of results) if (result.curve) transfer.push(result.curve.buffer as ArrayBuffer);
