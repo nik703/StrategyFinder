@@ -1,18 +1,27 @@
 /**
  * Live, sortable Top-25 leaderboard. Clicking a row previews the strategy on
  * the equity chart and opens the Strategy Breakdown drawer.
+ *
+ * Risk-adjusted, selection-bias-aware figures lead: the default order is the
+ * deflated Sharpe ratio, and every return figure is labelled in-sample. There is
+ * deliberately no holdout column – the holdout is revealed for one locked
+ * strategy only, so it can never be sorted on.
  */
 
-import { ChevronDown, ChevronsUpDown, ChevronUp, Trophy } from 'lucide-react';
+import { ChevronDown, ChevronsUpDown, ChevronUp, Lock, Trophy } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
-import { fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
+import { MIN_TRADES, MIN_TRADES_PER_YEAR, MIN_VALIDATION_TRADES } from '../engine/backtester';
+import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
+import { overfittingRisk } from '../lib/risk';
 import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type Verdict } from '../types/trading';
 import { cx, Panel, Pill } from './ui';
 
 interface LeaderboardProps {
   strategies: StrategyResult[];
   selectedId: string | null;
+  /** The strategy whose holdout was revealed, if any. */
+  lockedId: string | null;
   onSelect: (strategy: StrategyResult) => void;
   status: EngineStatus;
 }
@@ -21,7 +30,10 @@ type SortKey =
   | 'rank'
   | 'params'
   | 'dsr'
-  | 'holdout'
+  | 'haircut'
+  | 'risk'
+  | 'valSharpe'
+  | 'sortino'
   | 'verdict'
   | 'netPnl'
   | 'roi'
@@ -42,7 +54,11 @@ interface SortState {
 interface Row {
   rank: number;
   strategy: StrategyResult;
+  locked: boolean;
 }
+
+/** Default order: highest deflated Sharpe first. */
+const DEFAULT_SORT: SortState = { key: 'dsr', dir: 'desc' };
 
 interface Column {
   key: SortKey | 'indicators';
@@ -70,7 +86,14 @@ const COLUMNS: Column[] = [
     value: (row) => row.rank,
     firstDir: 'asc',
     render: (row) => (
-      <span className={cx('num font-semibold', row.rank === 1 ? 'text-accent-strong' : 'text-ink-2')}>#{row.rank}</span>
+      <div className="flex items-center gap-1.5">
+        <span className={cx('num font-semibold', row.rank === 1 ? 'text-accent-strong' : 'text-ink-2')}>#{row.rank}</span>
+        {row.locked && (
+          <span title="Locked: this strategy's holdout has been revealed" className="text-accent-strong">
+            <Lock size={12} aria-label="Locked" />
+          </span>
+        )}
+      </div>
     ),
   },
   {
@@ -93,32 +116,70 @@ const COLUMNS: Column[] = [
     ),
   },
   {
-    key: 'netPnl',
-    label: 'Net PnL ($)',
-    title: 'Net profit after fees and slippage over train + validation',
+    key: 'dsr',
+    label: 'Deflated Sharpe',
+    title: 'Deflated Sharpe Ratio of the validation segment: probability the Sharpe is real given every strategy tried so far. 95% or more is needed for a Robust verdict.',
     align: 'right',
-    value: ({ strategy }) => strategy.search.netPnl,
+    value: ({ strategy }) => strategy.dsr,
     render: ({ strategy }) => (
-      <span className={cx('font-medium', toneClass(strategy.search.netPnl))}>{fmtUsd(strategy.search.netPnl, true)}</span>
+      <span className={cx('font-semibold', strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink-2')}>
+        {fmtPct(strategy.dsr * 100, false, 0)}
+      </span>
     ),
   },
   {
-    key: 'roi',
-    label: 'ROI (%)',
-    title: 'Return on starting capital over train + validation',
+    key: 'haircut',
+    label: 'Haircut Sharpe',
+    title:
+      'Validation Sharpe after a Bonferroni haircut for every strategy tried on this data window, in any run or session (Harvey & Liu). 0 = fully explained by multiple testing.',
     align: 'right',
-    value: ({ strategy }) => strategy.search.roi,
+    value: ({ strategy }) => strategy.haircutSharpe ?? -Infinity,
     render: ({ strategy }) => (
-      <span className={cx('font-medium', toneClass(strategy.search.roi))}>{fmtPct(strategy.search.roi, true)}</span>
+      <span className={strategy.haircutSharpe !== undefined && strategy.haircutSharpe > 0 ? 'text-ink' : 'text-ink-3'}>
+        {strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)}
+      </span>
     ),
   },
   {
-    key: 'alpha',
-    label: 'Alpha vs. B&H (%)',
-    title: 'Strategy ROI minus Buy & Hold ROI, in percentage points',
+    key: 'risk',
+    label: 'Overfit risk',
+    title: 'Overfitting risk score 0–100: selection bias, multiple testing, parameter spike, fold inconsistency, regime collapse, thin sample. Open a row for the breakdown.',
     align: 'right',
-    value: ({ strategy }) => strategy.alpha,
-    render: ({ strategy }) => <span className={toneClass(strategy.alpha)}>{fmtPct(strategy.alpha, true)}</span>,
+    value: ({ strategy }) => overfittingRisk(strategy).score,
+    firstDir: 'asc',
+    render: ({ strategy }) => {
+      const risk = overfittingRisk(strategy);
+      return (
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          <span className="num font-semibold text-ink">{risk.score}</span>
+          <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level}</Pill>
+        </span>
+      );
+    },
+  },
+  {
+    key: 'valSharpe',
+    label: 'Validation Sharpe',
+    title: 'Annualised Sharpe ratio on the validation segment (the input to the deflated Sharpe)',
+    align: 'right',
+    value: ({ strategy }) => strategy.validation.sharpe,
+    render: ({ strategy }) => <span className="text-ink">{fmtNum(strategy.validation.sharpe)}</span>,
+  },
+  {
+    key: 'sharpe',
+    label: 'Sharpe (in-sample)',
+    title: 'Annualised Sharpe ratio over train + validation (risk-free rate 0)',
+    align: 'right',
+    value: ({ strategy }) => strategy.search.sharpe,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.sharpe)}</span>,
+  },
+  {
+    key: 'sortino',
+    label: 'Sortino (in-sample)',
+    title: 'Annualised Sortino ratio over train + validation',
+    align: 'right',
+    value: ({ strategy }) => strategy.search.sortino,
+    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.sortino)}</span>,
   },
   {
     key: 'maxDrawdown',
@@ -130,11 +191,23 @@ const COLUMNS: Column[] = [
     render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.search.maxDrawdown)}</span>,
   },
   {
+    key: 'trades',
+    label: 'Trades',
+    title: 'Trades over train + validation (validation trades in brackets)',
+    align: 'right',
+    value: ({ strategy }) => strategy.search.trades,
+    render: ({ strategy }) => (
+      <span className="text-ink-2">
+        {fmtInt(strategy.search.trades)} <span className="text-ink-3">({fmtInt(strategy.validation.trades)})</span>
+      </span>
+    ),
+  },
+  {
     key: 'winRate',
     label: 'Win Rate (%)',
     align: 'right',
     value: ({ strategy }) => strategy.search.winRate,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.search.winRate)}</span>,
+    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.search.winRate)}</span>,
   },
   {
     key: 'profitFactor',
@@ -142,22 +215,31 @@ const COLUMNS: Column[] = [
     title: 'Gross profit ÷ gross loss',
     align: 'right',
     value: ({ strategy }) => strategy.search.profitFactor,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.profitFactor)}</span>,
+    render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.search.profitFactor)}</span>,
   },
   {
-    key: 'sharpe',
-    label: 'Sharpe Ratio',
-    title: 'Annualised Sharpe ratio (risk-free rate 0)',
+    key: 'roi',
+    label: 'ROI (in-sample, %)',
+    title: 'Return on starting capital over train + validation – the data the search optimised on, so it is biased upwards',
     align: 'right',
-    value: ({ strategy }) => strategy.search.sharpe,
-    render: ({ strategy }) => <span className="text-ink">{fmtNum(strategy.search.sharpe)}</span>,
+    value: ({ strategy }) => strategy.search.roi,
+    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.search.roi, true)}</span>,
   },
   {
-    key: 'trades',
-    label: 'Trades',
+    key: 'netPnl',
+    label: 'Net PnL (in-sample, $)',
+    title: 'Net profit after fees, slippage and financing over train + validation',
     align: 'right',
-    value: ({ strategy }) => strategy.search.trades,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtInt(strategy.search.trades)}</span>,
+    value: ({ strategy }) => strategy.search.netPnl,
+    render: ({ strategy }) => <span className="text-ink-3">{fmtUsd(strategy.search.netPnl, true)}</span>,
+  },
+  {
+    key: 'alpha',
+    label: 'Excess ROI vs. B&H (in-sample)',
+    title: 'Strategy ROI minus Buy & Hold ROI over train + validation, in percentage points. Not risk-adjusted, so it is not alpha.',
+    align: 'right',
+    value: ({ strategy }) => strategy.alpha,
+    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.alpha, true)}</span>,
   },
   {
     key: 'mode',
@@ -185,36 +267,9 @@ const COLUMNS: Column[] = [
     render: ({ strategy }) => <span className={strategy.params > 4 ? 'text-warn' : 'text-ink-2'}>{strategy.params}</span>,
   },
   {
-    key: 'dsr',
-    label: 'DSR',
-    title: 'Deflated Sharpe Ratio of the validation segment: probability the Sharpe is real given every strategy tried so far',
-    align: 'right',
-    value: ({ strategy }) => strategy.dsr,
-    render: ({ strategy }) => (
-      <span className={strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink-2'}>
-        {fmtPct(strategy.dsr * 100, false, 0)}
-      </span>
-    ),
-  },
-  {
-    key: 'holdout',
-    label: 'Holdout ROI',
-    title: 'Return on the 20% holdout – hidden until the run ends, never used for ranking',
-    align: 'right',
-    value: ({ strategy }) => strategy.holdout?.roi ?? -Infinity,
-    render: ({ strategy }) =>
-      strategy.holdout ? (
-        <span className={toneClass(strategy.holdout.roi)}>{fmtPct(strategy.holdout.roi, true)}</span>
-      ) : (
-        <span className="text-ink-3" title="Sealed until the run ends">
-          sealed
-        </span>
-      ),
-  },
-  {
     key: 'verdict',
     label: 'Verdict',
-    title: 'Robust / Fragile / Overfit – combines the holdout, the deflated Sharpe and the robustness tests',
+    title: 'Robust / Fragile / Overfit – only the locked strategy gets one, once its holdout is revealed',
     align: 'left',
     value: ({ strategy }) => (strategy.verdict === 'Robust' ? 0 : strategy.verdict === 'Fragile' ? 1 : strategy.verdict === 'Overfit' ? 2 : 3),
     firstDir: 'asc',
@@ -223,19 +278,19 @@ const COLUMNS: Column[] = [
   {
     key: 'fitness',
     label: 'Score',
-    title: 'Composite fitness: deflated validation Sharpe and excess return, minus penalties for few trades, complexity and drawdown',
+    title: 'Composite fitness: deflated validation Sharpe and the 25th-percentile fold score, minus drawdown, regime-collapse and complexity penalties, capped at the median of the one-step parameter neighbours',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
     render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,
   },
 ];
 
-export default function Leaderboard({ strategies, selectedId, onSelect, status }: LeaderboardProps): JSX.Element {
-  const [sort, setSort] = useState<SortState>({ key: 'rank', dir: 'asc' });
+export default function Leaderboard({ strategies, selectedId, lockedId, onSelect, status }: LeaderboardProps): JSX.Element {
+  const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
 
   const rows = useMemo<Row[]>(() => {
     // `strategies` arrives ordered by fitness, so the index is the rank.
-    const ranked = strategies.map((strategy, index) => ({ rank: index + 1, strategy }));
+    const ranked = strategies.map((strategy, index) => ({ rank: index + 1, strategy, locked: strategy.id === lockedId }));
     const column = COLUMNS.find((c) => c.key === sort.key);
     if (!column?.value || sort.key === 'rank') return sort.dir === 'asc' ? ranked : ranked.reverse();
     const value = column.value;
@@ -248,7 +303,7 @@ export default function Leaderboard({ strategies, selectedId, onSelect, status }
       if (!Number.isFinite(va as number) && !Number.isFinite(vb as number)) return a.rank - b.rank;
       return (va < vb ? -1 : 1) * direction;
     });
-  }, [strategies, sort]);
+  }, [strategies, sort, lockedId]);
 
   const toggleSort = (column: Column): void => {
     if (!column.value) return;
@@ -271,7 +326,8 @@ export default function Leaderboard({ strategies, selectedId, onSelect, status }
           </span>
         </div>
         <p className="text-xs text-ink-3">
-          Click a row to preview its equity curve and open the full strategy breakdown. Click a column header to sort.
+          Sorted by deflated Sharpe. Return figures are in-sample (train + validation). Click a row for the breakdown and to lock one
+          strategy for the holdout.
         </p>
       </div>
 
@@ -279,13 +335,17 @@ export default function Leaderboard({ strategies, selectedId, onSelect, status }
         <div className="px-4 py-14 text-center">
           <p className="text-sm text-ink-2">
             {status === 'optimizing' || status === 'loading'
-              ? 'Searching for the first profitable strategies…'
-              : 'No strategies yet.'}
+              ? 'Searching for strategies that clear the minimum-trade gates…'
+              : status === 'converged' || status === 'stopped'
+                ? 'No strategy cleared the minimum-trade gates.'
+                : 'No strategies yet.'}
           </p>
           <p className="mt-1 text-xs text-ink-3">
             {status === 'optimizing' || status === 'loading'
-              ? 'The leaderboard fills in live as the optimiser discovers them.'
-              : 'Configure an asset above and press Start Optimization.'}
+              ? `Only strategies with at least ${MIN_TRADES} trades (${MIN_VALIDATION_TRADES} in validation) and ${MIN_TRADES_PER_YEAR} trades a year on every asset can be listed.`
+              : status === 'converged' || status === 'stopped'
+                ? `Every candidate had fewer than ${MIN_TRADES} trades, ${MIN_VALIDATION_TRADES} validation trades or ${MIN_TRADES_PER_YEAR} trades a year. Daily candles over 1–2 years rarely allow that many: try 4h or 1h candles, or a longer history.`
+                : 'Configure an asset above and press Start Optimization.'}
           </p>
         </div>
       ) : (

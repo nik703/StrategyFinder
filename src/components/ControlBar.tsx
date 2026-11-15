@@ -1,6 +1,7 @@
 /**
  * Top control bar: asset / basket builder, timeframe, history range, capital,
- * costs, trade mode, position sizing, funding, the Robust universe and the
+ * costs (fee, fixed and volatility-scaled slippage), trade mode, position
+ * sizing, Long/Short financing (perp funding or stock borrow), the Robust universe and the
  * Start / Stop buttons.
  */
 
@@ -8,7 +9,9 @@ import { Info, Loader2, Play, Plus, Square, X } from 'lucide-react';
 import { useId } from 'react';
 import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import {
+  DEFAULT_BORROW_PCT_YEAR,
   DEFAULT_FUNDING_PCT_8H,
+  financingFor,
   isCrypto,
   MAX_BASKET_ASSETS,
   MAX_UNIVERSE_ASSETS,
@@ -19,17 +22,20 @@ import {
 } from '../lib/config';
 import {
   HISTORY_RANGES,
+  HYPOTHESIS_IDS,
   INTERVALS,
-  MAX_MAX_STAGNATION,
   MAX_RANGE,
-  MIN_MAX_STAGNATION,
+  MIN_RUN_EVALUATIONS,
   rangeAllowed,
+  WINDOW_TRIAL_BUDGET,
   YAHOO_MAX_DAYS,
   type EngineStatus,
   type HistoryRange,
+  type Hypothesis,
   type Interval,
   type TradeMode,
 } from '../types/trading';
+import { HYPOTHESES } from '../engine/genome';
 import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
 
 interface ControlBarProps {
@@ -42,6 +48,8 @@ interface ControlBarProps {
   status: EngineStatus;
   onStart: () => void;
   onStop: () => void;
+  /** Set when the trial budget of the selected data window is spent: Start is then disabled with this reason. */
+  budgetBlocked: string | null;
 }
 
 /** Colours for the allocation bar (identity only – not a chart series). */
@@ -59,6 +67,11 @@ function rangeOptions(interval: Interval): { value: HistoryRange; label: string;
     };
   });
 }
+const HYPOTHESIS_OPTIONS: { value: Hypothesis; label: string; title: string }[] = HYPOTHESIS_IDS.map((id) => ({
+  value: id,
+  label: HYPOTHESES[id].label,
+  title: `${HYPOTHESES[id].rationale}\nTrigger: ${HYPOTHESES[id].trigger}\n${HYPOTHESES[id].filter}`,
+}));
 const MODE_OPTIONS: { value: TradeMode; label: string }[] = [
   { value: 'long-only', label: 'Long-Only' },
   { value: 'long-short', label: 'Long/Short' },
@@ -286,6 +299,7 @@ export default function ControlBar({
   status,
   onStart,
   onStop,
+  budgetBlocked,
 }: ControlBarProps): JSX.Element {
   const listId = useId();
   const busy = status === 'loading' || status === 'optimizing';
@@ -293,6 +307,7 @@ export default function ControlBar({
   // A ticker with its own chip (preset or saved) is not repeated in the free-text field.
   const hasChip = isPreset || savedTickers.includes(config.symbol);
   const subHour = config.interval === '15m' || config.interval === '30m';
+  const financing = financingFor(config);
   const tradesStocks =
     config.assetMode === 'single'
       ? !isCrypto(config.symbol)
@@ -450,7 +465,7 @@ export default function ControlBar({
           className="w-[92px]"
         />
         <NumberField
-          label="Slippage"
+          label="Slippage floor"
           suffix="%"
           value={config.slippagePct}
           min={0}
@@ -458,18 +473,33 @@ export default function ControlBar({
           step={0.01}
           onChange={(slippagePct) => onChange({ slippagePct })}
           disabled={busy}
-          className="w-[92px]"
+          className="w-[100px]"
         />
-        <NumberField
-          label="Stagnation limit"
-          value={config.maxStagnation}
-          min={MIN_MAX_STAGNATION}
-          max={MAX_MAX_STAGNATION}
-          step={500}
-          onChange={(maxStagnation) => onChange({ maxStagnation: Math.round(maxStagnation) })}
-          disabled={busy}
-          className="w-[124px]"
-        />
+        <div title="Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. 0 = fixed slippage only.">
+          <NumberField
+            label="Vol. slippage"
+            suffix="× ATR"
+            value={config.slippageAtrMult}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={(slippageAtrMult) => onChange({ slippageAtrMult })}
+            disabled={busy}
+            className="w-[112px]"
+          />
+        </div>
+        <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs.`}>
+          <NumberField
+            label="Evaluations / run"
+            value={config.maxEvaluations}
+            min={MIN_RUN_EVALUATIONS}
+            max={WINDOW_TRIAL_BUDGET}
+            step={500}
+            onChange={(maxEvaluations) => onChange({ maxEvaluations: Math.round(maxEvaluations) })}
+            disabled={busy}
+            className="w-[124px]"
+          />
+        </div>
         <div>
           <FieldLabel>Mode</FieldLabel>
           <Segmented
@@ -485,7 +515,8 @@ export default function ControlBar({
           <button
             type="button"
             onClick={onStart}
-            disabled={busy}
+            disabled={busy || budgetBlocked !== null}
+            title={budgetBlocked ?? undefined}
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-white transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
           >
             {status === 'loading' ? (
@@ -513,6 +544,29 @@ export default function ControlBar({
           </p>
         )}
       </div>
+      {budgetBlocked !== null && !busy && (
+        <p role="alert" className="mt-3 flex items-start gap-1.5 text-xs text-down">
+          <Info size={13} className="mt-0.5 shrink-0" />
+          {budgetBlocked}
+        </p>
+      )}
+      {/* Hypothesis – what the run tests; the search only tunes its numbers */}
+      <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">
+        <div>
+          <FieldLabel>Market hypothesis</FieldLabel>
+          <Segmented
+            ariaLabel="Market hypothesis"
+            options={HYPOTHESIS_OPTIONS}
+            value={config.hypothesis}
+            onChange={(hypothesis) => onChange({ hypothesis })}
+            disabled={busy}
+          />
+        </div>
+        <p className="min-w-[260px] flex-1 pt-5 text-xs leading-relaxed text-ink-3">
+          <span className="font-semibold text-ink-2">{HYPOTHESES[config.hypothesis].label}.</span> {HYPOTHESES[config.hypothesis].rationale}{' '}
+          <span className="text-ink-2">Trigger:</span> {HYPOTHESES[config.hypothesis].trigger} {HYPOTHESES[config.hypothesis].filter}
+        </p>
+      </div>
       {/* Row 3 – risk and robustness (run settings the optimiser cannot tune) */}
       <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
         <div>
@@ -536,29 +590,52 @@ export default function ControlBar({
           disabled={busy || config.sizingMode === 'full'}
           className="w-[100px]"
         />
-        <div>
-          <FieldLabel>Perp funding</FieldLabel>
-          <div className="flex items-center gap-2">
-            <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
-              <input
-                type="checkbox"
-                checked={config.fundingPct8h > 0}
-                disabled={busy}
-                onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
-                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
-              />
-              Charge funding
-            </label>
-            {config.fundingPct8h > 0 && (
-              <NumberFieldInline
-                ariaLabel="Funding rate per 8 hours"
-                value={config.fundingPct8h}
-                onChange={(fundingPct8h) => onChange({ fundingPct8h })}
-                disabled={busy}
-              />
-            )}
+        {financing === 'none' ? (
+          <div>
+            <FieldLabel>Financing</FieldLabel>
+            <p className="flex h-9 items-center text-xs text-ink-3" title="Long-Only runs are treated as spot positions">
+              Long-Only spot: none
+            </p>
           </div>
-        </div>
+        ) : financing === 'funding' ? (
+          <div>
+            <FieldLabel>Perp funding (L/S crypto)</FieldLabel>
+            <div className="flex items-center gap-2">
+              <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
+                <input
+                  type="checkbox"
+                  checked={config.fundingPct8h > 0}
+                  disabled={busy}
+                  onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
+                  className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+                />
+                Charge funding
+              </label>
+              {config.fundingPct8h > 0 && (
+                <NumberFieldInline
+                  ariaLabel="Funding rate per 8 hours"
+                  value={config.fundingPct8h}
+                  onChange={(fundingPct8h) => onChange({ fundingPct8h })}
+                  disabled={busy}
+                />
+              )}
+            </div>
+          </div>
+        ) : (
+          <div title={`Borrow fee on short stock / ETF positions, per year (default ${DEFAULT_BORROW_PCT_YEAR}%).`}>
+            <NumberField
+              label="Short borrow / yr"
+              suffix="%"
+              value={config.borrowPctYear}
+              min={0}
+              max={100}
+              step={0.25}
+              onChange={(borrowPctYear) => onChange({ borrowPctYear })}
+              disabled={busy}
+              className="w-[120px]"
+            />
+          </div>
+        )}
         <div className="min-w-[260px] flex-1">
           <FieldLabel>Robust universe</FieldLabel>
           <div className="flex items-center gap-2">

@@ -1,13 +1,34 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { buildDataset } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
-import { BacktestWorkspace, barsPerYear, evaluateSearch, runBacktest, splitFor } from '../src/engine/backtester';
+import {
+  BacktestWorkspace,
+  barsPerYear,
+  benchmarkEquity,
+  tradeLogHash,
+  evaluateSearch,
+  FOLDS,
+  holdoutMetrics,
+  holdoutShortfalls,
+  MIN_TRADES,
+  MIN_VALIDATION_TRADES,
+  plateauFitness,
+  runBacktest,
+  segmentMetrics,
+  splitFor,
+} from '../src/engine/backtester';
 import { attachEvaluator } from '../src/engine/evaluation';
 import { IndicatorCache } from '../src/engine/indicators';
 import { countParameters, gaussian, isCoherent, MAX_PARAMETERS, mirrorGroup, mulberry32 } from '../src/engine/genome';
+import { deflatedSharpeAgainst } from '../src/lib/stats';
 import {
-  DEFAULT_MAX_STAGNATION,
+  DEFAULT_RUN_EVALUATIONS,
   DEFAULT_SIZING,
+  DSR_PATIENCE,
+  HYPOTHESIS_IDS,
+  WINDOW_TRIAL_BUDGET,
+  type Hypothesis,
+  type TrialStats,
   LEADERBOARD_SIZE,
   PROGRESS_EVERY,
   type BacktestSettings,
@@ -42,8 +63,8 @@ function dataset(symbol: string, interval: '15m' | '30m' | '1h' | '4h' | '1d', r
   return { symbol, data: buildDataset({ [symbol]: series }, [{ symbol, weight: 1 }]).data };
 }
 
-/** Driftless i.i.d. random walk: there is nothing to find. */
-function randomWalk(n: number, seed: number, sigma = 0.02): NamedDataset {
+/** I.i.d. random walk with an optional constant drift per bar: there is no timing edge to find. */
+function randomWalk(n: number, seed: number, sigma = 0.02, drift = 0): NamedDataset {
   const rng = mulberry32(seed);
   const data: OHLCV = {
     t: new Float64Array(n),
@@ -56,7 +77,7 @@ function randomWalk(n: number, seed: number, sigma = 0.02): NamedDataset {
   let close = 100;
   for (let i = 0; i < n; i++) {
     const open = close;
-    close = open * Math.exp(sigma * gaussian(rng) - 0.5 * sigma * sigma);
+    close = open * Math.exp(drift + sigma * gaussian(rng) - 0.5 * sigma * sigma);
     data.t[i] = i * 86_400_000;
     data.o[i] = open;
     data.c[i] = close;
@@ -70,7 +91,16 @@ function randomWalk(n: number, seed: number, sigma = 0.02): NamedDataset {
 function runOptimizer(
   datasets: NamedDataset[],
   settings: BacktestSettings,
-  options: { seed: number; stopAfterIterations?: number; maxStagnation?: number; ports?: MessagePort[]; batchSize?: number },
+  options: {
+    seed: number;
+    hypothesis?: Hypothesis;
+    stopAfterIterations?: number;
+    maxEvaluations?: number;
+    priorTrials?: TrialStats;
+    windowBudget?: number;
+    ports?: MessagePort[];
+    batchSize?: number;
+  },
 ): Promise<WorkerResponse[]> {
   return new Promise((resolve) => {
     const messages: WorkerResponse[] = [];
@@ -97,7 +127,10 @@ function runOptimizer(
           datasets,
           settings,
           seed: options.seed,
-          maxStagnation: options.maxStagnation,
+          hypothesis: options.hypothesis ?? 'TREND_FOLLOWING',
+          maxEvaluations: options.maxEvaluations,
+          priorTrials: options.priorTrials,
+          windowBudget: options.windowBudget,
           ports: options.ports,
           batchSize: options.batchSize,
         },
@@ -116,6 +149,10 @@ function request(message: WorkerRequest): WorkerResponse {
   if (reply === null) throw new Error('The worker did not answer.');
   return reply;
 }
+
+/** Lock one strategy of the finished run and reveal its holdout. */
+const lock = (strategyId: string, priorReveals = 0, simulated = false): WorkerResponse =>
+  request({ type: 'lock', strategyId, priorReveals, simulated });
 
 const ofType = <T extends WorkerResponse['type']>(messages: WorkerResponse[], type: T): Of<T>[] =>
   messages.filter((m): m is Of<T> => m.type === type);
@@ -139,7 +176,7 @@ beforeAll(async () => {
 });
 
 describe('optimizer worker', () => {
-  it('keeps the holdout sealed during the search and reveals it when the run converges', async () => {
+  it('keeps the holdout sealed through the search and after it, and reveals it for one locked strategy only', async () => {
     const settings = settingsFor('long-short');
     const messages = await runOptimizer([dataset('BTC-USD', '1d', '5y')], settings, { seed: 12345 });
 
@@ -158,9 +195,14 @@ describe('optimizer worker', () => {
 
     // Progress every 25 iterations.
     const progress = ofType(messages, 'progress');
-    expect(progress.length).toBeGreaterThan(200);
+    expect(progress.length).toBeGreaterThan(10);
     progress.slice(0, -1).forEach((p, index) => expect(p.iteration).toBe((index + 1) * PROGRESS_EVERY));
-    for (const p of progress) expect(p.stagnation).toBeLessThanOrEqual(DEFAULT_MAX_STAGNATION);
+    for (const p of progress) {
+      expect(p.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
+      expect(p.windowTrials).toBe(p.evaluations); // no earlier runs on this window
+      expect(p.dsrStall).toBeLessThanOrEqual(DSR_PATIENCE);
+      expect(p.runTrials.count).toBe(p.evaluations);
+    }
 
     // While the run is live nothing about the holdout leaves the worker.
     const boards = ofType(messages, 'leaderboard');
@@ -176,14 +218,21 @@ describe('optimizer worker', () => {
       assertConstraints(board.strategies, 'long-short');
     }
 
-    // Converged at the default limit (5,000), and only then is the holdout revealed.
+    // The run ends on its own: early stop (no DSR gain for 500 evaluations) or its 2,000-evaluation budget.
+    // The holdout is STILL sealed: nothing is revealed for the board.
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
-    expect(done.reason).toBe('converged');
-    expect(DEFAULT_MAX_STAGNATION).toBe(5000);
-    expect(done.stagnation).toBe(DEFAULT_MAX_STAGNATION);
-    expect(done.benchmark.holdout).not.toBeNull();
-    expect(done.benchmark.equity.length).toBe(axis.barIndex.length);
+    expect(DEFAULT_RUN_EVALUATIONS).toBe(2000);
+    expect(DSR_PATIENCE).toBe(500);
+    expect(['converged', 'budget']).toContain(done.reason);
+    if (done.reason === 'converged') expect(done.dsrStall).toBe(DSR_PATIENCE);
+    else expect(done.evaluations).toBe(DEFAULT_RUN_EVALUATIONS);
+    expect(done.evaluations).toBeLessThanOrEqual(DEFAULT_RUN_EVALUATIONS);
+    // Repeated genomes and repeated trade logs were skipped, not counted as trials.
+    expect(done.iteration).toBeGreaterThan(done.evaluations);
+    expect(done.duplicates).toBeGreaterThan(0);
+    expect(done.benchmark.holdout).toBeNull();
+    expect(done.benchmark.equity.length).toBe(axis.holdoutPos);
 
     const final = done.strategies;
     expect(final.length).toBeGreaterThan(5);
@@ -192,30 +241,93 @@ describe('optimizer worker', () => {
     expect(new Set(final.map((s) => s.id)).size).toBe(final.length);
     assertConstraints(final, 'long-short');
     for (const s of final) {
-      expect(s.holdout).not.toBeNull();
-      expect(s.equity.length).toBe(axis.barIndex.length);
-      expect(s.search.trades).toBeGreaterThan(0);
+      expect(s.holdout).toBeNull();
+      expect(s.verdict).toBeNull();
+      expect(s.equity.length).toBe(axis.holdoutPos);
+      for (const asset of s.assets) expect(asset.holdout).toBeNull();
+      // Hard sample-size gates: nothing below them can be listed.
+      expect(s.search.trades).toBeGreaterThanOrEqual(MIN_TRADES);
+      expect(s.validation.trades).toBeGreaterThanOrEqual(MIN_VALIDATION_TRADES);
       expect(s.alpha).toBeCloseTo(s.search.roi - done.benchmark.search.roi, 6);
       expect(s.train.netPnl + s.validation.netPnl).toBeCloseTo(s.search.netPnl, 4);
       expect(s.dsr).toBeGreaterThanOrEqual(0);
       expect(s.dsr).toBeLessThanOrEqual(1);
-      expect(['Robust', 'Fragile', 'Overfit']).toContain(s.verdict);
-      expect(s.robustness).not.toBeNull();
-      expect(s.robustness?.sensitivity.variants).toBeGreaterThan(2);
-      expect(s.robustness?.topTrades.removed).toBeLessThanOrEqual(5);
-      expect(s.robustness?.crossAsset).toBeNull(); // single-asset run
       expect(s.assets).toHaveLength(1);
-      // A strategy that lost money on the holdout can never be called anything but overfit.
-      if ((s.holdout?.roi ?? 0) <= 0 || s.dsr < 0.5) expect(s.verdict).toBe('Overfit');
     }
     expect(done.bestFitness).toBeCloseTo(final[0].fitness, 9);
+    expect(done.bestDsr).toBeCloseTo(Math.max(...final.map((s) => s.dsr)), 9);
+    expect(done.hurdleSharpe).toBeGreaterThan(0);
 
-    const top = final[0];
+    // Stage 2 ranking: every listed strategy carries its fold and regime breakdown, and is ranked by
+    // its own fitness capped at the median of its one-grid-step neighbours (spikes sink, plateaus hold).
+    for (const s of final) {
+      expect(s.folds).toHaveLength(FOLDS);
+      expect(s.regimes?.map((r) => r.regime)).toEqual(['Bull', 'Bear', 'High volatility']);
+      expect(s.neighbourCount ?? 0).toBeGreaterThan(2);
+      expect(s.pointFitness).toBeDefined();
+      expect(s.fitness).toBeLessThanOrEqual((s.pointFitness as number) + 1e-12);
+      expect(s.fitness).toBeCloseTo(plateauFitness(s.pointFitness as number, [s.neighbourMedian as number]), 9);
+    }
+    // Every listed strategy tests the run's hypothesis, and no two of them share a trade log.
+    const btc = dataset('BTC-USD', '1d', '5y');
+    const btcSplit = splitFor(btc.data.c.length);
+    const btcInd = new IndicatorCache(btc.data);
+    const btcWs = new BacktestWorkspace(btc.data.c.length);
+    const logs = new Set<string>();
+    for (const s of final) {
+      expect(s.genome.hypothesis).toBe('TREND_FOLLOWING');
+      expect(s.haircutSharpe).toBeDefined();
+      expect(s.haircut ?? -1).toBeGreaterThanOrEqual(0);
+      runBacktest(btcInd, s.genome, settings, btcWs, btcSplit.holdoutStart);
+      logs.add(tradeLogHash(btcWs, btcSplit.holdoutStart));
+    }
+    expect(logs.size).toBe(final.length);
+    // The cap actually bites on part of the board: those strategies were spikes at their exact parameters.
+    expect(final.filter((s) => (s.pointFitness as number) > s.fitness + 1e-9).length).toBeGreaterThan(0);
+
+    // Before the lock no strategy gets a verdict, even on request.
+    const early = request({ type: 'analyze', strategyId: final[2].id, genome: final[2].genome }) as Of<'analysis'>;
+    expect(early.verdict).toBeNull();
+
+    // Lock ONE strategy: only its holdout is revealed.
+    const chosen = final[1];
+    const reply = lock(chosen.id) as Of<'locked'>;
+    expect(reply.type).toBe('locked');
+    const top = reply.strategy;
+    expect(top.id).toBe(chosen.id);
+    expect(top.holdout).not.toBeNull();
+    expect(top.equity.length).toBe(axis.barIndex.length);
+    expect(reply.benchmark.holdout).not.toBeNull();
+    expect(reply.benchmark.equity.length).toBe(axis.barIndex.length);
+    expect(['Robust', 'Fragile', 'Overfit']).toContain(top.verdict);
+    expect(Array.isArray(top.verdictNotes)).toBe(true);
+    expect((top.verdictNotes ?? []).length === 0).toBe(top.verdict === 'Robust');
+    expect(top.robustness?.sensitivity.variants).toBeGreaterThan(2);
+    expect(top.robustness?.topTrades.removed).toBeLessThanOrEqual(5);
+    expect(top.robustness?.crossAsset).toBeNull(); // single-asset run
+    // A strategy that lost money on the holdout, or whose DSR says luck, is always Overfit.
+    if ((top.holdout?.roi ?? 0) <= 0 || top.dsr < 0.5) expect(top.verdict).toBe('Overfit');
+    // Robust needs a holdout Sharpe CI above zero that beats Buy & Hold.
+    if (top.verdict === 'Robust') expect(top.holdout?.sharpe ?? 0).toBeGreaterThan(reply.benchmark.holdout?.sharpe ?? Infinity);
+
+    // The holdout is spent: no second strategy can be revealed. Re-locking the same one is idempotent.
+    const second = lock(final[0].id) as Of<'error'>;
+    expect(second.type).toBe('error');
+    expect(second.message).toContain(chosen.id);
+    const again = lock(chosen.id) as Of<'locked'>;
+    expect(again.type).toBe('locked');
+    expect(again.strategy).toBe(top);
+    // Verdicts: the locked strategy gets one, every other strategy stays without.
+    const lockedAnalysis = request({ type: 'analyze', strategyId: chosen.id, genome: chosen.genome }) as Of<'analysis'>;
+    expect(lockedAnalysis.verdict).toBe(top.verdict);
+    const otherAnalysis = request({ type: 'analyze', strategyId: final[0].id, genome: final[0].genome }) as Of<'analysis'>;
+    expect(otherAnalysis.verdict).toBeNull();
+
     console.log(
-      `converged after ${done.iteration} iterations in ${(done.elapsedMs / 1000).toFixed(1)}s | #1 fitness ${top.fitness.toFixed(2)} ` +
+      `converged after ${done.iteration} iterations in ${(done.elapsedMs / 1000).toFixed(1)}s, ${final.length} on the board, ` +
+        `${done.undersampled} rejected for too few trades | locked ${top.id}: fitness ${top.fitness.toFixed(2)} ` +
         `params ${top.params} trades ${top.search.trades} DSR ${(top.dsr * 100).toFixed(0)}% ` +
-        `validation Sharpe ${top.validation.sharpe.toFixed(2)} holdout Sharpe ${top.holdout?.sharpe.toFixed(2)} verdict ${top.verdict} | ` +
-        `verdicts: ${['Robust', 'Fragile', 'Overfit'].map((v) => `${v} ${final.filter((s) => s.verdict === v).length}`).join(', ')}`,
+        `validation Sharpe ${top.validation.sharpe.toFixed(2)} holdout Sharpe ${top.holdout?.sharpe.toFixed(2)} verdict ${top.verdict}`,
     );
   }, 300_000);
 
@@ -227,27 +339,105 @@ describe('optimizer worker', () => {
     expect(done.reason).toBe('stopped');
     expect(done.iteration).toBeGreaterThanOrEqual(300);
     expect(done.iteration).toBeLessThan(300 + 4 * PROGRESS_EVERY);
-    expect(done.stagnation).toBeLessThan(DEFAULT_MAX_STAGNATION);
     expect(done.strategies.length).toBeGreaterThan(0);
     assertConstraints(done.strategies, 'long-only');
-    // Stopping also ends the search, so the holdout is revealed.
+    // Stopping ends the search but keeps the holdout sealed until one strategy is locked.
     for (const s of done.strategies) {
-      expect(s.holdout).not.toBeNull();
+      expect(s.holdout).toBeNull();
       if (s.genome.exit.mode === 'dynamic') expect(s.genome.exit.shortExit).toBeNull();
     }
+    const reply = lock(done.strategies[0].id) as Of<'locked'>;
+    expect(reply.type).toBe('locked');
+    expect(reply.strategy.holdout).not.toBeNull();
   }, 120_000);
 
-  it('honours a custom stagnation limit', async () => {
-    const messages = await runOptimizer([dataset('SPY', '1d', '2y')], settingsFor('long-only'), { seed: 3, maxStagnation: 300 });
+  it('refuses to reveal the holdout while the search is running, or for a strategy not on the final board', async () => {
+    const replies: WorkerResponse[] = [];
+    const done = await new Promise<Of<'done'>>((resolve) => {
+      let asked = false;
+      scope.postMessage = (message) => {
+        if (message.type === 'progress' && !asked) {
+          asked = true;
+          // The worker answers synchronously: capture its reply to the mid-run lock request.
+          const runPost = scope.postMessage;
+          scope.postMessage = (reply) => replies.push(reply);
+          scope.onmessage?.({ data: { type: 'lock', strategyId: 'S-1', priorReveals: 0, simulated: false } });
+          scope.postMessage = runPost;
+        }
+        if (message.type === 'done') resolve(message);
+      };
+      scope.onmessage?.({
+        data: {
+          type: 'start',
+          payload: { datasets: [dataset('NVDA', '1h', '1y')], settings: settingsFor('long-only'), hypothesis: 'TREND_FOLLOWING', seed: 8, maxEvaluations: 300 },
+        },
+      });
+    });
+    expect(replies).toHaveLength(1);
+    expect(replies[0].type).toBe('error');
+    expect((replies[0] as Of<'error'>).message).toContain('after the run has ended');
+    const unknown = lock('S-not-on-the-board') as Of<'error'>;
+    expect(unknown.type).toBe('error');
+    expect(unknown.message).toContain('final leaderboard');
+    // Neither refusal spent the holdout.
+    if (done.strategies.length > 0) expect(lock(done.strategies[0].id).type).toBe('locked');
+  }, 120_000);
+
+  it('honours a custom evaluation limit', async () => {
+    const messages = await runOptimizer([dataset('SPY', '1d', '2y')], settingsFor('long-only'), { seed: 3, maxEvaluations: 300 });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.reason).toBe('budget');
+    expect(done.evaluations).toBe(300);
+  }, 120_000);
+
+  it('counts the trials of earlier sessions: they raise the hurdle, lower every DSR and use up the window budget', async () => {
+    const eth = dataset('ETH-USD', '4h', '2y');
+    const settings = settingsFor('long-only');
+    const fresh = (await runOptimizer([eth], settings, { seed: 41, maxEvaluations: 600 })).pop() as Of<'done'>;
+    expect(fresh.type).toBe('done');
+    expect(fresh.windowTrials).toBe(fresh.evaluations);
+    // Pretend 9,700 trials with the same spread were spent on this window in earlier sessions.
+    const variance = fresh.runTrials.m2 / (fresh.runTrials.count - 1);
+    const prior: TrialStats = { count: 9_700, mean: fresh.runTrials.mean, m2: variance * 9_699 };
+    const messages = await runOptimizer([eth], settings, { seed: 41, maxEvaluations: 600, priorTrials: prior });
+    const ready = messages[0] as Of<'ready'>;
+    const later = messages[messages.length - 1] as Of<'done'>;
+    expect(later.type).toBe('done');
+    // Only 300 evaluations were left on the window: the run stops there, and the window is spent.
+    expect(later.evaluations).toBe(WINDOW_TRIAL_BUDGET - 9_700);
+    expect(later.reason).toBe('window-budget');
+    expect(later.windowTrials).toBe(WINDOW_TRIAL_BUDGET);
+    // The hurdle reflects every trial on the window, so each strategy's DSR is lower than it would be against this run's alone.
+    expect(later.hurdleSharpe).toBeGreaterThan(fresh.hurdleSharpe);
+    const freshHurdle = fresh.hurdleSharpe / Math.sqrt(ready.barsPerYear);
+    for (const s of later.strategies) {
+      expect(s.dsr).toBeLessThanOrEqual(deflatedSharpeAgainst(s.validation, freshHurdle).probability + 1e-12);
+    }
+    // A spent window refuses to start at all.
+    const refused = await runOptimizer([eth], settings, { seed: 41, priorTrials: { ...prior, count: WINDOW_TRIAL_BUDGET } });
+    const error = refused[refused.length - 1] as Of<'error'>;
+    expect(error.type).toBe('error');
+    expect(error.message).toMatch(/trial budget/);
+  }, 300_000);
+
+  it('stops early once 500 evaluations in a row fail to beat the best deflated Sharpe', async () => {
+    const messages = await runOptimizer([randomWalk(1826, 77, 0.035)], settingsFor('long-only'), {
+      seed: 5,
+      hypothesis: 'RANGE_REVERSION',
+      maxEvaluations: WINDOW_TRIAL_BUDGET,
+    });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.reason).toBe('converged');
-    expect(done.stagnation).toBe(300);
-  }, 120_000);
+    expect(done.dsrStall).toBe(DSR_PATIENCE);
+    expect(done.evaluations).toBeLessThan(WINDOW_TRIAL_BUDGET);
+    expect(done.evaluations).toBeGreaterThanOrEqual(DSR_PATIENCE);
+  }, 300_000);
 
   it('scores a Robust universe on every asset and answers analyze requests', async () => {
-    const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD'].map((symbol) => dataset(symbol, '1d', '2y'));
+    // 4h candles: two years of daily candles cannot supply the minimum number of trades on every asset.
+    const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD'].map((symbol) => dataset(symbol, '4h', '2y'));
     const settings = settingsFor('long-only');
-    const messages = await runOptimizer(universe, settings, { seed: 21, maxStagnation: 400 });
+    const messages = await runOptimizer(universe, settings, { seed: 21, maxEvaluations: 400 });
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.strategies.length).toBeGreaterThan(0);
@@ -261,58 +451,73 @@ describe('optimizer worker', () => {
     }
     for (const s of done.strategies) {
       expect(s.assets).toHaveLength(3);
-      for (const asset of s.assets) expect(asset.holdout).not.toBeNull();
-      expect(s.robustness?.crossAsset?.rows.map((row) => row.symbol)).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD']);
-      const share = s.robustness?.crossAsset?.share ?? 0;
-      expect(share).toBeGreaterThanOrEqual(0);
-      expect(share).toBeLessThanOrEqual(1);
+      for (const asset of s.assets) {
+        expect(asset.holdout).toBeNull();
+        // Every asset clears the per-year trade gate.
+        expect(asset.search.trades).toBeGreaterThan(0);
+      }
     }
 
     // On-demand analysis, with two extra assets supplied for the cross-asset test.
     const target = done.strategies[0];
-    const extra = [dataset('XRP-USD', '1d', '2y'), dataset('DOGE-USD', '1d', '2y')];
+    const extra = [dataset('XRP-USD', '4h', '2y'), dataset('DOGE-USD', '4h', '2y')];
     const reply = request({ type: 'analyze', strategyId: target.id, genome: target.genome, universe: extra }) as Of<'analysis'>;
     expect(reply.type).toBe('analysis');
     expect(reply.strategyId).toBe(target.id);
     expect(reply.report.crossAsset?.rows.map((row) => row.symbol)).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD']);
     expect(reply.report.sensitivity.baseRoi).toBeCloseTo(target.search.roi, 6);
     expect(reply.report.topTrades.netPnlWithout).toBeLessThanOrEqual(reply.report.topTrades.netPnl);
-    expect(['Robust', 'Fragile', 'Overfit']).toContain(reply.verdict);
+    expect(reply.verdict).toBeNull(); // not locked yet
 
-    // A strategy that is not on the final leaderboard can still be analysed.
+    // Locking reveals every asset's holdout for that one strategy.
+    const locked = lock(target.id) as Of<'locked'>;
+    expect(locked.type).toBe('locked');
+    for (const asset of locked.strategy.assets) expect(asset.holdout).not.toBeNull();
+    expect(locked.strategy.robustness?.crossAsset?.rows.map((row) => row.symbol)).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD']);
+    const after = request({ type: 'analyze', strategyId: target.id, genome: target.genome }) as Of<'analysis'>;
+    expect(['Robust', 'Fragile', 'Overfit']).toContain(after.verdict);
+
+    // Any other strategy can still be analysed, but never gets a verdict.
     const other = request({ type: 'analyze', strategyId: 'S-custom', genome: done.strategies[done.strategies.length - 1].genome }) as Of<'analysis'>;
     expect(other.type).toBe('analysis');
-    expect(other.verdict).not.toBeNull();
+    expect(other.verdict).toBeNull();
   }, 300_000);
 
-  it('keeps the train / validation figures of every strategy unchanged when the holdout is revealed', async () => {
-    const eth = dataset('ETH-USD', '1d', '5y');
+  it('keeps the train / validation figures unchanged when the locked strategy\'s holdout is revealed', async () => {
+    const eth = dataset('ETH-USD', '4h', '2y');
     const settings = settingsFor('long-short');
-    const messages = await runOptimizer([eth], settings, { seed: 99, maxStagnation: 600 });
+    const messages = await runOptimizer([eth], settings, { seed: 99, maxEvaluations: 600 });
     const done = messages[messages.length - 1] as Of<'done'>;
     // The final figures must be exactly what the search ranked on: a backtest that stops at the holdout boundary.
     const split = splitFor(eth.data.c.length);
     const ind = new IndicatorCache(eth.data);
     const ws = new BacktestWorkspace(eth.data.c.length);
     const ppy = barsPerYear(eth.data.t);
-    let openAtBoundary = 0;
+    let straddling: (typeof done.strategies)[number] | null = null;
     for (const final of done.strategies) {
       const expected = evaluateSearch(ind, final.genome, settings, ws, split, ppy);
       expect(final.search).toEqual(expected.search);
       expect(final.train).toEqual(expected.train);
       expect(final.validation).toEqual(expected.validation);
-      expect(final.holdout).not.toBeNull();
+      expect(final.holdout).toBeNull();
       runBacktest(ind, final.genome, settings, ws);
-      if (ws.inMarket[split.holdoutStart - 1] === 1) openAtBoundary++;
+      if (straddling === null && ws.inMarket[split.holdoutStart - 1] === 1) straddling = final;
     }
-    // At least one strategy holds a position across the boundary, so the test can tell the two backtests apart.
-    expect(openAtBoundary).toBeGreaterThan(0);
+    // Lock a strategy that holds a position across the boundary, so the two backtests can be told apart.
+    expect(straddling).not.toBeNull();
+    const chosen = straddling as NonNullable<typeof straddling>;
+    const reply = lock(chosen.id) as Of<'locked'>;
+    expect(reply.type).toBe('locked');
+    expect(reply.strategy.holdout).not.toBeNull();
+    expect(reply.strategy.search).toEqual(chosen.search);
+    expect(reply.strategy.train).toEqual(chosen.train);
+    expect(reply.strategy.validation).toEqual(chosen.validation);
   }, 120_000);
 
   it('gives identical results on an evaluator pool and on a single thread', async () => {
-    const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD'].map((symbol) => dataset(symbol, '1d', '2y'));
+    const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD'].map((symbol) => dataset(symbol, '4h', '2y'));
     const settings = settingsFor('long-short');
-    const options = { seed: 314, maxStagnation: 500, batchSize: 75 };
+    const options = { seed: 314, maxEvaluations: 500, batchSize: 75 };
 
     const single = await runOptimizer(universe, settings, options);
 
@@ -331,6 +536,7 @@ describe('optimizer worker', () => {
     const a = single[single.length - 1] as Of<'done'>;
     const b = pooled[pooled.length - 1] as Of<'done'>;
     expect(b.type).toBe('done');
+    expect(a.strategies.length).toBeGreaterThan(0);
     expect(b.iteration).toBe(a.iteration);
     expect(b.stagnation).toBe(a.stagnation);
     expect(b.strategies.map((s) => s.id)).toEqual(a.strategies.map((s) => s.id));
@@ -344,16 +550,25 @@ describe('optimizer worker', () => {
 
   it('runs on 15m and 30m candles', async () => {
     for (const [symbol, interval, range] of [['SOL-USD', '30m', '1y'], ['AAPL', '15m', '1y']] as const) {
-      const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxStagnation: 300 });
+      const messages = await runOptimizer([dataset(symbol, interval, range)], settingsFor('long-only'), { seed: 5, maxEvaluations: 300 });
       const done = messages[messages.length - 1] as Of<'done'>;
       expect(done.type, `${symbol} ${interval}`).toBe('done');
-      expect(done.reason).toBe('converged');
-      expect(done.strategies.length).toBeGreaterThan(0);
-      for (const s of done.strategies) expect(s.holdout).not.toBeNull();
+      expect(['budget', 'converged']).toContain(done.reason);
+      for (const s of done.strategies) expect(s.holdout).toBeNull();
       const ready = messages[0] as Of<'ready'>;
-      // 30m crypto over a year: 17,520 candles; 15m stock: Yahoo's 60-day window.
-      if (interval === '30m') expect(ready.axis.bars).toBeGreaterThan(17_000);
-      else expect(ready.axis.bars).toBeLessThan(1_200);
+      if (interval === '30m') {
+        // 30m crypto over a year: 17,520 candles – plenty of trades to clear the gates.
+        expect(ready.axis.bars).toBeGreaterThan(17_000);
+        expect(done.strategies.length).toBeGreaterThan(0);
+      } else {
+        // 15m stock: Yahoo's 60-day window. About 220 validation candles cannot hold 60 trades, so the
+        // hard sample-size gates reject every candidate and the run ends cleanly with an empty board.
+        expect(ready.axis.bars).toBeLessThan(1_200);
+        expect(done.strategies).toHaveLength(0);
+        expect(done.undersampled).toBeGreaterThan(0);
+        expect(done.bestDsr).toBeNull();
+        expect(lock('S-1').type).toBe('error');
+      }
     }
   }, 300_000);
 
@@ -374,30 +589,118 @@ describe('optimizer worker', () => {
 });
 
 describe('acceptance: pure noise must not look like an edge', () => {
-  it('flags the best strategy found on driftless random walks as unproven', async () => {
-    const holdoutSharpes: number[] = [];
+  /*
+   * The walks of docs/AUDIT.md §0, reproduced exactly: 1,826 daily candles (≈ 5 years), 3.5% daily
+   * volatility, the same seeds. Before any fix, 96 of the 150 strategies on the drift boards
+   * (64%) made money on the holdout – the test the verdict used then. These tests judge the WHOLE
+   * top-25 board of every run, not just #1, with the holdout conditions the verdict uses now.
+   * Revealing every holdout is only done here, by the test acting as an outside oracle; the app
+   * itself reveals one locked strategy per run.
+   */
+  const AUDIT_BARS = 1826;
+  const AUDIT_SIGMA = 0.035;
+  const AUDIT_DRIFT_PER_BAR = 0.4 / 365;
+  const SETTINGS = settingsFor('long-only');
+
+  interface BoardRow {
+    dsr: number;
+    /** Annualised Sharpe over train + validation – what the search saw. */
+    searchSharpe: number;
+    holdoutRoi: number;
+    holdoutSharpe: number;
+    /** Passes every holdout condition of a Robust verdict (`holdoutShortfalls` is empty). */
+    holdoutPass: boolean;
+    /** Holdout conditions AND a deflated Sharpe of 95% or more: everything Robust needs short of the robustness tests. */
+    robustEligible: boolean;
+  }
+
+  /** Run on noise, then reveal the holdout of every strategy on the final board (oracle only). */
+  async function revealWholeBoard(data: NamedDataset, seed: number, hypothesis: Hypothesis): Promise<{ done: Of<'done'>; rows: BoardRow[] }> {
+    const messages = await runOptimizer([data], SETTINGS, { seed, hypothesis });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.type).toBe('done');
+    expect(done.reason).toBe('converged');
+    assertConstraints(done.strategies, 'long-only');
+    const n = data.data.c.length;
+    const split = splitFor(n);
+    const ppy = barsPerYear(data.data.t);
+    const ind = new IndicatorCache(data.data);
+    const ws = new BacktestWorkspace(n);
+    const bench = benchmarkEquity(data.data, SETTINGS);
+    const benchHoldout = segmentMetrics(bench, split.holdoutStart, n, bench[split.holdoutStart - 1], ppy, null, null);
+    const rows = done.strategies.map((s) => {
+      expect(s.holdout).toBeNull(); // the app itself never revealed it
+      expect(s.validation.trades).toBeGreaterThanOrEqual(MIN_VALIDATION_TRADES);
+      runBacktest(ind, s.genome, SETTINGS, ws);
+      const h = holdoutMetrics(ws.equity, split, ppy, ws);
+      const holdoutPass = holdoutShortfalls(h, benchHoldout, ppy).length === 0;
+      return { dsr: s.dsr, searchSharpe: s.search.sharpe, holdoutRoi: h.roi, holdoutSharpe: h.sharpe, holdoutPass, robustEligible: holdoutPass && s.dsr >= 0.95 };
+    });
+    return { done, rows };
+  }
+
+  /** Lock the #1 strategy, as a user would, and return its verdict. */
+  function lockTop(done: Of<'done'>): StrategyResult | null {
+    if (done.strategies.length === 0) return null;
+    const reply = lock(done.strategies[0].id) as Of<'locked'>;
+    expect(reply.type).toBe('locked');
+    return reply.strategy;
+  }
+
+  async function nullBoards(driftPerBar: number, walkSeed: number): Promise<BoardRow[]> {
+    const all: BoardRow[] = [];
     const lines: string[] = [];
-    for (let seed = 0; seed < 6; seed++) {
-      // Defaults: 2% risk sizing, 0.1% fee, 0.05% slippage, 5,000-iteration stagnation limit.
-      const messages = await runOptimizer([randomWalk(3650, 1000 + seed)], settingsFor('long-only'), { seed: 77 + seed });
-      const done = messages[messages.length - 1] as Of<'done'>;
-      expect(done.type).toBe('done');
-      expect(done.reason).toBe('converged');
-      expect(done.strategies.length).toBeGreaterThan(0);
-      assertConstraints(done.strategies, 'long-only');
-      const top = done.strategies[0];
-      // The deflated Sharpe must never certify noise as real.
-      expect(top.dsr).toBeLessThan(0.95);
-      expect(top.verdict).not.toBe('Robust');
-      holdoutSharpes.push(top.holdout?.sharpe ?? 0);
+    for (let k = 0; k < 6; k++) {
+      // Every hypothesis gets its turn on the noise.
+      const { done, rows } = await revealWholeBoard(
+        randomWalk(AUDIT_BARS, walkSeed + k, AUDIT_SIGMA, driftPerBar),
+        900 + k,
+        HYPOTHESIS_IDS[k % HYPOTHESIS_IDS.length],
+      );
+      const top = lockTop(done);
+      // Nothing on any board may look certified, and the locked #1 is never Robust.
+      for (const row of rows) expect(row.dsr).toBeLessThan(0.95);
+      if (top) expect(top.verdict).not.toBe('Robust');
+      all.push(...rows);
       lines.push(
-        `seed ${seed}: ${done.iteration} iterations | #1 validation Sharpe ${top.validation.sharpe.toFixed(2)} DSR ${(top.dsr * 100).toFixed(1)}% ` +
-          `→ holdout Sharpe ${top.holdout?.sharpe.toFixed(2)} (${top.verdict}); verdicts ` +
-          ['Robust', 'Fragile', 'Overfit'].map((v) => `${v[0]}${done.strategies.filter((s) => s.verdict === v).length}`).join('/'),
+        `run ${k} (${HYPOTHESIS_IDS[k % HYPOTHESIS_IDS.length]}): ${done.evaluations} evaluations (${done.reason}), board ${rows.length} | holdout ROI > 0: ${rows.filter((r) => r.holdoutRoi > 0).length} | ` +
+          `passes the holdout conditions: ${rows.filter((r) => r.holdoutPass).length} | locked #1 ${top?.verdict ?? 'n/a'}`,
       );
     }
-    const mean = holdoutSharpes.reduce((a, b) => a + b, 0) / holdoutSharpes.length;
-    console.log(`${lines.join('\n')}\nmean holdout Sharpe of the #1 strategies: ${mean.toFixed(2)}`);
-    expect(mean).toBeLessThanOrEqual(0.3);
+    const share = (f: (r: BoardRow) => boolean): string => `${all.filter(f).length}/${all.length} (${((100 * all.filter(f).length) / Math.max(1, all.length)).toFixed(1)}%)`;
+    console.log(
+      `${lines.join('\n')}\nwhole board: holdout ROI > 0 ${share((r) => r.holdoutRoi > 0)} · passes the holdout conditions ${share((r) => r.holdoutPass)} · ` +
+        `Robust-eligible ${share((r) => r.robustEligible)} · mean holdout Sharpe ${(all.reduce((sum, r) => sum + r.holdoutSharpe, 0) / Math.max(1, all.length)).toFixed(2)}`,
+    );
+    return all;
+  }
+
+  it('flags every strategy on the boards of driftless random walks as unproven', async () => {
+    const rows = await nullBoards(0, 500);
+    // One hypothesis per run: on five years of daily noise the breakout and dip-buy ideas cannot reach
+    // 60 validation trades, so the hard gates leave their boards empty and those runs stop early.
+    expect(rows.length).toBeGreaterThan(20);
+    expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
+    // A false positive is a strategy whose holdout meets the verdict's conditions: rare on noise.
+    expect(rows.filter((r) => r.holdoutPass).length / rows.length).toBeLessThanOrEqual(0.1);
+    // With no edge to find, the board as a whole does not make risk-adjusted money on the holdout.
+    expect(rows.reduce((sum, r) => sum + r.holdoutSharpe, 0) / rows.length).toBeLessThanOrEqual(0);
+    // Selection inflation: how much better the board looked in-sample than on the holdout. On these
+    // exact walks it was 1.33 Sharpe before any fix and 1.11 after Stage 1; fold + neighbourhood
+    // scoring brings it under 1.
+    const inflation = rows.reduce((sum, r) => sum + r.searchSharpe - r.holdoutSharpe, 0) / rows.length;
+    console.log(`selection inflation (mean in-sample − holdout Sharpe): ${inflation.toFixed(2)}`);
+    expect(inflation).toBeLessThan(1);
+  }, 900_000);
+
+  it('does not certify noise on a trending asset, where most long strategies profit from drift alone', async () => {
+    const rows = await nullBoards(AUDIT_DRIFT_PER_BAR, 600);
+    expect(rows.length).toBeGreaterThan(20);
+    expect(rows.filter((r) => r.robustEligible)).toHaveLength(0);
+    // Audit baseline: 64% of these boards passed the old holdout test (a positive holdout return).
+    // Under the current holdout conditions the false-positive rate must be a small fraction of that.
+    const falsePositiveRate = rows.filter((r) => r.holdoutPass).length / rows.length;
+    expect(falsePositiveRate).toBeLessThanOrEqual(0.1);
+    expect(falsePositiveRate).toBeLessThan(0.64 / 5);
   }, 900_000);
 });

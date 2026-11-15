@@ -15,11 +15,17 @@ import {
   combineFitness,
   deflatedTerm,
   evaluateSearch,
+  isSingleRegime,
+  plateauFitness,
+  regimeMask,
   splitFor,
+  tradeLogHash,
+  UNFIT,
+  type Regimes,
   type SearchMetrics,
   type Split,
 } from './backtester';
-import { countParameters, rewardToRisk, type GenomeLimits } from './genome';
+import { countParameters, rewardToRisk, stepNeighbours, type GenomeLimits } from './genome';
 import { IndicatorCache } from './indicators';
 import { deflatedSharpeAgainst } from '../lib/stats';
 import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, StrategyGenome } from '../types/trading';
@@ -39,6 +45,8 @@ export interface Asset {
   periodsPerYear: number;
   /** Buy & Hold over the search period. */
   benchmark: SearchMetrics & { equity: Float64Array };
+  /** Bull / bear / high-volatility label of every search-period bar. */
+  regimes: Regimes;
 }
 
 /** Per-asset ingredients of a fitness score that do not depend on the number of trials. */
@@ -55,7 +63,16 @@ export interface EvalContext {
   axis: ChartAxis;
   /** Per-bar Sharpe a strategy must beat to count as more than luck; frozen for a batch. */
   hurdle: number;
+  /** Trade-log fingerprints already evaluated in this run (frozen for a batch, see `tradeLogHash`). */
+  knownTrades: Set<string>;
 }
+
+/**
+ * Why a candidate was not scored:
+ *   inactive  – it never traded on the primary asset (nothing to rank, not a trial);
+ *   duplicate – its primary-asset trade log repeats one already evaluated (not a new trial).
+ */
+export type SkipReason = 'inactive' | 'duplicate';
 
 function validate(dataset: NamedDataset): void {
   const { data, symbol } = dataset;
@@ -86,6 +103,7 @@ export function buildAsset(dataset: NamedDataset, settings: BacktestSettings, bu
     split,
     periodsPerYear,
     benchmark: benchmarkSearch(data, settings, split, periodsPerYear),
+    regimes: regimeMask(data.c, split, periodsPerYear),
   };
 }
 
@@ -153,19 +171,48 @@ const OPTIMISTIC = 1e9;
  * assets are scored, the best case for the rest still leaves the median capped.
  * The bound is exact, so pruning never changes which strategies are accepted.
  */
-export function scoreAssets(ctx: EvalContext, genome: StrategyGenome, floor = -Infinity): { scores: AssetScore[]; complete: boolean } {
+export function scoreAssets(
+  ctx: EvalContext,
+  genome: StrategyGenome,
+  floor = -Infinity,
+  dedupe = false,
+): { scores: AssetScore[]; complete: boolean; tradeHash: string | null; skip: SkipReason | null } {
   const total = ctx.assets.length;
   const scores: AssetScore[] = [];
+  let tradeHash: string | null = null;
   for (let a = 0; a < total; a++) {
     const asset = ctx.assets[a];
-    const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear);
-    scores.push({ base: assetBaseScore(metrics, asset.benchmark), metrics });
+    const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
+    scores.push({ base: assetBaseScore(metrics), metrics });
+    if (a === 0 && dedupe) {
+      // The primary asset decides whether this is a new bet at all, before any other work is spent on it.
+      tradeHash = tradeLogHash(asset.ws, asset.split.holdoutStart);
+      if (metrics.search.trades === 0) return { scores, complete: false, tradeHash, skip: 'inactive' };
+      if (ctx.knownTrades.has(tradeHash)) return { scores, complete: false, tradeHash, skip: 'duplicate' };
+    }
     // The median of `total` values is settled by its lower half: bounding needs more than half of them.
     if (floor > -Infinity && a + 1 < total && a + 1 > total >> 1 && fitnessCeiling(ctx, genome, scores) <= floor) {
-      return { scores, complete: false };
+      return { scores, complete: false, tradeHash, skip: null };
     }
   }
-  return { scores, complete: true };
+  return { scores, complete: true, tradeHash, skip: null };
+}
+
+/** Average trades per year that asset `a` opened over its search period. */
+export function tradesPerYear(ctx: EvalContext, a: number, metrics: SearchMetrics): number {
+  const asset = ctx.assets[a];
+  const years = asset.split.holdoutStart / asset.periodsPerYear;
+  return years > 0 ? metrics.search.trades / years : 0;
+}
+
+/** Lowest trades-per-year rate over the scored assets (Infinity when none is scored). */
+function minTradesPerYear(ctx: EvalContext, scores: AssetScore[]): number {
+  let min = Infinity;
+  scores.forEach((score, a) => {
+    const rate = tradesPerYear(ctx, a, score.metrics);
+    if (rate < min) min = rate;
+  });
+  return min;
 }
 
 /** Highest fitness a partly scored strategy can still reach if every remaining asset turns out perfect. */
@@ -177,10 +224,14 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
     return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
   });
   for (let k = 0; k < missing; k++) assetScores.push(OPTIMISTIC);
+  // The primary asset is always scored first, so its trade counts are exact; unscored assets
+  // cannot lower the minimum trade rate below what the scored ones already show.
   return combineFitness({
     assetScores,
-    searchTrades: OPTIMISTIC,
-    validationTrades: OPTIMISTIC,
+    primaryTrades: scores[0].metrics.search.trades,
+    primaryValidationTrades: scores[0].metrics.validation.trades,
+    minTradesPerYear: minTradesPerYear(ctx, scores),
+    singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / ctx.assets.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
@@ -190,19 +241,17 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
 
 /** Fitness of a fully scored genome against the current selection-bias hurdle. */
 export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: AssetScore[]): { fitness: number; dsr: number } {
-  let searchTrades = 0;
-  let validationTrades = 0;
   let profitable = 0;
   const assetScores = scores.map((score) => {
-    searchTrades += score.metrics.search.trades;
-    validationTrades += score.metrics.validation.trades;
     if (score.metrics.validation.roi > 0) profitable++;
     return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
   });
   const fitness = combineFitness({
     assetScores,
-    searchTrades,
-    validationTrades,
+    primaryTrades: scores[0].metrics.search.trades,
+    primaryValidationTrades: scores[0].metrics.validation.trades,
+    minTradesPerYear: minTradesPerYear(ctx, scores),
+    singleRegime: isSingleRegime(scores[0].metrics.regimes),
     profitableShare: profitable / scores.length,
     params: countParameters(genome, ctx.limits),
     rewardToRisk: rewardToRisk(genome),
@@ -212,25 +261,80 @@ export function fitnessOf(ctx: EvalContext, genome: StrategyGenome, scores: Asse
   return { fitness, dsr };
 }
 
+/** A one-grid-step neighbour of a candidate and its per-asset scores. */
+export interface NeighbourScore {
+  genome: StrategyGenome;
+  scores: AssetScore[];
+}
+
+/** Backtest every one-grid-step parameter neighbour of `genome` on the whole universe. */
+export function scoreNeighbours(ctx: EvalContext, genome: StrategyGenome): NeighbourScore[] {
+  return stepNeighbours(genome, ctx.settings.tradeMode, ctx.limits).map((neighbour) => ({
+    genome: neighbour,
+    scores: scoreAssets(ctx, neighbour).scores,
+  }));
+}
+
+/**
+ * Rank fitness: the candidate's own fitness capped at the median fitness of its neighbours, all
+ * scored against the current hurdle. Returns the point fitness and the neighbour median as well.
+ */
+export function rankFitness(
+  ctx: EvalContext,
+  genome: StrategyGenome,
+  scores: AssetScore[],
+  neighbours: readonly NeighbourScore[] | null,
+): { fitness: number; point: number; neighbourMedian: number | null; dsr: number } {
+  const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
+  if (neighbours === null || neighbours.length === 0) return { fitness: point, point, neighbourMedian: null, dsr };
+  const values = neighbours.map((nb) => fitnessOf(ctx, nb.genome, nb.scores).fitness);
+  const fitness = plateauFitness(point, values);
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const neighbourMedian = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  return { fitness, point, neighbourMedian, dsr };
+}
+
 /** Outcome of evaluating one candidate during the search. */
 export interface CandidateResult {
   scores: AssetScore[];
-  /** False when scoring stopped early because the candidate provably cannot beat `floor`. */
+  /** False when scoring stopped early: the candidate provably cannot beat `floor`, or it was skipped. */
   complete: boolean;
+  /** Fingerprint of the primary-asset trade log. */
+  tradeHash: string | null;
+  /** Set when the candidate was not scored at all (it is then not a trial). */
+  skip: SkipReason | null;
+  /** Rank fitness: `pointFitness` capped by the neighbourhood (equal to it when no neighbours were scored). */
   fitness: number;
+  /** Fitness of the exact parameter values. */
+  pointFitness: number;
   dsr: number;
+  /** One-grid-step neighbours – scored only for candidates whose point fitness beats `floor`. */
+  neighbours: NeighbourScore[] | null;
   /** Primary-asset equity curve on the chart axis (search period only) – only for candidates that beat `floor`. */
   curve: Float32Array | null;
 }
 
-/** Evaluate one candidate against the frozen hurdle in `ctx` and the leaderboard floor. */
+/**
+ * Evaluate one candidate against the frozen hurdle in `ctx` and the leaderboard floor.
+ *
+ * Candidates whose own fitness beats the floor – the only ones that can enter the leaderboard –
+ * also have their one-grid-step parameter neighbourhood backtested, and are ranked by their
+ * fitness capped at the neighbours' median (`plateauFitness`). The cap only ever lowers a score,
+ * so candidates that cannot beat the floor on their own need no neighbours, and pruning stays exact.
+ */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
-  const { scores, complete } = scoreAssets(ctx, genome, floor);
-  if (!complete) return { scores, complete, fitness: -Infinity, dsr: 0, curve: null };
-  const { fitness, dsr } = fitnessOf(ctx, genome, scores);
-  // The curve is only needed by candidates that can enter the leaderboard; it stops at the holdout boundary.
-  const curve = fitness > floor ? sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos) : null;
-  return { scores, complete, fitness, dsr, curve };
+  const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, floor, true);
+  if (!complete) return { scores, complete, tradeHash, skip, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
+  const { fitness: point, dsr } = fitnessOf(ctx, genome, scores);
+  if (!(point > floor) || point <= UNFIT) {
+    return { scores, complete, tradeHash, skip, fitness: point, pointFitness: point, dsr, neighbours: null, curve: null };
+  }
+  // Sample the curve BEFORE the neighbours' backtests overwrite the primary workspace.
+  const curve = sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos);
+  const neighbours = scoreNeighbours(ctx, genome);
+  const { fitness } = rankFitness(ctx, genome, scores, neighbours);
+  return { scores, complete, tradeHash, skip, fitness, pointFitness: point, dsr, neighbours, curve: fitness > floor ? curve : null };
 }
 
 /** Build a scoring context from raw datasets (the primary asset first). */
@@ -245,6 +349,7 @@ export function createContext(datasets: NamedDataset[], settings: BacktestSettin
     limits: deriveLimits(primary),
     axis: buildAxis(primary.data.t, primary.split),
     hurdle: 0,
+    knownTrades: new Set(),
   };
 }
 
@@ -270,6 +375,8 @@ export interface EvaluatorBatch {
   id: number;
   hurdle: number;
   floor: number;
+  /** Trade-log fingerprints registered since the previous batch: every evaluator keeps a full replica. */
+  knownTrades: string[];
   genomes: StrategyGenome[];
 }
 
@@ -296,6 +403,7 @@ export function attachEvaluator(port: PortLike, init: EvaluatorInit): void {
     try {
       ctx ??= createContext(init.datasets, init.settings, init.budgetBytes);
       ctx.hurdle = message.hurdle;
+      for (const hash of message.knownTrades) ctx.knownTrades.add(hash);
       const results = message.genomes.map((genome) => evaluateCandidate(ctx as EvalContext, genome, message.floor));
       const transfer: Transferable[] = [];
       for (const result of results) if (result.curve) transfer.push(result.curve.buffer as ArrayBuffer);

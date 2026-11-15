@@ -4,7 +4,7 @@
  * rules, in-sample vs. out-of-sample metrics, and a Pine Script v5 export.
  */
 
-import { Check, CircleCheck, CircleX, Copy, Info, Loader2, TriangleAlert, X } from 'lucide-react';
+import { Check, CircleCheck, CircleX, Copy, Info, Loader2, Lock, TriangleAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ARCHETYPE_LABEL,
@@ -16,7 +16,10 @@ import {
   listIndicators,
   type RuleDescription,
 } from '../engine/describe';
-import { FREE_PARAMETERS, MAX_PARAMETERS } from '../engine/genome';
+import { FREE_PARAMETERS, HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
+import { overfittingRisk } from '../lib/risk';
+import StabilityHeatmap from './StabilityHeatmap';
+import { MIN_HOLDOUT_TRADES } from '../engine/backtester';
 import { generatePineScript } from '../engine/pine';
 import type { RunContext } from '../lib/config';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
@@ -31,13 +34,21 @@ interface StrategyModalProps {
   rank: number | null;
   benchmark: BenchmarkResult;
   context: RunContext;
-  /** Total number of strategies the optimiser has evaluated so far. */
+  /** Strategies this run has evaluated (earlier runs on the window are in `context.priorTrials`). */
   testedCount: number;
   barsPerYear: number;
   /** Result of an on-demand `analyze` request; overrides the report carried by the strategy. */
   analysis: { report: RobustnessReport; verdict: Verdict | null } | null;
   /** True while an analysis request is in flight. */
   analysisPending: boolean;
+  /** True once the search has ended (locking is only possible then). */
+  finished: boolean;
+  /** The run's locked strategy, if one has been chosen. */
+  lockedId: string | null;
+  /** True while the lock request is in flight. */
+  lockPending: boolean;
+  /** Lock this strategy and reveal its holdout. */
+  onLock: () => void;
   onClose: () => void;
 }
 
@@ -164,15 +175,23 @@ export default function StrategyModal({
   barsPerYear,
   analysis,
   analysisPending,
+  finished,
+  lockedId,
+  lockPending,
+  onLock,
   onClose,
 }: StrategyModalProps): JSX.Element {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  /** Locking is irreversible, so it takes two clicks. */
+  const [confirmLock, setConfirmLock] = useState(false);
   const [showCode, setShowCode] = useState(false);
   const { genome } = strategy;
   const report = analysis?.report ?? strategy.robustness;
   const verdict = analysis?.verdict ?? strategy.verdict;
   const revealed = strategy.holdout !== null;
+  const risk = useMemo(() => overfittingRisk(strategy), [strategy]);
+  const hypothesis = genome.hypothesis ? HYPOTHESES[genome.hypothesis] : null;
 
   // Close on Escape, lock background scroll, and move focus into the dialog.
   useEffect(() => {
@@ -193,6 +212,7 @@ export default function StrategyModal({
 
   useEffect(() => {
     setCopyState('idle');
+    setConfirmLock(false);
   }, [strategy.id]);
 
   const indicators = useMemo(() => listIndicators(genome), [genome]);
@@ -245,7 +265,7 @@ export default function StrategyModal({
                 Strategy {strategy.id}
               </h2>
               {rank !== null ? <Pill tone="accent">Rank #{rank}</Pill> : <Pill>No longer in Top 25</Pill>}
-              <Pill tone="bench">{ARCHETYPE_LABEL[genome.archetype]}</Pill>
+              <Pill tone="bench">{hypothesis ? hypothesis.label : ARCHETYPE_LABEL[genome.archetype]}</Pill>
               <Pill tone={genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exit.mode}</Pill>
               <Pill>{genome.shortEntry ? 'Long/Short' : 'Long-Only'}</Pill>
               <Pill tone={strategy.params > FREE_PARAMETERS ? 'warn' : 'neutral'}>{strategy.params} params</Pill>
@@ -268,16 +288,58 @@ export default function StrategyModal({
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {/* Headline numbers: everything the search was allowed to see (train + validation). */}
+          {/* Headline numbers: selection-bias-aware and risk-adjusted first; raw return last and labelled in-sample. */}
           <div className="grid grid-cols-2 gap-2 px-5 pb-2 sm:grid-cols-3">
-            <StatTile label="Net PnL" value={fmtUsd(strategy.search.netPnl, true)} tone={toneClass(strategy.search.netPnl)} />
-            <StatTile label="ROI" value={fmtPct(strategy.search.roi, true)} tone={toneClass(strategy.search.roi)} />
-            <StatTile label="Alpha vs. B&H" value={fmtPct(strategy.alpha, true)} tone={toneClass(strategy.alpha)} />
+            <StatTile
+              label="Overfit risk"
+              value={`${risk.score} · ${risk.level}`}
+              tone={risk.level === 'low' ? 'text-up' : risk.level === 'moderate' ? 'text-warn' : 'text-down'}
+            />
+            <StatTile
+              label="Deflated Sharpe"
+              value={fmtPct(strategy.dsr * 100, false, 0)}
+              tone={strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink'}
+            />
+            <StatTile label="Haircut Sharpe" value={strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)} />
+            <StatTile label="Validation Sharpe" value={fmtNum(strategy.validation.sharpe)} />
             <StatTile label="Max drawdown" value={fmtPct(strategy.search.maxDrawdown)} />
-            <StatTile label="Sharpe" value={fmtNum(strategy.search.sharpe)} />
-            <StatTile label="Trades" value={fmtInt(strategy.search.trades)} />
+            <StatTile label="Trades (validation)" value={`${fmtInt(strategy.search.trades)} (${fmtInt(strategy.validation.trades)})`} />
           </div>
-          <p className="px-5 pb-5 text-[11px] text-ink-3">Headline figures cover train + validation, the 80% of history the search could see.</p>
+          <p className="px-5 pb-5 text-[11px] text-ink-3">
+            The deflated and haircut Sharpe account for all {fmtInt(context.priorTrials.count + testedCount)} strategies tried on this data
+            window across every run. The other figures cover train + validation – the 80% of history the search optimised on, so they are
+            biased upwards: in-sample ROI {fmtPct(strategy.search.roi, true)}, {fmtPct(strategy.alpha, true)} vs. Buy &amp; Hold.
+          </p>
+
+          <Section title="Overfitting risk" hint="0 = low · 100 = high">
+            <div className="flex flex-wrap items-baseline gap-3">
+              <span className="num text-3xl font-semibold text-ink">{risk.score}</span>
+              <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level} risk</Pill>
+              <span className="text-xs text-ink-3">
+                {risk.level === 'low'
+                  ? 'The evidence that this is more than a lucky fit is comparatively strong.'
+                  : risk.level === 'moderate'
+                    ? 'Some of the evidence points to a fit of past noise.'
+                    : 'Most of the evidence points to a fit of past noise – treat it as unproven.'}
+              </span>
+            </div>
+            <ul className="mt-3 space-y-1.5">
+              {risk.components.map((component) => (
+                <li key={component.key} className="grid grid-cols-[150px_minmax(0,1fr)_44px] items-center gap-3 text-xs">
+                  <span className="text-ink-2" title={`${component.weight} of 100 points`}>
+                    {component.label} <span className="text-ink-3">· {component.weight}</span>
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
+                      <span className="block h-full rounded-full bg-ink-3" style={{ width: `${component.risk * 100}%` }} />
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-ink-3">{component.detail}</span>
+                  </span>
+                  <span className="num text-right font-semibold text-ink">{Math.round(component.weight * component.risk)}</span>
+                </li>
+              ))}
+            </ul>
+          </Section>
 
           {context.simulated && (
             <div className="mx-5 mb-5 flex gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
@@ -289,8 +351,14 @@ export default function StrategyModal({
             </div>
           )}
 
-          <Section title="The idea" hint={ARCHETYPE_LABEL[genome.archetype]}>
+          <Section title="The idea" hint={hypothesis ? `Hypothesis: ${hypothesis.label}` : ARCHETYPE_LABEL[genome.archetype]}>
+            {hypothesis && (
+              <p className="mb-2 text-sm leading-relaxed text-ink">
+                <span className="font-semibold">{hypothesis.label}.</span> {hypothesis.rationale}
+              </p>
+            )}
             <p className="text-sm leading-relaxed text-ink-2">{describeArchetype(genome)}</p>
+            {hypothesis && <p className="mt-2 text-xs text-ink-3">One primitive per idea: it stands in for {hypothesis.replaces}</p>}
           </Section>
 
           <Section
@@ -397,10 +465,57 @@ export default function StrategyModal({
             </div>
 
             {!revealed && (
-              <p className="mt-2 flex items-start gap-2 text-xs text-ink-3">
-                <Info size={14} className="mt-0.5 shrink-0" />
-                The holdout is not simulated while the search is running. It is evaluated once, when the run stops or converges.
-              </p>
+              <div className="mt-3 rounded-lg border border-line px-3 py-2.5 text-xs leading-relaxed text-ink-2">
+                {!finished ? (
+                  <p className="flex items-start gap-2">
+                    <Info size={14} className="mt-0.5 shrink-0 text-ink-3" />
+                    The holdout is not simulated while the search is running. When the run ends you can lock ONE strategy to reveal its
+                    holdout.
+                  </p>
+                ) : lockedId !== null ? (
+                  <p className="flex items-start gap-2">
+                    <Lock size={14} className="mt-0.5 shrink-0 text-ink-3" />
+                    This run&apos;s holdout was spent on strategy <span className="num font-semibold text-ink">{lockedId}</span>. Every other
+                    strategy&apos;s holdout stays sealed, so the holdout cannot be used to pick a winner.
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <p className="min-w-0 flex-1">
+                      <span className="font-semibold text-ink">Lock this strategy as the run&apos;s final answer?</span> Its holdout is revealed
+                      once. No other strategy of this run can be revealed afterwards, and the reveal is recorded for later runs on the same
+                      symbols and dates.
+                    </p>
+                    {confirmLock ? (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmLock(false)}
+                          className="inline-flex h-8 items-center rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={onLock}
+                          disabled={lockPending}
+                          className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-semibold text-white transition-colors hover:bg-accent-strong disabled:opacity-60"
+                        >
+                          {lockPending ? <Loader2 size={13} className="animate-spin" /> : <Lock size={13} />}
+                          Yes, lock {strategy.id} and reveal
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmLock(true)}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-3 text-xs font-semibold text-accent-strong transition-colors hover:bg-accent/20"
+                      >
+                        <Lock size={13} /> Lock &amp; reveal holdout
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
 
             {ambiguousShare > 0.1 && (
@@ -419,7 +534,7 @@ export default function StrategyModal({
               <div>
                 <p>
                   <span className="font-semibold text-ink">Selection bias.</span>{' '}
-                  <span className="num">{fmtInt(testedCount)}</span> strategies have been tried on this data. Deflated Sharpe Ratio of the
+                  <span className="num">{fmtInt(context.priorTrials.count + testedCount)}</span> strategies have been tried on this data window (all runs). Deflated Sharpe Ratio of the
                   validation segment: <span className="num font-semibold text-ink">{fmtPct(strategy.dsr * 100, false, 1)}</span> – the
                   probability that the validation Sharpe of <span className="num">{fmtNum(strategy.validation.sharpe)}</span> is real
                   rather than the luckiest of that many attempts. Below 95% it is not statistically distinguishable from luck.
@@ -434,8 +549,8 @@ export default function StrategyModal({
                     from <span className="num">{fmtInt(strategy.holdout.bars)}</span> candles and{' '}
                     <span className="num">{fmtInt(strategy.holdout.trades)}</span> trades.
                     {holdoutCi[0] <= 0 ? ' The interval includes zero, so the holdout alone does not prove an edge.' : ''}
-                    {context.priorHoldoutViews > 0
-                      ? ` This holdout had already been viewed ${context.priorHoldoutViews} time${context.priorHoldoutViews === 1 ? '' : 's'} before this run, so it is no longer unseen data.`
+                    {context.priorHoldoutReveals > 0
+                      ? ` This holdout period had already been revealed ${context.priorHoldoutReveals} time${context.priorHoldoutReveals === 1 ? '' : 's'} before this run, so it is no longer untouched data.`
                       : ''}
                   </p>
                 ) : null}
@@ -443,21 +558,40 @@ export default function StrategyModal({
             </div>
           </Section>
 
+          <Section title="Parameter stability" hint="Train + validation · primary asset">
+            {report?.stability ? (
+              <StabilityHeatmap grid={report.stability} />
+            ) : report ? (
+              <p className="text-sm text-ink-3">This strategy has no tunable parameter to map.</p>
+            ) : (
+              <p className="flex items-center gap-2 text-sm text-ink-3">
+                <Loader2 size={15} className="animate-spin" /> Mapping the parameter neighbourhood…
+              </p>
+            )}
+          </Section>
+
           <Section title="Robustness" hint="Tested on train + validation; the holdout is not used">
             {report ? (
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  {verdict !== null ? <VerdictPill verdict={verdict} /> : <Pill>Verdict after the run ends</Pill>}
+                  {verdict !== null ? <VerdictPill verdict={verdict} /> : <Pill>{revealed ? 'Verdict pending' : 'Verdict after lock'}</Pill>}
                   <span className="text-xs text-ink-3">
                     {verdict === 'Robust'
-                      ? 'Profitable on the holdout, deflated Sharpe of 95% or more, and every test below passed.'
+                      ? 'Deflated Sharpe of 95% or more, a holdout Sharpe whose 95% interval is above zero and beats Buy & Hold, enough holdout trades, an untouched holdout, live data, and every test below passed.'
                       : verdict === 'Fragile'
-                        ? 'Survived the holdout, but a test below failed or the deflated Sharpe is under 95%.'
+                        ? 'Survived the holdout, but did not meet every Robust condition:'
                         : verdict === 'Overfit'
-                          ? 'Lost money on the holdout, or the deflated Sharpe says the result is probably luck (under 50%).'
-                          : 'The verdict needs the holdout, which is revealed when the run ends.'}
+                          ? 'Rejected:'
+                          : 'A verdict needs the holdout, so only the one locked strategy of a run gets one.'}
                   </span>
                 </div>
+                {strategy.verdictNotes && strategy.verdictNotes.length > 0 && (
+                  <ul className="list-disc space-y-0.5 pl-5 text-xs text-ink-2">
+                    {strategy.verdictNotes.map((note) => (
+                      <li key={note}>{note}</li>
+                    ))}
+                  </ul>
+                )}
                 <ul className="space-y-1.5">
                   <TestRow
                     pass={!report.sensitivity.fragile}
@@ -486,12 +620,24 @@ export default function StrategyModal({
                     label="Deflated Sharpe ≥ 95%"
                     detail={fmtPct(strategy.dsr * 100, false, 1)}
                   />
-                  {strategy.holdout && (
-                    <TestRow
-                      pass={strategy.holdout.roi > 0}
-                      label="Profitable on the holdout"
-                      detail={`${fmtPct(strategy.holdout.roi, true)} vs Buy & Hold ${fmtPct(benchmark.holdout?.roi ?? null, true)}`}
-                    />
+                  {strategy.holdout && holdoutCi && (
+                    <>
+                      <TestRow
+                        pass={holdoutCi[0] > 0}
+                        label="Holdout Sharpe 95% interval above zero"
+                        detail={`${fmtNum(holdoutCi[0], 2)} to ${fmtNum(holdoutCi[1], 2)}`}
+                      />
+                      <TestRow
+                        pass={strategy.holdout.sharpe > (benchmark.holdout?.sharpe ?? Infinity)}
+                        label="Holdout Sharpe beats Buy & Hold"
+                        detail={`${fmtNum(strategy.holdout.sharpe)} vs ${fmtNum(benchmark.holdout?.sharpe ?? null)} · ROI ${fmtPct(strategy.holdout.roi, true)} vs ${fmtPct(benchmark.holdout?.roi ?? null, true)}`}
+                      />
+                      <TestRow
+                        pass={strategy.holdout.trades >= MIN_HOLDOUT_TRADES}
+                        label={`At least ${MIN_HOLDOUT_TRADES} holdout trades`}
+                        detail={fmtInt(strategy.holdout.trades)}
+                      />
+                    </>
                   )}
                 </ul>
                 {report.crossAsset && (

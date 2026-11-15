@@ -87,8 +87,12 @@ history for about 730 days, so stock requests longer than that are shortened (th
 ### Backtester
 
 - Signals are evaluated on the close of candle `t` and filled at the open of candle `t+1`.
-- Every fill pays the fee (default 0.1% per side) and slippage (default 0.05%). Perpetual funding can be
-  charged on open positions (off by default, 0.01% per 8h when switched on).
+- Every fill pays the fee (default 0.1% per side) and **volatility-scaled slippage**: the larger of a fixed
+  floor (default 0.05%) and a multiple of ATR(14) as a % of price (default 0.03 ×), read on the last closed
+  candle. Volatile candles and volatile assets cost more to trade.
+- **Long/Short runs pay financing by default.** Crypto is shorted as a perpetual: every open position pays
+  funding (default 0.01% per 8h). Stock and ETF shorts pay a borrow fee (default 2% a year). Long-Only runs
+  are treated as spot positions and pay no financing.
 - **Sizing is a run setting, not something the optimiser tunes.** Default: risk 2% of the starting capital at
   the stop, no compounding, exposure capped at 1× equity. Options: compounding, or 100% of equity.
 - Stops and targets are simulated intrabar from the entry candle. A gap through a level fills at the open.
@@ -104,62 +108,118 @@ Data is split chronologically: **Train 60% / Validation 20% / Holdout 20%**.
 
 - The search sees train and validation only. While a run is live, every backtest stops at the holdout
   boundary; the holdout is not simulated, scored or sent to the UI.
-- When the run ends (Stop or converged) the final leaderboard is evaluated on the holdout once, and the
-  holdout part of the chart appears.
-- A holdout is only unseen once. The app counts reveals per dataset (symbols, timeframe, range, end date) in
-  `localStorage` and warns on later runs: "Holdout already viewed N times. It is no longer unseen data."
+- **The holdout stays sealed when the run ends.** You choose ONE strategy of the final leaderboard and press
+  *Lock & reveal holdout*. Only that strategy's holdout is simulated and shown, once per run; every other
+  strategy stays sealed, so the holdout can never be used to pick a winner (there is no holdout column to
+  sort on).
+- A holdout is only unseen once. Every reveal is recorded in `localStorage` with its symbols and holdout
+  **date window**. A later run whose holdout overlaps an earlier reveal on any shared symbol is warned, and
+  none of its strategies can be rated Robust. A new end date, or another range or timeframe over the same
+  dates, does not reset the log.
 
-### Strategy genome
+### Market hypothesis and strategy genome
 
-Every strategy follows one archetype and stays small:
+Every run tests **one market hypothesis**, picked in the control bar before the run starts. A hypothesis
+fixes the single trigger primitive, the filter and the filter's direction; the search only tunes their
+numbers and the exit. Collinear indicators are not separate ideas – RSI, Stochastic, CCI and %B all
+measure "short-horizon oversold", and Supertrend, MA crosses and MACD all measure "trend" – so each idea is
+expressed by one primitive:
 
-- **Trend-following:** one trigger that fires when price or momentum turns up, plus an optional filter
-  (ATR %, volume ratio, ADX strength or Bollinger bandwidth).
-- **Mean reversion:** one trigger on an oversold reading or a short-term downswing (lookback ≤ 30), plus an
-  optional slow up-trend regime filter (lookback ≥ 100) or a filter. "Fade Supertrend flips against the
-  200-bar trend" is this archetype.
+| Hypothesis | Trigger | Filter (direction fixed) |
+|---|---|---|
+| **Trend following** – time-series momentum | Close above its EMA, or crossing above it | optional ADX above a level |
+| **Volatility breakout** – a close beyond the volatility envelope starts a move | Close crosses above the upper Bollinger band | optional volume above average |
+| **Buy the dip in an uptrend** – short-term overreaction | RSI oversold (below a level, or crossing back above it) | **required** close above a slow EMA (100+ candles) |
+| **Range reversion** – trendless prices revert to a mean | RSI oversold | optional ADX below a level |
+
+- Mutations stay inside the hypothesis: they tune a number, switch the trigger between its state and
+  event form, add / drop / redraw the filter, or change the exit. They never swap the indicator family,
+  flip a filter's direction or change the archetype. A mutation is **guaranteed to differ** from its parent
+  (it is retried, then falls back to a one-step neighbour).
 - At most 2 conditions per entry, always joined by `AND`. In Long/Short mode the short rules are the exact
   mirror of the long rules.
-- **Round-number grids only.** Lookbacks from {5, 7, 10, 14, 20, 21, 26, 30, 50, 100, 150, 200}; oscillator
-  levels in steps of 5; ATR, Bollinger and Supertrend multipliers in steps of 0.5; static stop / target from
-  {1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30} %. Stochastic smoothing is fixed at 3 / 3.
+- **Round-number grids only.** Lookbacks from the geometric grid {5, 7, 10, 14, 20, 28, 40, 56, 80, 112,
+  160, 200} (about √2 per step, no near-duplicates); oscillator levels in steps of 5; band multipliers in
+  steps of 0.5; static stop / target from {1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30} %.
 - **At most 8 tunable numbers** per strategy, with a fitness penalty for each one above 4.
 - **Exits:** static % stop and target, or ATR stop (1–4×) with optional ATR target (1.5–8×), trailing stop,
-  trigger-reversal exit (trend only, the mirror of the entry trigger) and an optional time stop
-  (5, 10, 20 or 40 bars). A trailing stop is only kept when the target sits at least 1 ATR beyond the stop.
+  trigger-reversal exit (trend following only) and an optional time stop (5, 10, 20 or 40 bars). A trailing
+  stop is only kept when the target sits at least 1 ATR beyond the stop.
 
-### Optimiser
+### Optimiser, trial budget and early stopping
 
-Evolutionary hill-climbing with mutation: coherent textbook seeds and random genomes start the population;
-each iteration mutates the champion or a rank-biased parent, recombines two leaderboard members, or injects a
-fresh random genome. Progress is posted every 25 iterations. The run ends when you press **Stop** or after
-a configurable number of consecutive iterations without a better top score (default 5,000, set in the control bar).
+Evolutionary hill-climbing with mutation: textbook seeds of the hypothesis and random genomes start the
+population; each iteration mutates the champion or a rank-biased parent, recombines two leaderboard
+members, or injects a fresh random genome.
+
+- **Only new bets count.** A candidate whose genome was already proposed, that never trades, or whose
+  trade log (entries, exits, direction and PnL on the primary asset) repeats one already evaluated is
+  skipped: it is not a trial, uses no budget and cannot enter the leaderboard.
+- **Evaluations per run:** 2,000 by default (settable from 100 to 10,000).
+- **Cumulative trial budget per data window:** at most **10,000** evaluations across every run and session
+  whose search period overlaps (a shared symbol, and at least half of the shorter window in common). The
+  trials are kept in `localStorage`, so reloading the page, a new end date, another range or another
+  timeframe over the same dates never resets them. They also seed the deflated-Sharpe hurdle and the
+  haircut, so every new run on the same data is judged against everything tried on it before. Once the
+  budget is spent, Start is disabled for that window.
+- **Early stopping:** a run ends when 500 evaluations in a row fail to beat the best deflated Sharpe on the
+  leaderboard (or at its evaluation limit, or the window's budget, or when you press **Stop**).
+- **Haircut Sharpe** (Harvey & Liu): the validation Sharpe's p-value is multiplied by the number of trials on
+  the window (Bonferroni) and turned back into the Sharpe that survives. Shown next to the deflated Sharpe.
+
+The telemetry strip shows a **trial-budget meter** for the active data window: trials used (all runs), its
+level (fresh / significance degrading from 50% / nearly spent from 90% / spent), and the Sharpe the luckiest
+of that many skill-less strategies is expected to reach. Every strategy carries an **overfitting risk score**
+(0–100: selection bias 30, multiple testing 15, parameter spike 20, fold inconsistency 15, regime collapse 10,
+thin sample 10; always "high" below a 50% deflated Sharpe), and its breakdown shows a **parameter-stability
+heatmap**: the search-period Sharpe over the two parameters whose one-step neighbours move it most.
 
 **Robust universe** (on by default for crypto): the same rules are backtested separately on every asset of
 a universe (default BTC, ETH, SOL, XRP, ADA, DOGE; editable). Fitness is the median per-asset score, trade
-counts are summed across assets, and there is a penalty when fewer than 2/3 of the assets are profitable on
+counts are gated per asset (never pooled), and there is a penalty when fewer than 2/3 of the assets are profitable on
 validation. The leaderboard and chart show the primary asset.
+
+The search period (train + validation) is cut into **5 equal, sequential folds**, and every fold is
+scored on its own (0.6 Sortino + 0.4 Sharpe, clamped). Fitness rests on the **25th percentile** of the
+five – the second-worst fold – so one lucky year cannot carry a strategy that fails in the others. Raw
+return over Buy & Hold no longer counts at all: it is a bet on the market's direction, not evidence of an
+edge.
+
+Every search-period bar is also labelled, causally, as **bull** or **bear** (sign of the trailing return
+over about a quarter of a year) and, separately, **high volatility** (trailing one-month volatility in the
+top third of the search period). A regime slice is judged when it covers at least 10% of the period and
+holds at least 10 of the strategy's trades. A strategy that **collapses** in a slice (annualised Sharpe
+below −0.5 there) loses 0.75 per slice; one that makes money in only one regime and collapses in all the
+others is **disqualified**.
 
 Fitness (higher is better), per asset:
 
 ```
 + 3.00 × Deflated Sharpe Ratio of the validation segment (plus a small slice of its z-score as a gradient)
-+ 0.35 × train risk-adjusted return (0.6 Sortino + 0.4 Sharpe, clamped)
-+ 1.50 × validation excess return over Buy & Hold
-+ 0.75 × train + validation excess return over Buy & Hold
++ 1.50 × 25th-percentile fold score
++ 0.25 × median fold score
 − penalty for intrabar drawdowns beyond 20%, steeper beyond 45%
-− penalty for a loss on the training segment, and for train / validation divergence
+− 0.75 for every regime slice the strategy collapses in
 ```
 
-then, across assets:
+then, across assets, after the **hard sample-size gates**: a strategy is disqualified outright with fewer
+than 100 train + validation trades or 60 validation trades on the primary asset, or fewer than 25 trades a
+year on any asset. Daily candles over 1–2 years rarely allow that many trades; use 4h / 1h candles or a
+longer history.
 
 ```
   median of the per-asset scores
-− up to 6.0 for fewer than 100 trades, up to 2.0 for fewer than 25 validation trades
 − 1.0 when fewer than 2/3 of the universe is profitable on validation
 − 0.15 for each tunable parameter above 4
 − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
 ```
+
+**Plateaus, not spikes.** A strategy that could enter the leaderboard also has every one-grid-step
+parameter neighbour backtested (each tunable number moved one step down and one step up, everything else
+unchanged). It is ranked by its own fitness **capped at the median fitness of those neighbours**: a
+broad plateau keeps its score, while an isolated spike – great at exactly these values, poor one step
+away – is pulled down to what its neighbourhood supports. The cap only ever lowers a score, so it is
+re-applied whenever the deflated-Sharpe hurdle moves and never lets a strategy jump the leaderboard.
 
 The **Deflated Sharpe Ratio** (Bailey & López de Prado) is the probability that a Sharpe ratio is real given
 the number of strategies tried so far, the spread of their Sharpe ratios, the sample length, and the
@@ -187,18 +247,24 @@ When a run ends (or on demand from the strategy drawer) each strategy is tested 
 - **Top-trade removal:** net PnL without the 5 best trades.
 - **Cross-asset:** the exact rules, untuned, on every universe asset.
 
-Verdict: **Overfit** when it lost money on the holdout or its deflated Sharpe is below 50%; **Fragile**
-when it survives the holdout but fails a test above or its deflated Sharpe is below 95%; **Robust** otherwise.
+Verdict (only the locked strategy gets one): **Overfit** when its deflated Sharpe is below 50% or it lost
+money (or had a non-positive Sharpe) on the holdout. **Robust** only when ALL of these hold: deflated Sharpe
+≥ 95%; holdout Sharpe 95% confidence interval above zero; holdout Sharpe above Buy & Hold's; at least 30
+holdout trades; every test above passes; the holdout period was never revealed before; live (not simulated)
+data. **Fragile** otherwise; the drawer lists every unmet condition.
 
 ## Read this before trusting a result
 
 - **Expect small numbers and few "Robust" verdicts.** With 2% risk per trade and a deflated Sharpe hurdle,
   most strategies are labelled Overfit or Fragile. That is the tool being honest, not broken: a year or
-  two of validation data cannot prove an edge against thousands of trials. On six driftless random walks
-  the best strategy's deflated Sharpe stayed at or below 16%, every listed strategy was labelled Overfit,
-  and the mean holdout Sharpe was −0.36.
+  two of validation data cannot prove an edge against thousands of trials. On the audit's random walks
+  (6 driftless, 6 with +40% a year of drift, one hypothesis per run, whole boards), no strategy reached a
+  95% deflated Sharpe, none met the holdout conditions of a Robust verdict, and every locked #1 was rated
+  Overfit. On five years of daily candles the breakout and dip-buy hypotheses rarely reach the minimum
+  number of trades at all – use 4h or 1h candles for them.
 - **The holdout is a one-shot test.** Re-running on the same dataset and picking the run whose holdout looks
-  best turns the holdout into training data. The reveal counter exists to make that visible.
+  best turns the holdout into training data. The reveal log makes that visible and blocks a Robust verdict
+  on a holdout that has been seen before.
 - **The holdout confidence interval is wide.** The drawer shows the 95% interval for the holdout Sharpe; with
   a few dozen trades it usually includes zero.
 - **Daily bars cannot resolve intrabar order.** The "ambiguous candles" count shows how many trades relied on
@@ -221,14 +287,16 @@ netlify/functions/market-data.ts  Market-data proxy (Binance + Yahoo Finance)
 src/types/trading.ts              Shared types and worker protocol
 src/engine/indicators.ts          Indicator library and memoising cache
 src/engine/backtester.ts          Execution model, metrics, split, benchmark, fitness
-src/engine/genome.ts              Archetypes, grids, random generation, mutation, repair
+src/engine/genome.ts              Market hypotheses, grids, random generation, mutation, repair
 src/engine/describe.ts            Plain-English rules and badges
 src/engine/pine.ts                Pine Script v5 exporter
 src/workers/optimizer.worker.ts   Optimisation loop (Web Worker)
 src/workers/evaluator.worker.ts   Evaluator pool member: scores candidate strategies
 src/engine/evaluation.ts          Shared scoring code and the evaluator protocol
-src/lib/stats.ts                  Deflated Sharpe Ratio, confidence intervals
-src/lib/holdoutLog.ts             Holdout reveal counter
+src/lib/stats.ts                  Deflated Sharpe Ratio, haircut Sharpe, confidence intervals
+src/lib/holdoutLog.ts             Holdout reveal log (symbols + date window, overlap matching)
+src/lib/trialLedger.ts            Cumulative trial budget per data window (overlap matching)
+src/lib/risk.ts                   Overfitting risk score
 src/data/                         Data loader, offline generator, basket builder
 src/components/                   ControlBar, TelemetryStrip, EquityChart, Leaderboard, StrategyModal
 src/App.tsx                       Dashboard and worker orchestration

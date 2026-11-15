@@ -1,24 +1,49 @@
 /**
- * Live telemetry: engine status, iteration counter, stagnation progress
- * (X / N iterations without improvement), best strategy vs. Buy & Hold
- * and the market-data source.
+ * Live telemetry: engine status, evaluation counter, the trial-budget meter of
+ * the data window (every run and session on overlapping data counts), the best
+ * deflated Sharpe ratio against the luck hurdle, and the market-data source.
+ *
+ * The headline is deliberately NOT a return figure: in-sample returns of the
+ * best of thousands of tried strategies are inflated by selection, while the
+ * deflated Sharpe accounts for how many were tried.
  */
 
 import { CircleCheck, CircleDot, Database, Loader2, OctagonX, TriangleAlert } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { RunContext } from '../lib/config';
-import { fmtDate, fmtDuration, fmtInt, fmtPct, toneClass } from '../lib/format';
-import { type EngineStatus, type ProgressSnapshot } from '../types/trading';
+import type { BudgetStatus } from '../lib/trialLedger';
+import { fmtDate, fmtDuration, fmtInt, fmtNum, fmtPct } from '../lib/format';
+import { DSR_PATIENCE, type EngineStatus, type ProgressSnapshot, type StopReason } from '../types/trading';
 import { cx, Panel } from './ui';
 
 interface TelemetryStripProps {
   status: EngineStatus;
   telemetry: ProgressSnapshot;
-  benchmarkRoi: number | null;
+  /** Buy & Hold Sharpe over the validation segment, for comparison. */
+  benchmarkSharpe: number | null;
   context: RunContext | null;
-  /** Stagnation limit of the current (or next) run. */
-  maxStagnation: number;
+  /** Evaluation limit of the current (or next) run. */
+  maxEvaluations: number;
+  /** Why the last run ended (null while running or before the first run). */
+  stopReason: StopReason | null;
+  /** Trial budget of the active data window; `estimated` before the data has been downloaded. */
+  budget: { status: BudgetStatus; estimated: boolean } | null;
 }
+
+const STOP_LABEL: Record<StopReason, string> = {
+  stopped: 'Stopped by User',
+  converged: 'Stopped early · no DSR gain',
+  budget: 'Run budget used',
+  'window-budget': 'Window budget spent',
+  exhausted: 'Search space exhausted',
+};
+
+const BUDGET_TEXT: Record<BudgetStatus['level'], { label: string; tone: string; bar: string }> = {
+  fresh: { label: 'Fresh data', tone: 'text-up', bar: 'bg-accent' },
+  degrading: { label: 'Significance degrading', tone: 'text-warn', bar: 'bg-warn' },
+  critical: { label: 'Nearly spent', tone: 'text-down', bar: 'bg-down' },
+  exhausted: { label: 'Spent – search disabled', tone: 'text-down', bar: 'bg-down' },
+};
 
 const STATUS: Record<EngineStatus, { label: string; className: string; icon: ReactNode }> = {
   idle: {
@@ -67,13 +92,21 @@ function Tile({ label, children, className }: { label: string; children: ReactNo
   );
 }
 
-export default function TelemetryStrip({ status, telemetry, benchmarkRoi, context, maxStagnation }: TelemetryStripProps): JSX.Element {
+export default function TelemetryStrip({
+  status,
+  telemetry,
+  benchmarkSharpe,
+  context,
+  maxEvaluations,
+  stopReason,
+  budget,
+}: TelemetryStripProps): JSX.Element {
   const badge = STATUS[status];
-  const badgeLabel = status === 'converged' ? `Converged at ${fmtInt(maxStagnation)}` : badge.label;
-  const stagnation = Math.min(telemetry.stagnation, maxStagnation);
-  const stagnationPct = (stagnation / maxStagnation) * 100;
+  const badgeLabel = (status === 'converged' || status === 'stopped') && stopReason !== null ? STOP_LABEL[stopReason] : badge.label;
   const hasRun = telemetry.iteration > 0;
-  const alpha = telemetry.bestRoi !== null && benchmarkRoi !== null ? telemetry.bestRoi - benchmarkRoi : null;
+  const level = budget ? BUDGET_TEXT[budget.status.level] : null;
+  const dsr = telemetry.bestDsr;
+  const dsrTone = dsr === null ? 'text-ink-3' : dsr >= 0.95 ? 'text-up' : dsr >= 0.5 ? 'text-warn' : 'text-ink';
 
   return (
     <Panel className="grid grid-cols-1 divide-y divide-line sm:grid-cols-2 sm:divide-y-0 xl:grid-cols-[1.05fr_0.8fr_1.5fr_1.45fr_1.4fr] xl:divide-x">
@@ -98,54 +131,69 @@ export default function TelemetryStrip({ status, telemetry, benchmarkRoi, contex
         </div>
       </Tile>
 
-      <Tile label="Total iterations">
-        <div className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(telemetry.iteration)}</div>
-        <div className="mt-1 text-xs text-ink-3">strategies evaluated</div>
-      </Tile>
-
-      <Tile label="Stagnation progress">
+      <Tile label="Evaluations this run">
         <div className="flex items-baseline gap-1.5 whitespace-nowrap">
-          <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(stagnation)}</span>
-          <span className="num text-sm text-ink-3">/ {fmtInt(maxStagnation)}</span>
+          <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(telemetry.evaluations)}</span>
+          <span className="num text-sm text-ink-3">/ {fmtInt(maxEvaluations)}</span>
         </div>
-        <div className="mt-1 truncate text-xs text-ink-3">iterations without improvement</div>
-        <div
-          className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-accent/15"
-          role="progressbar"
-          aria-label="Stagnation progress"
-          aria-valuemin={0}
-          aria-valuemax={maxStagnation}
-          aria-valuenow={stagnation}
-        >
-          <div
-            className={cx(
-              'h-full rounded-full transition-[width] duration-150 ease-linear',
-              status === 'converged' ? 'bg-up' : stagnationPct >= 75 ? 'bg-warn' : 'bg-accent',
-            )}
-            style={{ width: `${stagnationPct}%` }}
-          />
+        <div className="num mt-1 text-xs leading-snug text-ink-3" title="Repeated genomes and repeated trade logs are skipped: they are not new trials.">
+          {fmtInt(telemetry.duplicates)} duplicates skipped · early stop {fmtInt(Math.min(telemetry.dsrStall, DSR_PATIENCE))}/{fmtInt(DSR_PATIENCE)}
         </div>
       </Tile>
 
-      <Tile label="Best strategy ROI vs. Buy & Hold ROI">
+      <Tile label="Trial budget · this data window">
+        {budget && level ? (
+          <>
+            <div className="flex items-baseline gap-1.5 whitespace-nowrap">
+              <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(budget.status.used)}</span>
+              <span className="num text-sm text-ink-3">/ {fmtInt(budget.status.limit)}</span>
+              <span className={cx('ml-1 truncate text-xs font-semibold', level.tone)}>{level.label}</span>
+            </div>
+            <div
+              className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-accent/15"
+              role="progressbar"
+              aria-label="Trial budget used on this data window"
+              aria-valuemin={0}
+              aria-valuemax={budget.status.limit}
+              aria-valuenow={budget.status.used}
+            >
+              <div className={cx('h-full rounded-full transition-[width] duration-150 ease-linear', level.bar)} style={{ width: `${budget.status.share * 100}%` }} />
+            </div>
+            <div
+              className="num mt-1 truncate text-xs text-ink-3"
+              title="Annualised Sharpe the luckiest of that many skill-less strategies is expected to show over this search period by chance alone. Every trial on overlapping data – any run, any session – counts."
+            >
+              best-of-{fmtInt(budget.status.used)} by luck ≈ Sharpe {fmtNum(budget.status.luckSharpe)}
+              {budget.estimated ? ' · estimated window' : context ? ` · ${context.priorTrials.runs} earlier run${context.priorTrials.runs === 1 ? '' : 's'}` : ''}
+            </div>
+          </>
+        ) : (
+          <div className="mt-1 text-xs text-ink-3">Enter an asset to see its trial budget</div>
+        )}
+      </Tile>
+
+      <Tile label="Best deflated Sharpe">
         <div className="flex items-baseline gap-3">
-          <div>
-            <span className={cx('num text-2xl font-semibold leading-7', toneClass(telemetry.bestRoi))}>
-              {fmtPct(telemetry.bestRoi, true)}
-            </span>
-          </div>
-          <span className="text-xs text-ink-3">vs</span>
-          <div>
-            <span className="num text-lg font-medium leading-7 text-ink-2">{fmtPct(benchmarkRoi, true)}</span>
-          </div>
+          <span className={cx('num text-2xl font-semibold leading-7', dsrTone)}>{dsr === null ? '–' : fmtPct(dsr * 100, false, 0)}</span>
+          <span className="text-xs text-ink-3">{dsr === null ? '' : dsr >= 0.95 ? 'distinguishable from luck' : 'not distinguishable from luck'}</span>
         </div>
-        <div className="num mt-1 text-xs text-ink-3">
-          {alpha === null ? (
-            'Alpha appears once a strategy is found'
+        <div className="num mt-1 truncate text-xs text-ink-3">
+          {telemetry.bestDsrSharpe === null ? (
+            hasRun && telemetry.undersampled > 0 ? (
+              `${fmtInt(telemetry.undersampled)} candidates rejected for too few trades`
+            ) : (
+              'Appears once a strategy clears the trade gates'
+            )
           ) : (
             <>
-              Alpha <span className={cx('font-medium', toneClass(alpha))}>{fmtPct(alpha, true)}</span> · best fitness{' '}
-              <span className="text-ink-2">{telemetry.bestFitness === null ? '–' : telemetry.bestFitness.toFixed(2)}</span>
+              Validation Sharpe <span className="text-ink-2">{fmtNum(telemetry.bestDsrSharpe)}</span> vs luck hurdle{' '}
+              <span className="text-ink-2">{fmtNum(telemetry.hurdleSharpe)}</span>
+              {benchmarkSharpe !== null && (
+                <>
+                  {' '}
+                  · B&amp;H <span className="text-ink-2">{fmtNum(benchmarkSharpe)}</span>
+                </>
+              )}
             </>
           )}
         </div>

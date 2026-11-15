@@ -275,12 +275,13 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     `//  Parameters   : ${countParameters(genome)} tunable values`,
     `//  Tested on    : ${ascii(ctx.venue)}`,
     `//  Period       : ${isoDate(ctx.windowStart)} to ${isoDate(ctx.windowEnd)} (${ctx.bars} candles: 60% train, 20% validation, 20% holdout)`,
-    `//  Costs        : ${settings.feePct}% fee + ${settings.slippagePct}% slippage per side`,
+    `//  Costs        : ${settings.feePct}% fee + ${settings.slippagePct}% slippage per side` +
+      ((settings.slippageAtrMult ?? 0) > 0 ? ` (StrategyFinder: at least ${settings.slippageAtrMult} x ATR(14)% slippage)` : ''),
     '//',
     `//  StrategyFinder results${ctx.simulatedData ? ' (SIMULATED fallback data - re-validate on real data)' : ''}:`,
     `//    Train        : ${metricsLine(result.train)}`,
     `//    Validation   : ${metricsLine(result.validation)}`,
-    `//    Holdout      : ${result.holdout ? metricsLine(result.holdout) : 'not revealed yet (the run was still in progress)'}`,
+    `//    Holdout      : ${result.holdout ? metricsLine(result.holdout) : 'not revealed yet (sealed until this strategy is locked)'}`,
     `//    Deflated Sharpe (validation): ${(result.dsr * 100).toFixed(0)}%`,
     `//    Buy & Hold   : ROI ${signed(ctx.benchmarkRoi)}% over train + validation`,
     '//',
@@ -289,6 +290,12 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     '//     lower-timeframe data. It needs a TradingView Premium plan; remove it on other plans.',
     "//   - Orders are placed on bar close and filled at the next bar's open, exactly as in StrategyFinder.",
     '//   - Fee and slippage are both charged through commission_value (fee + slippage per side).',
+    ...((settings.slippageAtrMult ?? 0) > 0 || (settings.borrowPctPerBar ?? 0) > 0 || settings.fundingPctPerBar > 0
+      ? [
+          '//   - StrategyFinder also charged volatility-scaled slippage and any funding / short borrow,',
+          '//     which commission_value cannot express: expect TradingView results to look slightly better.',
+        ]
+      : []),
     '//   - Small differences are expected: TradingView uses its own data feed and intrabar fill model.',
     '//   - Educational tool, not financial advice. Past performance does not guarantee future results.',
   );

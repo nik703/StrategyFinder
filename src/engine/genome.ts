@@ -1,11 +1,17 @@
 /**
- * Strategy genome: archetypes, parameter grids, random generation, mutation,
- * crossover and repair.
+ * Strategy genome: market hypotheses, parameter grids, random generation,
+ * mutation, crossover and repair.
  *
  * The search space is deliberately small and coherent, so the optimiser cannot
  * assemble a pile of unrelated, finely tuned rules:
  *
- *   • every strategy follows one archetype (TREND or MEAN_REVERSION);
+ *   • every run tests ONE market hypothesis (see `HYPOTHESES`): it fixes the
+ *     single trigger primitive, the filter and the filter's direction. Collinear
+ *     indicators are not separate ideas – RSI, Stochastic, CCI and %B all measure
+ *     "short-horizon oversold", and Supertrend, MA crosses and MACD all measure
+ *     "trend" – so each idea is expressed by one primitive and the search only
+ *     tunes its numbers;
+ *   • every strategy follows its hypothesis's archetype (TREND or MEAN_REVERSION);
  *   • an entry is ONE trigger plus at most ONE filter, combined with AND;
  *   • short rules are always the mirror image of the long rules;
  *   • every number comes from a coarse, round-number grid;
@@ -20,7 +26,7 @@ import type {
   ConditionRole,
   DynamicExit,
   ExitGene,
-  IndicatorFamily,
+  Hypothesis,
   RuleGroup,
   StrategyGenome,
   TradeMode,
@@ -70,8 +76,11 @@ function pickWeighted<T>(rng: Rng, items: readonly (readonly [T, number])[]): T 
 /*  Parameter grids                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** Every indicator lookback comes from this list. */
-export const LOOKBACK_GRID: readonly number[] = [5, 7, 10, 14, 20, 21, 26, 30, 50, 100, 150, 200];
+/**
+ * Every indicator lookback comes from this list: a geometric grid in steps of about √2, so one
+ * grid step is the same relative change everywhere and no two values are near-duplicates.
+ */
+export const LOOKBACK_GRID: readonly number[] = [5, 7, 10, 14, 20, 28, 40, 56, 80, 112, 160, 200];
 /** Static stop-loss / take-profit percentages. */
 export const STATIC_PCT_GRID: readonly number[] = [1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30];
 export const TIME_STOP_GRID: readonly number[] = [5, 10, 20, 40];
@@ -85,7 +94,7 @@ const range = (from: number, to: number, step: number): number[] => {
 export const GRIDS = {
   stopLossPct: STATIC_PCT_GRID.filter((v) => v <= 15),
   takeProfitPct: STATIC_PCT_GRID,
-  atrPeriod: [7, 10, 14, 20, 21],
+  atrPeriod: [7, 10, 14, 20, 28],
   stopAtrMult: range(1, 4, 0.5),
   takeProfitAtrMult: range(1.5, 8, 0.5),
   macdSignal: [5, 7, 10, 14],
@@ -155,7 +164,6 @@ export function snap(value: number, grid: readonly number[]): number {
 /*  Condition semantics                                                       */
 /* -------------------------------------------------------------------------- */
 
-const ALL_OPS: readonly CmpOp[] = ['gt', 'lt', 'cross_above', 'cross_below'];
 
 export function flipOp(op: CmpOp): CmpOp {
   switch (op) {
@@ -417,8 +425,12 @@ function isValidSecond(c: Condition, archetype: Archetype, limits: GenomeLimits)
   );
 }
 
-/** True when the long entry obeys the genome's archetype. */
+/**
+ * True when the long entry obeys the genome's hypothesis (see `conformsTo`), or – for a hand-built
+ * genome without one – its archetype.
+ */
 export function isCoherent(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
+  if (g.hypothesis !== undefined) return conformsTo(g, limits);
   const { conditions } = g.longEntry;
   if (conditions.length < 1 || conditions.length > MAX_CONDITIONS) return false;
   if (!isValidTrigger(conditions[0], g.archetype, limits)) return false;
@@ -426,34 +438,170 @@ export function isCoherent(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIM
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Random conditions                                                         */
+/*  Market hypotheses                                                         */
 /* -------------------------------------------------------------------------- */
 
-function blank(ind: IndicatorFamily): Condition {
-  switch (ind) {
-    case 'RSI':
-      return { ind, period: 14, op: 'lt', level: 30 };
-    case 'MACD':
-      return { ind, fast: 10, slow: 26, signal: 10, variant: 'signal', op: 'gt' };
-    case 'PRICE_MA':
-      return { ind, maType: 'SMA', period: 50, op: 'gt' };
-    case 'MA_CROSS':
-      return { ind, fastType: 'SMA', fastPeriod: 20, slowType: 'SMA', slowPeriod: 50, op: 'gt' };
-    case 'BB':
-      return { ind, period: 20, mult: 2, variant: 'lower', op: 'lt', level: 0 };
-    case 'ATR':
-      return { ind, period: 14, op: 'gt', level: 2 };
-    case 'STOCH':
-      return { ind, kPeriod: 14, smooth: STOCH_SMOOTH, dPeriod: STOCH_D, variant: 'level', op: 'lt', level: 20 };
-    case 'ADX':
-      return { ind, period: 14, variant: 'strength', op: 'gt', level: 25 };
-    case 'VOLUME':
-      return { ind, period: 20, op: 'gt', level: 1.5 };
-    case 'SUPERTREND':
-      return { ind, period: 10, mult: 3, op: 'gt' };
-    case 'CCI':
-      return { ind, period: 20, op: 'lt', level: -100 };
+export interface HypothesisInfo {
+  id: Hypothesis;
+  label: string;
+  /** One-word name for compact UI. */
+  short: string;
+  archetype: Archetype;
+  /** Why the effect should exist at all. */
+  rationale: string;
+  /** The one trigger primitive the search tunes. */
+  trigger: string;
+  /** The filter (and its fixed direction), or why there is none. */
+  filter: string;
+  filterRequired: boolean;
+  /** The indicators this hypothesis replaces – they measure the same thing. */
+  replaces: string;
+}
+
+/**
+ * The market hypotheses a run can test. Each one is a distinct, economically motivated idea,
+ * expressed by exactly one trigger primitive and one filter whose direction is part of the idea:
+ *
+ *   TREND_FOLLOWING  close vs. its EMA                          + optional ADX above a level
+ *   VOL_BREAKOUT     close crosses above the upper Bollinger band + optional volume above average
+ *   DIP_IN_UPTREND   RSI oversold                               + REQUIRED close above a slow EMA
+ *   RANGE_REVERSION  RSI oversold                               + optional ADX below a level
+ */
+export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
+  TREND_FOLLOWING: {
+    id: 'TREND_FOLLOWING',
+    label: 'Trend following',
+    short: 'Trend',
+    archetype: 'TREND',
+    rationale:
+      'Time-series momentum: markets that have been rising tend to keep rising for a while, because information spreads slowly and money chases performance.',
+    trigger: 'Close above its EMA (a state) or crossing above it (an event).',
+    filter: 'Optional: ADX above a level – only trade when a trend is actually present.',
+    filterRequired: false,
+    replaces: 'Supertrend, moving-average crosses, MACD and +DI/−DI, which all measure the same trend.',
+  },
+  VOL_BREAKOUT: {
+    id: 'VOL_BREAKOUT',
+    label: 'Volatility breakout',
+    short: 'Breakout',
+    archetype: 'TREND',
+    rationale:
+      'A close beyond the recent volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
+    trigger: 'Close crosses above the upper Bollinger band.',
+    filter: 'Optional: volume above its average – participation confirms the breakout.',
+    filterRequired: false,
+    replaces: 'Band-width and ATR "squeeze" filters, which describe the same volatility state.',
+  },
+  DIP_IN_UPTREND: {
+    id: 'DIP_IN_UPTREND',
+    label: 'Buy the dip in an uptrend',
+    short: 'Dip-buy',
+    archetype: 'MEAN_REVERSION',
+    rationale:
+      'Short-term overreaction: sharp pullbacks inside a long-term uptrend tend to be partly reversed, as buyers are paid to absorb forced selling.',
+    trigger: 'RSI oversold – below a level, or crossing back above it.',
+    filter: 'Required: close above a slow EMA (100+ bars) – the long-term trend must be up.',
+    filterRequired: true,
+    replaces: 'Stochastic, CCI, %B and lower-band touches, which all measure "short-horizon oversold".',
+  },
+  RANGE_REVERSION: {
+    id: 'RANGE_REVERSION',
+    label: 'Range reversion',
+    short: 'Range',
+    archetype: 'MEAN_REVERSION',
+    rationale: 'In trendless markets prices oscillate around a mean, so oversold readings tend to revert.',
+    trigger: 'RSI oversold – below a level, or crossing back above it.',
+    filter: 'Optional: ADX below a level – only trade when no trend is present.',
+    filterRequired: false,
+    replaces: 'Stochastic, CCI, %B and lower-band touches, which all measure "short-horizon oversold".',
+  },
+};
+
+/** Operators the trigger of each hypothesis may use. */
+const TRIGGER_OPS: Readonly<Record<Hypothesis, readonly CmpOp[]>> = {
+  TREND_FOLLOWING: ['gt', 'cross_above'],
+  VOL_BREAKOUT: ['cross_above'],
+  DIP_IN_UPTREND: ['lt', 'cross_above'],
+  RANGE_REVERSION: ['lt', 'cross_above'],
+};
+
+/** Only trend following may close on a reversal of its trigger (for a breakout or an oscillator it has no meaning). */
+export function allowsReversalExit(h: Hypothesis | undefined, archetype: Archetype): boolean {
+  return h === undefined ? archetype === 'TREND' : h === 'TREND_FOLLOWING';
+}
+
+/** Why `h` cannot be tested on data with these limits, or null when it can. */
+export function hypothesisUnsupported(h: Hypothesis, limits: GenomeLimits): string | null {
+  if (h === 'DIP_IN_UPTREND' && lookbacks(SLOW_LOOKBACK, 200, limits).length === 0) {
+    return 'Buy the dip in an uptrend needs a slow trend filter of 100+ candles, which needs at least about 560 candles of history.';
   }
+  return null;
+}
+
+/** True when `c` is the trigger primitive of `h`. */
+export function triggerConforms(c: Condition, h: Hypothesis): boolean {
+  if (!TRIGGER_OPS[h].includes(c.op)) return false;
+  switch (h) {
+    case 'TREND_FOLLOWING':
+      return c.ind === 'PRICE_MA' && c.maType === 'EMA';
+    case 'VOL_BREAKOUT':
+      return c.ind === 'BB' && c.variant === 'upper';
+    case 'DIP_IN_UPTREND':
+    case 'RANGE_REVERSION':
+      return c.ind === 'RSI' && c.level < 50;
+  }
+}
+
+/** True when `c` is the filter of `h`, pointing in the hypothesis's direction. */
+export function filterConforms(c: Condition, h: Hypothesis, limits: GenomeLimits): boolean {
+  switch (h) {
+    case 'TREND_FOLLOWING':
+      return c.ind === 'ADX' && c.variant === 'strength' && c.op === 'gt';
+    case 'VOL_BREAKOUT':
+      return c.ind === 'VOLUME' && c.op === 'gt' && limits.hasVolume;
+    case 'DIP_IN_UPTREND':
+      return c.ind === 'PRICE_MA' && c.maType === 'EMA' && c.op === 'gt' && c.period >= SLOW_LOOKBACK;
+    case 'RANGE_REVERSION':
+      return c.ind === 'ADX' && c.variant === 'strength' && c.op === 'lt';
+  }
+}
+
+/** True when a genome is built exactly from its hypothesis's primitives. */
+export function conformsTo(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
+  const h = g.hypothesis;
+  if (h === undefined) return false;
+  const spec = HYPOTHESES[h];
+  const { conditions } = g.longEntry;
+  if (g.archetype !== spec.archetype || conditions.length < 1 || conditions.length > MAX_CONDITIONS) return false;
+  if (!triggerConforms(conditions[0], h)) return false;
+  if (conditions.length > 1 && !filterConforms(conditions[1], h, limits)) return false;
+  if (conditions.length === 1 && spec.filterRequired) return false;
+  if (g.exit.mode === 'dynamic' && g.exit.reversalExit && !allowsReversalExit(h, g.archetype)) return false;
+  return true;
+}
+
+/**
+ * The hypothesis a hand-built genome (one without `hypothesis`) belongs to: the first one of its
+ * archetype whose trigger it already uses, else the archetype's default.
+ */
+export function inferHypothesis(g: StrategyGenome): Hypothesis {
+  const trigger = g.longEntry.conditions[0];
+  const candidates: Hypothesis[] =
+    g.archetype === 'TREND' ? ['TREND_FOLLOWING', 'VOL_BREAKOUT'] : ['DIP_IN_UPTREND', 'RANGE_REVERSION'];
+  if (trigger) {
+    for (const h of candidates) {
+      if (!triggerConforms(trigger, h)) continue;
+      // An oscillator dip inside a slow uptrend filter is the dip-buy idea.
+      if (h === 'DIP_IN_UPTREND' && !(g.longEntry.conditions[1] && filterConforms(g.longEntry.conditions[1], h, DEFAULT_LIMITS))) continue;
+      return h;
+    }
+  }
+  if (g.archetype === 'TREND') return 'TREND_FOLLOWING';
+  // A mean-reversion entry gated by a slow up-trend is the dip-buy idea, whatever oscillator it used.
+  const second = g.longEntry.conditions[1];
+  const slowUptrend =
+    second !== undefined && (second.ind === 'PRICE_MA' || second.ind === 'MA_CROSS') && second.op === 'gt' && conditionLookback(second) >= SLOW_LOOKBACK;
+  return slowUptrend ? 'DIP_IN_UPTREND' : 'RANGE_REVERSION';
 }
 
 /** Draw every tunable parameter of `c` uniformly from its grid. */
@@ -465,95 +613,34 @@ function randomizeParams(rng: Rng, c: Condition, slot: Slot, limits: GenomeLimit
   return normalizeCondition(c, slot, limits);
 }
 
-const MA_TYPES = ['EMA', 'SMA'] as const;
-
-function randomTrendCondition(rng: Rng, slot: Slot, up: boolean, limits: GenomeLimits): Condition {
-  const ind = pickWeighted<IndicatorFamily>(rng, [
-    ['PRICE_MA', 1.2],
-    ['MA_CROSS', 1],
-    ['MACD', 1],
-    ['SUPERTREND', 1.2],
-    ['ADX', 0.5],
-    ['STOCH', 0.5],
-  ]);
-  const c = blank(ind);
-  const event = rng() < 0.5;
-  c.op = up ? (event ? 'cross_above' : 'gt') : event ? 'cross_below' : 'lt';
-  if (c.ind === 'MACD') c.variant = pick(rng, ['signal', 'zero', 'hist'] as const);
-  if (c.ind === 'PRICE_MA') c.maType = pick(rng, MA_TYPES);
-  if (c.ind === 'MA_CROSS') {
-    c.fastType = pick(rng, MA_TYPES);
-    c.slowType = pick(rng, MA_TYPES);
+/** A random instance of the trigger primitive of `h`. */
+export function hypothesisTrigger(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition {
+  const op = pick(rng, TRIGGER_OPS[h]);
+  switch (h) {
+    case 'TREND_FOLLOWING':
+      return randomizeParams(rng, { ind: 'PRICE_MA', maType: 'EMA', period: 56, op }, 'trend-trigger', limits);
+    case 'VOL_BREAKOUT':
+      return randomizeParams(rng, { ind: 'BB', period: 20, mult: 2, variant: 'upper', op, level: 0 }, 'trend-trigger', limits);
+    case 'DIP_IN_UPTREND':
+    case 'RANGE_REVERSION':
+      return randomizeParams(rng, { ind: 'RSI', period: 14, op, level: 30 }, 'reversion-trigger', limits);
   }
-  if (c.ind === 'ADX') c.variant = 'di';
-  if (c.ind === 'STOCH') c.variant = 'kd';
-  return randomizeParams(rng, c, slot, limits);
 }
 
-function randomOversoldCondition(rng: Rng, limits: GenomeLimits): Condition {
-  const kind = pickWeighted(rng, [
-    ['RSI', 1.2],
-    ['STOCH', 0.8],
-    ['CCI', 0.8],
-    ['PCTB', 0.7],
-    ['LOWER', 0.9],
-  ] as const);
-  const op = pick<CmpOp>(rng, ['lt', 'cross_above', 'cross_below']);
-  let c: Condition;
-  if (kind === 'RSI') c = { ...blank('RSI'), op, level: 30 } as Condition;
-  else if (kind === 'STOCH') c = { ...blank('STOCH'), op, level: 20 } as Condition;
-  else if (kind === 'CCI') c = { ...blank('CCI'), op, level: -100 } as Condition;
-  else if (kind === 'PCTB') c = { ind: 'BB', period: 20, mult: 2, variant: 'pctb', op, level: 0.1 };
-  else c = { ind: 'BB', period: 20, mult: 2, variant: 'lower', op, level: 0 };
-  return randomizeParams(rng, c, 'reversion-trigger', limits);
-}
-
-function randomFilterCondition(rng: Rng, limits: GenomeLimits): Condition {
-  const kinds: (readonly ['ATR' | 'VOLUME' | 'ADX' | 'BW', number])[] = [
-    ['ATR', 0.8],
-    ['ADX', 1],
-    ['BW', 0.7],
-  ];
-  if (limits.hasVolume) kinds.push(['VOLUME', 1]);
-  const kind = pickWeighted(rng, kinds);
-  const op: CmpOp = rng() < 0.7 ? 'gt' : 'lt';
-  let c: Condition;
-  if (kind === 'ATR') c = { ...blank('ATR'), op } as Condition;
-  else if (kind === 'VOLUME') c = { ...blank('VOLUME'), op } as Condition;
-  else if (kind === 'ADX') c = { ...blank('ADX'), op } as Condition;
-  else c = { ind: 'BB', period: 20, mult: 2, variant: 'bandwidth', op, level: 10 };
-  return randomizeParams(rng, c, 'filter', limits);
-}
-
-function randomRegimeCondition(rng: Rng, limits: GenomeLimits): Condition {
-  const c = blank(rng() < 0.7 ? 'PRICE_MA' : 'MA_CROSS');
-  c.op = 'gt';
-  if (c.ind === 'PRICE_MA') c.maType = pick(rng, MA_TYPES);
-  if (c.ind === 'MA_CROSS') {
-    c.fastType = pick(rng, MA_TYPES);
-    c.slowType = pick(rng, MA_TYPES);
+/** A random instance of the filter of `h`, or null when the data cannot support it. */
+export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits): Condition | null {
+  switch (h) {
+    case 'TREND_FOLLOWING':
+      return randomizeParams(rng, { ind: 'ADX', period: 14, variant: 'strength', op: 'gt', level: 20 }, 'filter', limits);
+    case 'VOL_BREAKOUT':
+      return limits.hasVolume ? randomizeParams(rng, { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }, 'filter', limits) : null;
+    case 'DIP_IN_UPTREND':
+      return hypothesisUnsupported(h, limits) === null
+        ? randomizeParams(rng, { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' }, 'regime', limits)
+        : null;
+    case 'RANGE_REVERSION':
+      return randomizeParams(rng, { ind: 'ADX', period: 14, variant: 'strength', op: 'lt', level: 20 }, 'filter', limits);
   }
-  return randomizeParams(rng, c, 'regime', limits);
-}
-
-export function randomTrigger(rng: Rng, archetype: Archetype, limits: GenomeLimits): Condition {
-  if (archetype === 'TREND') return randomTrendCondition(rng, 'trend-trigger', true, limits);
-  return rng() < 0.6
-    ? randomOversoldCondition(rng, limits)
-    : randomTrendCondition(rng, 'reversion-trigger', false, limits);
-}
-
-export function randomSecond(rng: Rng, archetype: Archetype, limits: GenomeLimits): Condition {
-  if (archetype === 'MEAN_REVERSION' && limits.maxLookback >= SLOW_LOOKBACK && rng() < 0.6) {
-    return randomRegimeCondition(rng, limits);
-  }
-  return randomFilterCondition(rng, limits);
-}
-
-function randomEntry(rng: Rng, archetype: Archetype, limits: GenomeLimits): RuleGroup {
-  const conditions = [randomTrigger(rng, archetype, limits)];
-  if (rng() < 0.55) conditions.push(randomSecond(rng, archetype, limits));
-  return { logic: 'AND', conditions };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -568,9 +655,9 @@ function randomStaticExit(rng: Rng): ExitGene {
   };
 }
 
-function randomDynamicExit(rng: Rng, archetype: Archetype): DynamicExit {
+function randomDynamicExit(rng: Rng, allowReversal: boolean): DynamicExit {
   const trailing = rng() < 0.4;
-  const reversalExit = archetype === 'TREND' && rng() < 0.35;
+  const reversalExit = allowReversal && rng() < 0.35;
   return {
     mode: 'dynamic',
     atrPeriod: pick(rng, GRIDS.atrPeriod),
@@ -608,6 +695,7 @@ export function cloneGenome(g: StrategyGenome): StrategyGenome {
         };
   return {
     archetype: g.archetype,
+    ...(g.hypothesis !== undefined ? { hypothesis: g.hypothesis } : {}),
     longEntry: cloneGroup(g.longEntry),
     shortEntry: g.shortEntry ? cloneGroup(g.shortEntry) : null,
     exit,
@@ -617,6 +705,8 @@ export function cloneGenome(g: StrategyGenome): StrategyGenome {
 
 /** A tunable number inside a genome, with the grid it lives on. */
 interface Handle {
+  /** Human-readable name, e.g. "RSI level" or "Stop × ATR". */
+  label: string;
   grid: readonly number[];
   get: () => number;
   set: (value: number) => void;
@@ -629,18 +719,19 @@ function parameterHandles(g: StrategyGenome, limits: GenomeLimits): Handle[] {
     const fields = c as unknown as Fields;
     for (const [key, grid] of conditionSpecs(c, slotOf(g.archetype, index, c), limits)) {
       if (grid.length === 0) continue;
-      handles.push({ grid, get: () => fields[key] as number, set: (v) => (fields[key] = v) });
+      handles.push({ label: parameterLabel(c, key, index), grid, get: () => fields[key] as number, set: (v) => (fields[key] = v) });
     }
   });
   const exit = g.exit;
   if (exit.mode === 'static') {
-    handles.push({ grid: GRIDS.stopLossPct, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
-    handles.push({ grid: GRIDS.takeProfitPct, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
+    handles.push({ label: 'Stop loss %', grid: GRIDS.stopLossPct, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
+    handles.push({ label: 'Take profit %', grid: GRIDS.takeProfitPct, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
   } else {
-    handles.push({ grid: GRIDS.atrPeriod, get: () => exit.atrPeriod, set: (v) => (exit.atrPeriod = v) });
-    handles.push({ grid: GRIDS.stopAtrMult, get: () => exit.stopAtrMult, set: (v) => (exit.stopAtrMult = v) });
+    handles.push({ label: 'ATR period', grid: GRIDS.atrPeriod, get: () => exit.atrPeriod, set: (v) => (exit.atrPeriod = v) });
+    handles.push({ label: 'Stop × ATR', grid: GRIDS.stopAtrMult, get: () => exit.stopAtrMult, set: (v) => (exit.stopAtrMult = v) });
     if (exit.takeProfitAtrMult !== null) {
       handles.push({
+        label: 'Target × ATR',
         grid: GRIDS.takeProfitAtrMult,
         get: () => exit.takeProfitAtrMult as number,
         set: (v) => (exit.takeProfitAtrMult = v),
@@ -648,9 +739,64 @@ function parameterHandles(g: StrategyGenome, limits: GenomeLimits): Handle[] {
     }
   }
   if (g.maxBarsInTrade !== null) {
-    handles.push({ grid: TIME_STOP_GRID, get: () => g.maxBarsInTrade as number, set: (v) => (g.maxBarsInTrade = v) });
+    handles.push({ label: 'Time stop (candles)', grid: TIME_STOP_GRID, get: () => g.maxBarsInTrade as number, set: (v) => (g.maxBarsInTrade = v) });
   }
   return handles;
+}
+
+const KEY_NAMES: Record<string, string> = {
+  period: 'period',
+  level: 'level',
+  mult: 'width (σ)',
+  fast: 'fast period',
+  slow: 'slow period',
+  signal: 'signal period',
+  fastPeriod: 'fast period',
+  slowPeriod: 'slow period',
+  kPeriod: '%K period',
+};
+
+/** "RSI level", "EMA period", "Filter ADX level", … */
+function parameterLabel(c: Condition, key: string, index: number): string {
+  const name =
+    c.ind === 'PRICE_MA' ? c.maType : c.ind === 'BB' ? 'Band' : c.ind === 'VOLUME' ? 'Volume' : c.ind === 'MA_CROSS' ? 'MA' : c.ind;
+  const what = c.ind === 'VOLUME' && key === 'level' ? 'ratio' : (KEY_NAMES[key] ?? key);
+  return `${index > 0 ? 'Filter ' : ''}${name} ${what}`;
+}
+
+/** One tunable parameter of a genome: its name, its grid and its current value. */
+export interface ParameterAxis {
+  label: string;
+  grid: readonly number[];
+  value: number;
+}
+
+/** Every tunable parameter of `g`, in a stable order (entry conditions, then exit, then time stop). */
+export function parameterAxes(g: StrategyGenome, limits: GenomeLimits): ParameterAxis[] {
+  return parameterHandles(cloneGenome(g), limits).map((h) => ({ label: h.label, grid: h.grid, value: snap(h.get(), h.grid) }));
+}
+
+/**
+ * `g` with some parameters (by `parameterAxes` index) set to other grid values, normalised.
+ * Null when the result is not a coherent strategy or normalisation would move a requested value.
+ */
+export function withParameterValues(
+  g: StrategyGenome,
+  mode: TradeMode,
+  limits: GenomeLimits,
+  values: readonly (readonly [index: number, value: number])[],
+): StrategyGenome | null {
+  const copy = cloneGenome(g);
+  const handles = parameterHandles(copy, limits);
+  for (const [index, value] of values) {
+    if (!handles[index]) return null;
+    handles[index].set(value);
+  }
+  const result = normalizeGenome(copy, mode, limits);
+  if (!isCoherent(result, limits)) return null;
+  const after = parameterHandles(cloneGenome(result), limits);
+  for (const [index, value] of values) if (!after[index] || after[index].get() !== value) return null;
+  return result;
 }
 
 /**
@@ -669,7 +815,9 @@ export function countParameters(g: StrategyGenome, limits: GenomeLimits = DEFAUL
  * parameter cap. Does NOT fix an entry that violates its archetype – see `repairGenome`.
  */
 export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome {
-  const archetype: Archetype = input.archetype === 'MEAN_REVERSION' ? 'MEAN_REVERSION' : 'TREND';
+  const hypothesis = input.hypothesis;
+  const archetype: Archetype =
+    hypothesis !== undefined ? HYPOTHESES[hypothesis].archetype : input.archetype === 'MEAN_REVERSION' ? 'MEAN_REVERSION' : 'TREND';
   const conditions = input.longEntry.conditions
     .slice(0, MAX_CONDITIONS)
     .map((c, index) => normalizeCondition(c, slotOf(archetype, index, c), limits));
@@ -689,7 +837,7 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
     let takeProfitAtrMult =
       input.exit.takeProfitAtrMult === null ? null : snap(input.exit.takeProfitAtrMult, GRIDS.takeProfitAtrMult);
     let trailing = input.exit.trailing;
-    const reversalExit = archetype === 'TREND' && input.exit.reversalExit && conditions.length > 0;
+    const reversalExit = allowsReversalExit(hypothesis, archetype) && input.exit.reversalExit && conditions.length > 0;
     // A trail can only lock in profit if the target sits at least 1 ATR beyond the stop distance.
     if (trailing && takeProfitAtrMult !== null && takeProfitAtrMult < stopAtrMult + 1) trailing = false;
     // Without a target there must be another way out with a profit.
@@ -708,7 +856,14 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
     };
   }
 
-  const genome: StrategyGenome = { archetype, longEntry, shortEntry: null, exit, maxBarsInTrade };
+  const genome: StrategyGenome = {
+    archetype,
+    ...(hypothesis !== undefined ? { hypothesis } : {}),
+    longEntry,
+    shortEntry: null,
+    exit,
+    maxBarsInTrade,
+  };
 
   // Parameter cap: shed the least essential pieces first.
   while (countParameters(genome, limits) > MAX_PARAMETERS) {
@@ -733,30 +888,51 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
   return genome;
 }
 
-/** Enforce every invariant. Incoherent entries are replaced by fresh random ones. */
+/**
+ * Enforce every invariant, including the hypothesis: a trigger that is not the hypothesis's
+ * primitive is redrawn, a filter that is not its filter (or points the wrong way) is dropped, and a
+ * required filter is added. A hand-built genome without a hypothesis is assigned one first (see
+ * `inferHypothesis`), so everything that leaves this function conforms to exactly one hypothesis.
+ */
 export function repairGenome(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits, rng: Rng): StrategyGenome {
-  let genome = normalizeGenome(g, mode, limits);
+  const hypothesis = g.hypothesis ?? inferHypothesis(g);
+  const spec = HYPOTHESES[hypothesis];
+  let genome = normalizeGenome({ ...g, hypothesis, archetype: spec.archetype }, mode, limits);
   const { conditions } = genome.longEntry;
   let changed = false;
-  if (conditions.length === 0 || !isValidTrigger(conditions[0], genome.archetype, limits)) {
-    conditions[0] = randomTrigger(rng, genome.archetype, limits);
+  if (conditions.length === 0 || !triggerConforms(conditions[0], hypothesis)) {
+    conditions[0] = hypothesisTrigger(rng, hypothesis, limits);
     changed = true;
   }
-  if (conditions.length > 1 && !isValidSecond(conditions[1], genome.archetype, limits)) {
-    conditions.pop();
+  if (conditions.length > 1 && !filterConforms(conditions[1], hypothesis, limits)) {
+    conditions.length = 1;
     changed = true;
+  }
+  if (spec.filterRequired && conditions.length === 1) {
+    const filter = hypothesisFilter(rng, hypothesis, limits);
+    if (filter) {
+      conditions.push(filter);
+      changed = true;
+    }
   }
   if (changed) genome = normalizeGenome(genome, mode, limits);
   return genome;
 }
 
-export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits): StrategyGenome {
-  const archetype: Archetype = rng() < 0.5 ? 'TREND' : 'MEAN_REVERSION';
+/** A random strategy built from the primitives of hypothesis `h`. */
+export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h: Hypothesis): StrategyGenome {
+  const spec = HYPOTHESES[h];
+  const conditions = [hypothesisTrigger(rng, h, limits)];
+  if (spec.filterRequired || rng() < 0.5) {
+    const filter = hypothesisFilter(rng, h, limits);
+    if (filter) conditions.push(filter);
+  }
   const genome: StrategyGenome = {
-    archetype,
-    longEntry: randomEntry(rng, archetype, limits),
+    archetype: spec.archetype,
+    hypothesis: h,
+    longEntry: { logic: 'AND', conditions },
     shortEntry: null,
-    exit: rng() < 0.45 ? randomStaticExit(rng) : randomDynamicExit(rng, archetype),
+    exit: rng() < 0.45 ? randomStaticExit(rng) : randomDynamicExit(rng, allowsReversalExit(h, spec.archetype)),
     maxBarsInTrade: rng() < 0.2 ? pick(rng, TIME_STOP_GRID) : null,
   };
   return repairGenome(genome, mode, limits, rng);
@@ -766,17 +942,24 @@ export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits): S
 /*  Mutation and crossover                                                    */
 /* -------------------------------------------------------------------------- */
 
-type MutationKind = 'tweak' | 'operator' | 'trigger' | 'second' | 'exit' | 'time' | 'archetype';
+/**
+ * Mutations stay inside the hypothesis: they tune numbers, switch the trigger between its state
+ * and event form, add / drop / redraw the hypothesis's filter, or change the exit. They never swap
+ * the indicator family, flip a filter's direction or change the archetype.
+ */
+type MutationKind = 'tweak' | 'operator' | 'redraw' | 'filter' | 'exit' | 'time';
 
 const MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [
-  ['tweak', 0.45],
+  ['tweak', 0.5],
   ['operator', 0.1],
-  ['trigger', 0.1],
-  ['second', 0.13],
-  ['exit', 0.12],
-  ['time', 0.06],
-  ['archetype', 0.04],
+  ['redraw', 0.05],
+  ['filter', 0.13],
+  ['exit', 0.14],
+  ['time', 0.08],
 ];
+
+/** Attempts at a random mutation before falling back to a guaranteed-distinct neighbour. */
+const MUTATION_ATTEMPTS = 16;
 
 /** Move one parameter to a neighbouring grid value. */
 function tweak(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
@@ -790,75 +973,66 @@ function tweak(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
   handle.set(handle.grid[Math.max(0, Math.min(handle.grid.length - 1, next))]);
 }
 
-function mutateOperator(rng: Rng, g: StrategyGenome): void {
-  const c = pick(rng, g.longEntry.conditions);
-  if (rng() < 0.35) {
-    if (c.ind === 'MACD') c.variant = pick(rng, (['signal', 'zero', 'hist'] as const).filter((v) => v !== c.variant));
-    else if (c.ind === 'BB' && c.variant === 'lower') Object.assign(c, { variant: 'pctb', level: 0.1 });
-    else if (c.ind === 'BB' && c.variant === 'pctb' && c.level < 0.5) Object.assign(c, { variant: 'lower', level: 0 });
-    else if (c.ind === 'PRICE_MA') c.maType = c.maType === 'EMA' ? 'SMA' : 'EMA';
-    else if (c.ind === 'MA_CROSS') {
-      if (rng() < 0.5) c.fastType = c.fastType === 'EMA' ? 'SMA' : 'EMA';
-      else c.slowType = c.slowType === 'EMA' ? 'SMA' : 'EMA';
-    }
-    return;
-  }
-  // Keep the direction, change between "state" and "event" (or the filter's side).
-  const role = conditionRole(c);
-  let options: CmpOp[];
-  if (role === 'FILTER') options = ['gt', 'lt'];
-  else if (role === 'TREND_UP') options = ['gt', 'cross_above'];
-  else if (role === 'TREND_DOWN') options = ['lt', 'cross_below'];
-  else options = ALL_OPS.filter((op) => op !== (role === 'OVERSOLD' ? 'gt' : 'lt'));
-  const others = options.filter((op) => op !== c.op);
-  if (others.length > 0) c.op = pick(rng, others);
-}
-
-function mutateExit(rng: Rng, g: StrategyGenome): void {
+function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean): void {
   const exit = g.exit;
   if (exit.mode === 'static') {
-    g.exit = randomDynamicExit(rng, g.archetype);
+    g.exit = randomDynamicExit(rng, allowReversal);
     return;
   }
   const r = rng();
-  if (r < 0.25) g.exit = randomStaticExit(rng);
-  else if (r < 0.5) exit.trailing = !exit.trailing;
-  else if (r < 0.75) exit.takeProfitAtrMult = exit.takeProfitAtrMult === null ? pick(rng, GRIDS.takeProfitAtrMult) : null;
+  const options = allowReversal ? 4 : 3;
+  const k = Math.floor(r * options);
+  if (k === 0) g.exit = randomStaticExit(rng);
+  else if (k === 1) exit.trailing = !exit.trailing;
+  else if (k === 2) exit.takeProfitAtrMult = exit.takeProfitAtrMult === null ? pick(rng, GRIDS.takeProfitAtrMult) : null;
   else exit.reversalExit = !exit.reversalExit;
 }
 
-function applyMutation(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
+function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: GenomeLimits): void {
   const kind = pickWeighted(rng, MUTATION_WEIGHTS);
   const { conditions } = g.longEntry;
+  const spec = HYPOTHESES[h];
   switch (kind) {
     case 'tweak':
       tweak(rng, g, limits);
       return;
-    case 'operator':
-      mutateOperator(rng, g);
+    case 'operator': {
+      // State ↔ event form of the trigger (e.g. "close above EMA" ↔ "close crosses above EMA").
+      const others = TRIGGER_OPS[h].filter((op) => op !== conditions[0].op);
+      if (others.length > 0) conditions[0].op = pick(rng, others);
+      else tweak(rng, g, limits);
       return;
-    case 'trigger':
-      conditions[0] = randomTrigger(rng, g.archetype, limits);
+    }
+    case 'redraw':
+      conditions[0] = hypothesisTrigger(rng, h, limits);
       return;
-    case 'second':
-      if (conditions.length > 1 && rng() < 0.4) conditions.pop();
-      else conditions[1] = randomSecond(rng, g.archetype, limits);
+    case 'filter': {
+      if (!spec.filterRequired && conditions.length > 1 && rng() < 0.5) {
+        conditions.length = 1;
+        return;
+      }
+      const filter = hypothesisFilter(rng, h, limits);
+      if (filter) conditions[1] = filter;
+      else tweak(rng, g, limits);
       return;
+    }
     case 'exit':
-      mutateExit(rng, g);
+      mutateExit(rng, g, allowsReversalExit(h, spec.archetype));
       return;
-    case 'time':
-      g.maxBarsInTrade = g.maxBarsInTrade === null || rng() < 0.5 ? pick(rng, [null, ...TIME_STOP_GRID]) : null;
+    case 'time': {
+      if (g.maxBarsInTrade === null) g.maxBarsInTrade = pick(rng, TIME_STOP_GRID);
+      else if (rng() < 0.5) g.maxBarsInTrade = null;
+      else g.maxBarsInTrade = pick(rng, TIME_STOP_GRID.filter((v) => v !== g.maxBarsInTrade));
       return;
-    case 'archetype':
-      g.archetype = g.archetype === 'TREND' ? 'MEAN_REVERSION' : 'TREND';
-      g.longEntry = randomEntry(rng, g.archetype, limits);
-      return;
+    }
   }
 }
 
 /**
- * Produce a mutated child. `intensity` (≥ 1) adds extra mutation steps so the
+ * Produce a mutated child that is GUARANTEED to differ from its parent: random mutations are
+ * retried until repair no longer maps the child back onto the parent, then a random one-grid-step
+ * neighbour is used, and as a last resort the exit mode is switched. A no-op mutation would cost a
+ * full evaluation and teach the search nothing. `intensity` (≥ 1) adds extra mutation steps so the
  * search can take larger jumps when it is stagnating.
  */
 export function mutateGenome(
@@ -868,18 +1042,28 @@ export function mutateGenome(
   limits: GenomeLimits,
   intensity = 1,
 ): StrategyGenome {
-  let child = cloneGenome(parent);
-  let steps = 1 + (rng() < 0.3 ? 1 : 0) + (rng() < 0.1 ? 1 : 0);
-  steps += Math.max(0, Math.round(intensity) - 1);
-  for (let i = 0; i < steps; i++) {
-    applyMutation(rng, child, limits);
-    // Repair after every step so later steps always see a coherent genome.
-    child = repairGenome(child, mode, limits, rng);
+  const h = parent.hypothesis;
+  if (h === undefined) throw new Error('Only genomes built from a market hypothesis can be mutated.');
+  const parentSignature = genomeSignature(normalizeGenome(parent, mode, limits));
+  for (let attempt = 0; attempt < MUTATION_ATTEMPTS; attempt++) {
+    let child = cloneGenome(parent);
+    let steps = 1 + (rng() < 0.3 ? 1 : 0) + (rng() < 0.1 ? 1 : 0);
+    steps += Math.max(0, Math.round(intensity) - 1);
+    for (let i = 0; i < steps; i++) {
+      applyMutation(rng, child, h, limits);
+      // Repair after every step so later steps always see a coherent genome.
+      child = repairGenome(child, mode, limits, rng);
+    }
+    if (genomeSignature(child) !== parentSignature) return child;
   }
-  return child;
+  const neighbours = stepNeighbours(parent, mode, limits);
+  if (neighbours.length > 0) return neighbours[Math.floor(rng() * neighbours.length)];
+  const child = cloneGenome(parent);
+  child.exit = parent.exit.mode === 'static' ? randomDynamicExit(rng, allowsReversalExit(h, parent.archetype)) : randomStaticExit(rng);
+  return repairGenome(child, mode, limits, rng);
 }
 
-/** Block-level crossover: the entry of one parent with the exit of the other. */
+/** Block-level crossover: the entry of one parent with the exit of the other (both share the run's hypothesis). */
 export function crossoverGenomes(
   rng: Rng,
   a: StrategyGenome,
@@ -892,6 +1076,7 @@ export function crossoverGenomes(
   const exitSource = cloneGenome(entryFromA ? b : a);
   const child: StrategyGenome = {
     archetype: entrySource.archetype,
+    ...(entrySource.hypothesis !== undefined ? { hypothesis: entrySource.hypothesis } : {}),
     longEntry: entrySource.longEntry,
     shortEntry: null,
     exit: exitSource.exit,
@@ -901,12 +1086,20 @@ export function crossoverGenomes(
 }
 
 /**
- * Every single-parameter ±20% neighbour of a strategy, snapped to the grids.
- * When ±20% rounds back to the same grid value the adjacent grid step is used
- * instead, so each parameter is always moved. Variants that would break the
- * archetype are skipped.
+ * How a neighbour moves one parameter:
+ *   pct20 – ±20%, snapped to the grid (the adjacent grid value when ±20% rounds back) – the
+ *           post-run sensitivity report;
+ *   step  – exactly one grid step down and one up – the neighbourhood used for ranking.
  */
-export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
+export type NeighbourKind = 'pct20' | 'step';
+
+/**
+ * Every single-parameter neighbour of a strategy (see `NeighbourKind`). Each tunable
+ * parameter is moved down and up once while every other parameter stays put.
+ * Variants that would break the archetype, or that normalise back to an already
+ * listed genome, are skipped.
+ */
+export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits, kind: NeighbourKind = 'pct20'): StrategyGenome[] {
   const base = normalizeGenome(g, mode, limits);
   const baseSignature = genomeSignature(base);
   const seen = new Set<string>([baseSignature]);
@@ -919,12 +1112,19 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
       if (!handle || handle.grid.length < 2) continue;
       const current = snap(handle.get(), handle.grid);
       const at = handle.grid.indexOf(current);
-      const target = current * factor;
-      let next = snap(target, handle.grid);
-      if (next === current) {
-        const neighbour = at + (target < current ? -1 : 1);
+      let next: number;
+      if (kind === 'step') {
+        const neighbour = at + (factor < 1 ? -1 : 1);
         if (neighbour < 0 || neighbour >= handle.grid.length) continue;
         next = handle.grid[neighbour];
+      } else {
+        const target = current * factor;
+        next = snap(target, handle.grid);
+        if (next === current) {
+          const neighbour = at + (target < current ? -1 : 1);
+          if (neighbour < 0 || neighbour >= handle.grid.length) continue;
+          next = handle.grid[neighbour];
+        }
       }
       handle.set(next);
       const variant = normalizeGenome(copy, mode, limits);
@@ -935,6 +1135,11 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
     }
   }
   return variants;
+}
+
+/** The one-grid-step parameter neighbourhood used to rank strategies by plateau, not spike. */
+export function stepNeighbours(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
+  return parameterVariants(g, mode, limits, 'step');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -955,7 +1160,7 @@ export function genomeSignature(g: StrategyGenome): string {
     g.exit.mode === 'static'
       ? `S:${g.exit.stopLossPct}:${g.exit.takeProfitPct}`
       : `D:${g.exit.atrPeriod}:${g.exit.stopAtrMult}:${g.exit.trailing ? 1 : 0}:${g.exit.takeProfitAtrMult ?? 'x'}:${g.exit.reversalExit ? 1 : 0}`;
-  return `${g.archetype}|${g.longEntry.conditions.map(conditionKey).join(';')}|${g.shortEntry ? 'LS' : 'L'}|${exit}|${g.maxBarsInTrade ?? 'x'}`;
+  return `${g.hypothesis ?? '-'}|${g.archetype}|${g.longEntry.conditions.map(conditionKey).join(';')}|${g.shortEntry ? 'LS' : 'L'}|${exit}|${g.maxBarsInTrade ?? 'x'}`;
 }
 
 /**
@@ -963,6 +1168,12 @@ export function genomeSignature(g: StrategyGenome): string {
  * The leaderboard caps the number of strategies per niche.
  */
 export function genomeNiche(g: StrategyGenome): string {
+  // Within one hypothesis the structure is: filter or not, state or event trigger, and the exit design.
   const families = g.longEntry.conditions.map((c) => c.ind).sort();
-  return `${g.archetype}|${families.join('+')}|${g.exit.mode}`;
+  const trigger = g.longEntry.conditions[0]?.op ?? '';
+  const exit =
+    g.exit.mode === 'static'
+      ? 'S'
+      : `D${g.exit.trailing ? 't' : ''}${g.exit.takeProfitAtrMult !== null ? 'p' : ''}${g.exit.reversalExit ? 'r' : ''}`;
+  return `${g.hypothesis ?? g.archetype}|${families.join('+')}|${trigger}|${exit}${g.maxBarsInTrade === null ? '' : 'T'}`;
 }
