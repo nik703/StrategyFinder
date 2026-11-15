@@ -5,6 +5,7 @@ import type { HoldoutWindow } from './holdoutLog';
 import type { TrialWindow } from './trialLedger';
 import {
   DEFAULT_CRYPTO_UNIVERSE,
+  DEFAULT_ROBUST_TARGET,
   DEFAULT_RUN_EVALUATIONS,
   DEFAULT_STOCK_UNIVERSE,
   INTERVAL_MS,
@@ -54,6 +55,8 @@ export interface RunConfig {
   hypothesis: Hypothesis;
   /** Evaluations (trials) the next run may spend. */
   maxEvaluations: number;
+  /** Stop after this many robust strategies (0 = run the full budget). */
+  robustTarget: number;
   /** fixed: risk % of starting capital · compound: risk % of current equity · full: 100% of equity. */
   sizingMode: 'fixed' | 'compound' | 'full';
   /** Share of capital lost when a trade is stopped out, in percent. */
@@ -105,6 +108,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   tradeMode: 'long-only',
   hypothesis: 'TREND_FOLLOWING',
   maxEvaluations: DEFAULT_RUN_EVALUATIONS,
+  robustTarget: DEFAULT_ROBUST_TARGET,
   sizingMode: 'fixed',
   riskPct: 2,
   // Financing is on by default; it only applies to Long/Short runs (Long-Only is treated as spot).

@@ -32,6 +32,7 @@ interface LeaderboardProps {
 type SortKey =
   | 'rank'
   | 'params'
+  | 'gates'
   | 'dsr'
   | 'haircut'
   | 'risk'
@@ -80,6 +81,12 @@ export function VerdictPill({ verdict }: { verdict: Verdict | null }): JSX.Eleme
   return <Pill tone={verdict === 'Robust' ? 'up' : verdict === 'Fragile' ? 'warn' : 'down'}>{verdict}</Pill>;
 }
 
+/** Number of robustness gates a strategy passes (0–4). */
+function gatesPassed(strategy: StrategyResult): number {
+  const r = strategy.robust;
+  return r ? [r.validation, r.folds, r.neighbours, r.significance].filter(Boolean).length : 0;
+}
+
 const COLUMNS: Column[] = [
   {
     key: 'rank',
@@ -98,6 +105,28 @@ const COLUMNS: Column[] = [
         )}
       </div>
     ),
+  },
+  {
+    key: 'gates',
+    label: 'Gates',
+    title: 'Robustness gates passed on the search period: validation, fold consistency, neighbour stability, significance (trades + DSR ≥ 50%)',
+    align: 'left',
+    value: ({ strategy }) => gatesPassed(strategy),
+    render: ({ strategy }) => {
+      const r = strategy.robust;
+      if (!r) return <span className="text-ink-3">–</span>;
+      const failed = [
+        !r.validation && 'validation',
+        !r.folds && 'folds',
+        !r.neighbours && 'neighbours',
+        !r.significance && 'significance',
+      ].filter(Boolean);
+      return (
+        <span title={r.passed ? 'Passes every robustness gate' : `Fails: ${failed.join(', ')}`}>
+          <Pill tone={r.passed ? 'up' : 'neutral'}>{r.passed ? 'Robust 4/4' : `${gatesPassed(strategy)}/4`}</Pill>
+        </span>
+      );
+    },
   },
   {
     key: 'indicators',

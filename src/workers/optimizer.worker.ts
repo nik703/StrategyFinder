@@ -32,6 +32,7 @@ import {
   holdoutShortfalls,
   median,
   passesTradeGates,
+  ROBUST_MIN_DSR,
   runBacktest,
   segmentMetrics,
   UNFIT,
@@ -42,6 +43,7 @@ import {
   evaluateCandidate,
   fitnessOf,
   rankFitness,
+  robustChecks,
   sampleCurve,
   scoreAssets,
   scoreNeighbours,
@@ -75,7 +77,12 @@ import {
 } from '../engine/genome';
 import { expectedMaxSharpe, haircutSharpe, RunningStats } from '../lib/stats';
 import {
+  DEFAULT_ROBUST_TARGET,
   DEFAULT_RUN_EVALUATIONS,
+  ELITE_SIZE,
+  MAX_ROBUST_TARGET,
+  MAX_RUN_EVALUATIONS,
+  type GateFunnel,
   FITNESS_PATIENCE,
   EXHAUSTION_LIMIT,
   HYPOTHESIS_IDS,
@@ -130,7 +137,9 @@ const CLONE_CORRELATION = 0.9;
 const ROUNDS_PER_EVALUATOR = 4;
 /** Pure random search until the leaderboard holds this many strategies. */
 const SEED_POPULATION = 10;
-/** A candidate must beat the board's best fitness by this much to reset the early-stopping clock. */
+/** Evaluations a run makes before reaching its robust target may end it. */
+const MIN_TARGET_EVALUATIONS = 1_000;
+/** A candidate must beat the board's best fitness by this much to reset the restart clock. */
 const FITNESS_MIN_GAIN = 0.001;
 /** The stability map spans this many grid steps either side of the chosen value. */
 const STABILITY_RADIUS = 2;
@@ -256,6 +265,13 @@ interface Session extends EvalContext {
   duplicates: number;
   /** Candidates that never traded. */
   inactive: number;
+  /**
+   * Strategies that passed every robustness gate, by fingerprint – kept even when the leaderboard's
+   * fitness ranking would push them off, and re-checked whenever the luck hurdle moves.
+   */
+  robust: Map<string, Entry>;
+  /** How many candidates cleared each gate. */
+  funnel: GateFunnel;
 }
 
 /** Gates for one asset of a pooled universe: the pooled gates shared out over the assets. */
@@ -331,36 +347,37 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
   const rising = (period: number): Condition => ({ ind: 'MA_SLOPE', maType: 'EMA', period, op: 'gt' });
   const lowerBand: Condition = { ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 };
   let seeds: StrategyGenome[];
+  // Textbook versions with ONE indicator, or one trigger plus one filter from another family.
   switch (h) {
     case 'TREND_FOLLOWING':
       seeds = [
-        // 20/56 EMA cross in a long-term uptrend, trailing ATR stop.
-        seed([emaCross(20, 56), aboveEma(200)], dynamic(3, null, true)),
-        // Turtle-style 56-candle breakout while the slow EMA rises and a trend is present, closed on the opposite breakout.
-        seed([donchian(56), rising(112), adx('gt', 20)], dynamic(2.5, null, true, true)),
-        // MACD signal cross above the 200 EMA with a fixed ATR bracket.
-        seed([{ ind: 'MACD', fast: 14, slow: 28, signal: 10, variant: 'signal', op: 'cross_above' }, aboveEma(200)], dynamic(2, 4, false)),
+        // 20/56 EMA crossover with a trailing ATR stop.
+        seed([emaCross(20, 56)], dynamic(3, null, true)),
+        // Turtle-style 56-candle breakout while the slow EMA rises, closed on the opposite breakout.
+        seed([donchian(56), rising(112)], dynamic(2.5, null, true, true)),
+        // MACD signal cross while a trend is present, fixed ATR bracket.
+        seed([{ ind: 'MACD', fast: 14, slow: 28, signal: 10, variant: 'signal', op: 'cross_above' }, adx('gt', 20)], dynamic(2, 4, false)),
       ];
       break;
     case 'VOL_BREAKOUT':
       seeds = [
-        seed([donchian(20), aboveEma(112)], dynamic(2, 4, false)),
-        seed([{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }, rising(112), { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }], dynamic(2.5, null, true)),
-        seed([donchian(40), { ind: 'VOLUME', period: 20, op: 'gt', level: 1.25 }], dynamic(3, 6, false), 20),
+        seed([donchian(20)], dynamic(2, 4, false)),
+        seed([{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }, { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }], dynamic(2.5, null, true)),
+        seed([donchian(40), aboveEma(112)], dynamic(3, 6, false)),
       ];
       break;
     case 'DIP_IN_UPTREND':
       seeds = [
-        seed([rsi(14, 30), aboveEma(200)], { mode: 'static', stopLossPct: 5, takeProfitPct: 10 }),
-        seed([rsi(7, 20), rising(112)], dynamic(2, 3, false), 10),
-        seed([lowerBand, aboveEma(160), adx('gt', 20)], dynamic(2, 3, false, true), 20),
+        seed([rsi(14, 30), aboveEma(200)], dynamic(2, 3, false)),
+        seed([rsi(7, 20), rising(112)], dynamic(2, 3, false)),
+        seed([lowerBand, aboveEma(160)], dynamic(1.5, 2.5, false, true)),
       ];
       break;
     case 'RANGE_REVERSION':
       seeds = [
-        seed([rsi(14, 30)], { mode: 'static', stopLossPct: 4, takeProfitPct: 7.5 }),
-        seed([rsi(14, 30), adx('lt', 20)], dynamic(2, 3, false, true), 20),
-        seed([lowerBand, adx('lt', 25)], { mode: 'static', stopLossPct: 3, takeProfitPct: 5 }, 10),
+        seed([rsi(14, 30)], dynamic(2, 3, false)),
+        seed([rsi(14, 30), adx('lt', 20)], dynamic(2, 3, false, true)),
+        seed([lowerBand], dynamic(1.5, 2.5, false)),
       ];
       break;
   }
@@ -376,7 +393,8 @@ function rescoreBoard(s: Session): void {
   s.hurdleTrials = s.trials.count;
   s.hurdleVariance = s.trials.variance;
   s.hurdle = expectedMaxSharpe(s.hurdleTrials, s.hurdleVariance);
-  for (const entry of s.board) {
+  const entries = new Set([...s.board, ...s.robust.values()]);
+  for (const entry of entries) {
     const { fitness, point, neighbourMedian, dsr } = rankFitness(s, entry.result.genome, entry.scores, entry.neighbours);
     entry.result.fitness = fitness;
     entry.result.pointFitness = point;
@@ -385,8 +403,18 @@ function rescoreBoard(s: Session): void {
     const haircut = haircutSharpe(entry.scores[0].metrics.validation, s.hurdleTrials, s.assets[0].periodsPerYear);
     entry.result.haircutSharpe = haircut.sharpe;
     entry.result.haircut = haircut.haircut;
+    // The deflated Sharpe falls as trials accrue: a strategy can drop out of the robust set.
+    entry.result.robust = robustChecks(s, entry.scores, dsr, entry.neighbours);
   }
+  for (const [key, entry] of s.robust) if (!entry.result.robust?.passed) s.robust.delete(key);
   s.board.sort((a, b) => b.result.fitness - a.result.fitness);
+}
+
+/** Every strategy the run reports: the leaderboard plus robust strategies that fell off it. */
+function reportedEntries(s: Session): Entry[] {
+  const out = [...s.board];
+  for (const entry of s.robust.values()) if (!out.includes(entry)) out.push(entry);
+  return out.sort((a, b) => b.result.fitness - a.result.fitness);
 }
 
 function searchAssetResults(s: Session, scores: AssetScore[]): AssetResult[] {
@@ -645,7 +673,7 @@ function lockStrategy(s: Session, id: string, priorReveals: number, simulated: b
     if (s.locked.id === id && known) return known;
     throw new Error(`This run's holdout has already been spent on strategy ${s.locked.id}. Only one strategy per run can be revealed.`);
   }
-  const entry = s.board.find((e) => e.result.id === id);
+  const entry = reportedEntries(s).find((e) => e.result.id === id);
   if (!entry) throw new Error('Only a strategy on the final leaderboard can be locked.');
   s.locked = { id, priorReveals: Math.max(0, Math.floor(priorReveals)), simulated };
   const result = revealHoldout(s, entry.result);
@@ -767,7 +795,13 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     );
   }
   const requested = Math.round(payload.maxEvaluations ?? DEFAULT_RUN_EVALUATIONS);
-  const maxEvaluations = Math.min(remaining, Number.isFinite(requested) ? Math.max(MIN_RUN_EVALUATIONS, requested) : DEFAULT_RUN_EVALUATIONS);
+  const maxEvaluations = Math.min(
+    remaining,
+    MAX_RUN_EVALUATIONS,
+    Number.isFinite(requested) ? Math.max(MIN_RUN_EVALUATIONS, requested) : DEFAULT_RUN_EVALUATIONS,
+  );
+  // 0 = no target: scan the whole budget.
+  const robustTarget = Math.max(0, Math.min(MAX_ROBUST_TARGET, Math.round(payload.robustTarget ?? DEFAULT_ROBUST_TARGET)));
 
   const s: Session = {
     ...ctx,
@@ -786,6 +820,8 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     undersampled: 0,
     duplicates: 0,
     inactive: 0,
+    robust: new Map(),
+    funnel: { scored: 0, trades: 0, validation: 0, folds: 0, dsr: 0, neighboursChecked: 0, neighbours: 0 },
   };
   session = s;
   const { mode, limits, board } = s;
@@ -817,8 +853,13 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   let stagnation = 0;
   /** Unique, trading strategies evaluated by this run: its trials. */
   let evaluations = 0;
-  /** Evaluations since a candidate last beat the best deflated Sharpe on the board. */
+  /** Evaluations since a candidate last improved the best fitness on the board. */
   let fitnessStall = 0;
+  /** Population cycle (1, +1 at every diversity restart) and the iteration it started at. */
+  let cycle = 1;
+  let cycleStart = 0;
+  /** Elite strategies kept across restarts (the best of the board at each restart). */
+  const hallOfFame: StrategyGenome[] = [];
   /** Proposals since the last new (non-duplicate, trading) evaluation. */
   let sinceNew = 0;
   /** Trade-log fingerprints registered since the last batch was sent to the evaluators. */
@@ -845,32 +886,63 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       bestDsrSharpe: leader ? leader.validation.sharpe : null,
       hurdleSharpe: s.hurdle * annualiser,
       undersampled: s.undersampled,
+      robustFound: s.robust.size,
+      robustTarget,
+      cycle,
+      funnel: { ...s.funnel },
       itersPerSec,
       elapsedMs: performance.now() - startedAt,
     };
   };
 
   const postBoard = (): void => {
-    scope.postMessage({ type: 'leaderboard', iteration, strategies: board.map((e) => e.result) });
+    scope.postMessage({ type: 'leaderboard', iteration, strategies: reportedEntries(s).map((e) => e.result) });
     boardDirty = false;
     lastBoardPost = performance.now();
   };
 
-  /** Rank-biased parent selection: quadratic bias towards the top of the leaderboard. */
-  const pickParent = (): StrategyGenome => board[Math.floor(rng() * rng() * board.length)].result.genome;
+  /**
+   * The parent population of the current cycle: strategies found since the last restart, ranked by
+   * fitness, after the hall of fame (the elite kept at the restarts). In the first cycle that is
+   * simply the leaderboard.
+   */
+  let parents: StrategyGenome[] = [];
+  const refreshParents = (): void => {
+    const fresh = board.filter((entry) => entry.result.foundAt >= cycleStart).map((entry) => entry.result.genome);
+    parents = cycle === 1 ? board.map((entry) => entry.result.genome) : [...hallOfFame.slice(-ELITE_SIZE), ...fresh];
+  };
+  /** Rank-biased parent selection: quadratic bias towards the top of the parent population. */
+  const pickParent = (): StrategyGenome => parents[Math.floor(rng() * rng() * parents.length)];
 
   const propose = (): StrategyGenome => {
     if (seeds.length > 0) return seeds.shift() as StrategyGenome;
-    if (board.length < SEED_POPULATION) return randomGenome(rng, mode, limits, hypothesis);
+    if (parents.length < SEED_POPULATION) return randomGenome(rng, mode, limits, hypothesis);
     const progress = Math.min(1, fitnessStall / FITNESS_PATIENCE);
     const r = rng();
-    // Exploration grows from 10% to 25% of proposals as the search stalls.
+    // Exploration grows from 10% to 25% of proposals as the cycle stalls.
     const explore = 0.1 + 0.15 * progress;
     if (r < explore) return randomGenome(rng, mode, limits, hypothesis);
     if (r < explore + 0.12) return crossoverGenomes(rng, pickParent(), pickParent(), mode, limits);
-    // Hill-climb the champion 40% of the time, otherwise a rank-biased parent.
-    const parent = rng() < 0.4 ? board[0].result.genome : pickParent();
+    // Hill-climb the cycle's best 40% of the time, otherwise a rank-biased parent.
+    const parent = rng() < 0.4 ? parents[0] : pickParent();
     return mutateGenome(rng, parent, mode, limits, 1 + Math.floor(progress * 3));
+  };
+
+  /**
+   * Diversity restart: keep the best `ELITE_SIZE` strategies in the hall of fame and re-seed the rest
+   * of the parent population with fresh random single- and dual-indicator genomes, so a long scan
+   * escapes the local optimum it has stalled on instead of looping on minor tweaks.
+   */
+  const restart = (): void => {
+    cycle++;
+    cycleStart = iteration;
+    fitnessStall = 0;
+    for (const entry of board.slice(0, ELITE_SIZE)) {
+      const signature = genomeSignature(entry.result.genome);
+      if (!hallOfFame.some((g) => genomeSignature(g) === signature)) hallOfFame.push(entry.result.genome);
+    }
+    for (let k = 0; k < 2 * SEED_POPULATION; k++) seeds.push(randomGenome(rng, mode, limits, hypothesis));
+    refreshParents();
   };
 
   /** Primary-asset curve for a candidate whose curve was not captured during evaluation (rare: the board shrank). */
@@ -892,6 +964,56 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     improvedMeaningfully: boolean;
   }
   const NOT_A_TRIAL: Outcome = { trial: false, improvedFitness: false, improvedMeaningfully: false };
+
+  /** A leaderboard / robust-archive entry for a fully scored candidate. */
+  const buildEntry = (
+    genome: StrategyGenome,
+    evaluated: CandidateResult,
+    fitness: number,
+    neighbours: NeighbourScore[],
+    fingerprint: string,
+    robust: StrategyResult['robust'],
+    curve: Float32Array | null = null,
+  ): Entry => {
+    const { scores, pointFitness, dsr } = evaluated;
+    const primaryMetrics = scores[0].metrics;
+    const equity = curve ?? evaluated.curve ?? primaryCurve(genome);
+    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.genome, nb.scores).fitness);
+    const haircut = haircutSharpe(primaryMetrics.validation, s.hurdleTrials, primary.periodsPerYear);
+    return {
+      niche: genomeNiche(genome),
+      fingerprint,
+      returns: curveReturns(equity),
+      scores,
+      neighbours,
+      result: {
+        id: `S-${iteration}`,
+        genome,
+        fitness,
+        pointFitness,
+        neighbourMedian: neighbourValues.length > 0 ? median(neighbourValues) : null,
+        neighbourCount: neighbourValues.length,
+        dsr,
+        haircutSharpe: haircut.sharpe,
+        haircut: haircut.haircut,
+        params: countParameters(genome, limits),
+        sample: { ...sampleOf(s, scores), holdoutTrades: null, gates: s.gates, pooled: s.pooled },
+        robust,
+        search: primaryMetrics.search,
+        train: primaryMetrics.train,
+        validation: primaryMetrics.validation,
+        folds: primaryMetrics.folds,
+        regimes: primaryMetrics.regimes,
+        holdout: null,
+        alpha: primaryMetrics.search.roi - primary.benchmark.search.roi,
+        equity,
+        foundAt: iteration,
+        assets: searchAssetResults(s, scores),
+        robustness: null,
+        verdict: null,
+      },
+    };
+  };
 
   /** Register an evaluated candidate and insert it into the leaderboard if it qualifies. */
   const consider = (genome: StrategyGenome, evaluated: CandidateResult): Outcome => {
@@ -916,10 +1038,40 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     s.runTrials.push(primaryMetrics.validation.sharpeRaw * annualiser);
     const trialOnly: Outcome = { trial: true, improvedFitness: false, improvedMeaningfully: false };
     if (!complete) return trialOnly;
+
+    // Robustness funnel: which gates this candidate clears on its own (the neighbourhood comes later).
+    const cheap = robustChecks(s, scores, dsr, null);
+    const funnel = s.funnel;
+    funnel.scored++;
+    if (!isUndersampled(scores)) funnel.trades++;
+    if (cheap.validation) funnel.validation++;
+    if (cheap.folds) funnel.folds++;
+    if (dsr >= ROBUST_MIN_DSR) funnel.dsr++;
+
     if (fitness <= UNFIT) {
       if (isUndersampled(scores)) s.undersampled++;
       return trialOnly;
     }
+    const fingerprint = tradeHash ?? genomeSignature(genome);
+    // A candidate that clears every other gate always gets its neighbourhood checked, even when its
+    // fitness would not make the leaderboard: it may be one of the robust strategies the run is after.
+    if (cheap.validation && cheap.folds && cheap.significance && !s.robust.has(fingerprint)) {
+      if (neighbours === null) {
+        neighbours = scoreNeighbours(s, genome);
+        fitness = rankFitness(s, genome, scores, neighbours).fitness;
+      }
+      funnel.neighboursChecked++;
+      const checks = robustChecks(s, scores, dsr, neighbours);
+      if (checks.neighbours) funnel.neighbours++;
+      if (checks.passed) {
+        s.robust.set(fingerprint, buildEntry(genome, evaluated, fitness, neighbours, fingerprint, checks));
+        boardDirty = true;
+      }
+    } else if (neighbours !== null) {
+      funnel.neighboursChecked++;
+      if (robustChecks(s, scores, dsr, neighbours).neighbours) funnel.neighbours++;
+    }
+
     if (board.length >= LEADERBOARD_SIZE && pointFitness <= board[board.length - 1].result.fitness) return trialOnly;
     if (neighbours === null) {
       // Rare: the candidate did not beat the round's frozen floor, but the board has since shrunk.
@@ -930,16 +1082,14 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return trialOnly;
 
-    const { search } = primaryMetrics;
-    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.genome, nb.scores).fitness);
     // Identical trade logs never reach this point, so the trade-log fingerprint identifies the board entry.
-    const fingerprint = tradeHash ?? genomeSignature(genome);
     if (board.some((e) => e.fingerprint === fingerprint)) return trialOnly;
 
     // Behavioural clones: a fitter twin already on the board wins; otherwise this one replaces its twins.
     // The curve stops at the holdout boundary – nothing beyond it has been simulated.
-    const equity = evaluated.curve ?? primaryCurve(genome);
-    const returns = curveReturns(equity);
+    const archived = s.robust.get(fingerprint);
+    const equity = archived?.result.equity ?? evaluated.curve ?? primaryCurve(genome);
+    const returns = archived?.returns ?? curveReturns(equity);
     const twins: number[] = [];
     for (let k = 0; k < board.length; k++) {
       if (correlation(returns, board[k].returns) >= CLONE_CORRELATION) twins.push(k);
@@ -964,39 +1114,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       board.splice(nicheWorst, 1);
     }
 
-    const haircut = haircutSharpe(primaryMetrics.validation, s.hurdleTrials, primary.periodsPerYear);
-    const entry: Entry = {
-      niche,
-      fingerprint,
-      returns,
-      scores,
-      neighbours,
-      result: {
-        id: `S-${iteration}`,
-        genome,
-        fitness,
-        pointFitness,
-        neighbourMedian: neighbourValues.length > 0 ? median(neighbourValues) : null,
-        neighbourCount: neighbourValues.length,
-        dsr,
-        haircutSharpe: haircut.sharpe,
-        haircut: haircut.haircut,
-        params: countParameters(genome, limits),
-        sample: { ...sampleOf(s, scores), holdoutTrades: null, gates: s.gates, pooled: s.pooled },
-        search: primaryMetrics.search,
-        train: primaryMetrics.train,
-        validation: primaryMetrics.validation,
-        folds: primaryMetrics.folds,
-        regimes: primaryMetrics.regimes,
-        holdout: null,
-        alpha: search.roi - primary.benchmark.search.roi,
-        equity,
-        foundAt: iteration,
-        assets: searchAssetResults(s, scores),
-        robustness: null,
-        verdict: null,
-      },
-    };
+    const entry = archived ?? buildEntry(genome, evaluated, fitness, neighbours, fingerprint, robustChecks(s, scores, dsr, neighbours), equity);
     let at = board.length;
     while (at > 0 && board[at - 1].result.fitness < fitness) at--;
     board.splice(at, 0, entry);
@@ -1048,14 +1166,16 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // The search is over, but the holdout stays sealed: the user locks ONE strategy to reveal it.
     rescoreBoard(s);
     s.finished = true;
-    const strategies = board.map((entry) => entry.result);
+    const strategies = reportedEntries(s).map((entry) => entry.result);
     scope.postMessage({ type: 'done', reason, strategies, benchmark: sealedBenchmark(s), ...snapshot() });
   };
 
   /** Why the run must end now, or null to carry on. */
   const stopReason = (): StopReason | null => {
+    // The target ends a run only after a minimum scan: with a handful of trials the deflated
+    // Sharpe's hurdle rests on too few Sharpe ratios to be trusted.
+    if (robustTarget > 0 && s.robust.size >= robustTarget && evaluations >= Math.min(MIN_TARGET_EVALUATIONS, maxEvaluations)) return 'target';
     if (evaluations >= maxEvaluations) return prior.count + evaluations >= windowBudget ? 'window-budget' : 'budget';
-    if (fitnessStall >= FITNESS_PATIENCE) return 'converged';
     if (sinceNew >= EXHAUSTION_LIMIT) return 'exhausted';
     return null;
   };
@@ -1064,6 +1184,9 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // The selection-bias hurdle and the leaderboard floor are frozen for the round, so every
     // candidate in it is judged like for like whichever evaluator scores it.
     rescoreBoard(s);
+    // A stall is no reason to stop while robust strategies are still missing: restart instead.
+    if (fitnessStall >= FITNESS_PATIENCE) restart();
+    else refreshParents();
     const floor = board.length >= LEADERBOARD_SIZE ? board[board.length - 1].result.fitness : -Infinity;
     const batch: { genome: StrategyGenome; duplicate: boolean }[] = [];
     for (let k = 0; k < batchSize; k++) batch.push(proposeUnique());

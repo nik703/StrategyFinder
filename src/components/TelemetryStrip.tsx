@@ -32,7 +32,7 @@ interface TelemetryStripProps {
 
 const STOP_LABEL: Record<StopReason, string> = {
   stopped: 'Stopped by User',
-  converged: 'Stopped early · no DSR gain',
+  target: 'Robust target reached',
   budget: 'Run budget used',
   'window-budget': 'Window budget spent',
   exhausted: 'Search space exhausted',
@@ -92,6 +92,56 @@ function Tile({ label, children, className }: { label: string; children: ReactNo
   );
 }
 
+/** Robust strategies found, evaluations and population cycle, and the robustness-gate funnel. */
+function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapshot; maxEvaluations: number }): JSX.Element {
+  const { robustFound, robustTarget, cycle, funnel, evaluations } = telemetry;
+  const share = maxEvaluations > 0 ? Math.min(1, evaluations / maxEvaluations) : 0;
+  const reached = robustTarget > 0 && robustFound >= robustTarget;
+  const gate = (label: string, value: number, of: number, title: string): JSX.Element => (
+    <span title={title} className="whitespace-nowrap">
+      {label} <span className="num font-semibold text-ink-2">{fmtInt(value)}</span>
+      {of !== funnel.scored && <span className="num text-ink-3">/{fmtInt(of)}</span>}
+    </span>
+  );
+  return (
+    <div className="col-span-full border-t border-line px-4 py-3">
+      <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1">
+        <div className="flex items-baseline gap-2" title="Strategies passing every robustness gate on the search period (validation, folds, neighbours, significance). The holdout stays sealed until you lock one.">
+          <span className="text-[11px] font-medium uppercase tracking-wider text-ink-3">Robust strategies found</span>
+          <span className={cx('num text-lg font-semibold', reached ? 'text-up' : robustFound > 0 ? 'text-warn' : 'text-ink')}>
+            {fmtInt(robustFound)}
+            <span className="text-sm font-normal text-ink-3"> / {robustTarget > 0 ? fmtInt(robustTarget) : 'full budget'}</span>
+          </span>
+        </div>
+        <div className="num text-xs text-ink-3">
+          <span className="font-semibold text-ink-2">{fmtInt(evaluations)}</span> / {fmtInt(maxEvaluations)} evals
+          <span className="ml-1">(Population cycle {fmtInt(cycle)})</span>
+        </div>
+      </div>
+      <div
+        className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-accent/15"
+        role="progressbar"
+        aria-label="Evaluations used by this run"
+        aria-valuemin={0}
+        aria-valuemax={maxEvaluations}
+        aria-valuenow={evaluations}
+      >
+        <div className="h-full rounded-full bg-accent transition-[width] duration-150 ease-linear" style={{ width: `${share * 100}%` }} />
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-3">
+        <span className="whitespace-nowrap">
+          Of <span className="num font-semibold text-ink-2">{fmtInt(funnel.scored)}</span> scored candidates, cleared:
+        </span>
+        {gate('min trades', funnel.trades, funnel.scored, 'Timeframe-scaled minimum-trade gates')}
+        {gate('validation Sharpe > 0.3', funnel.validation, funnel.scored, 'Validation Sharpe above 0.3 and a positive validation net profit after every cost')}
+        {gate('3 of 5 folds', funnel.folds, funnel.scored, 'At least 3 of the 5 folds profitable and no fold beyond the drawdown cap')}
+        {gate('DSR ≥ 50%', funnel.dsr, funnel.scored, 'Validation Sharpe beats the best a random walk is expected to show after this many trials')}
+        {gate('stable neighbours', funnel.neighbours, funnel.neighboursChecked, 'One-step parameter neighbours keep a positive median expectancy (checked for promising candidates only)')}
+      </div>
+    </div>
+  );
+}
+
 export default function TelemetryStrip({
   status,
   telemetry,
@@ -137,7 +187,7 @@ export default function TelemetryStrip({
           <span className="num text-sm text-ink-3">/ {fmtInt(maxEvaluations)}</span>
         </div>
         <div className="num mt-1 text-xs leading-snug text-ink-3" title="Repeated genomes and repeated trade logs are skipped: they are not new trials.">
-          {fmtInt(telemetry.duplicates)} duplicates skipped · early stop {fmtInt(Math.min(telemetry.fitnessStall, FITNESS_PATIENCE))}/{fmtInt(FITNESS_PATIENCE)}
+          {fmtInt(telemetry.duplicates)} duplicates skipped · restart at stall {fmtInt(Math.min(telemetry.fitnessStall, FITNESS_PATIENCE))}/{fmtInt(FITNESS_PATIENCE)}
         </div>
       </Tile>
 
@@ -242,6 +292,7 @@ export default function TelemetryStrip({
           </>
         )}
       </Tile>
+      <ScanProgress telemetry={telemetry} maxEvaluations={maxEvaluations} />
     </Panel>
   );
 }
