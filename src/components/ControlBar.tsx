@@ -1,12 +1,12 @@
 /**
- * Top control bar: asset / basket builder, timeframe, history range, capital,
- * costs (fee, fixed and volatility-scaled slippage), trade mode, position
- * sizing, Long/Short financing (perp funding or stock borrow), the Robust universe and the
- * Start / Stop buttons.
+ * Step 1 of the guided workflow – Market & preset setup: one-click presets, the asset / basket /
+ * pool picker, timeframe, history, direction mode, market hypothesis and the Start / Stop buttons.
+ * Everything else (capital, costs, sizing, financing, search budget, the Robust universe) sits in
+ * the Advanced Settings drawer with sensible defaults.
  */
 
-import { Info, Loader2, Play, Plus, Square, X } from 'lucide-react';
-import { useId } from 'react';
+import { ChevronDown, ChevronRight, Info, Loader2, Play, Plus, SlidersHorizontal, Square, X } from 'lucide-react';
+import { useId, useState } from 'react';
 import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import {
   DEFAULT_BORROW_PCT_YEAR,
@@ -39,7 +39,8 @@ import {
   type MaPeriodSearch,
 } from '../types/trading';
 import { HYPOTHESES } from '../engine/genome';
-import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
+import PresetCards from './PresetCards';
+import { cx, FieldLabel, NumberField, Panel, Segmented, StepHeader } from './ui';
 
 interface ControlBarProps {
   config: RunConfig;
@@ -89,10 +90,29 @@ const HYPOTHESIS_OPTIONS: { value: Hypothesis; label: string; title: string }[] 
   label: HYPOTHESES[id].label,
   title: `${HYPOTHESES[id].rationale}\nTrigger: ${HYPOTHESES[id].trigger}\n${HYPOTHESES[id].filter}`,
 }));
-const MODE_OPTIONS: { value: TradeMode; label: string }[] = [
-  { value: 'long-only', label: 'Long-Only' },
-  { value: 'long-short', label: 'Long/Short' },
+const MODE_OPTIONS: { value: TradeMode; label: string; title: string }[] = [
+  {
+    value: 'long-only',
+    label: 'Long-Only',
+    title: 'Never sells short – the default for equities and spot crypto, which drift upwards over time and charge for shorting.',
+  },
+  {
+    value: 'asymmetric',
+    label: 'Asymmetric L/S',
+    title:
+      'Shorts use the mirrored entry trigger, but only inside their own bear-market filter (close below a slow EMA/SMA, or a falling one), tuned independently of the long rules.',
+  },
+  {
+    value: 'long-short',
+    label: 'Mirrored L/S',
+    title: 'Shorts are the exact mirror image of the long rules, in every market regime.',
+  },
 ];
+const MODE_NOTE: Record<TradeMode, string> = {
+  'long-only': 'Long-Only: buys only, treated as spot (no funding or borrow).',
+  asymmetric: 'Asymmetric L/S: shorts need their own bear-regime filter, so they sit out bull markets; shorts pay funding / borrow.',
+  'long-short': 'Mirrored L/S: shorts mirror the long rules in every regime; shorts pay funding / borrow.',
+};
 const SIZING_OPTIONS: { value: RunConfig['sizingMode']; label: string }[] = [
   { value: 'fixed', label: 'Risk % · fixed' },
   { value: 'compound', label: 'Risk % · compounding' },
@@ -350,6 +370,11 @@ export default function ControlBar({
   const universeInvalid =
     universeOn && (universeList.some((symbol) => !TICKER_PATTERN.test(symbol)) || universeList.length > MAX_UNIVERSE_ASSETS);
 
+  const [advanced, setAdvanced] = useState(false);
+  const hypothesis = HYPOTHESES[config.hypothesis];
+  const sizingText =
+    config.sizingMode === 'full' ? '100% of equity' : `${config.riskPct}% risk ${config.sizingMode === 'compound' ? '(compounding)' : '(fixed)'}`;
+
   return (
     <Panel className="p-4">
       <datalist id={listId}>
@@ -358,8 +383,13 @@ export default function ControlBar({
         ))}
       </datalist>
 
-      {/* Row 1 – what to trade */}
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+      <StepHeader step={1} title="Market & preset" hint="Start from a preset or pick your own market – every setting stays editable." />
+      <div className="mt-3">
+        <PresetCards config={config} onApply={(preset) => onChange(preset.patch)} disabled={busy} />
+      </div>
+
+      {/* What to trade */}
+      <div className="mt-4 flex flex-col gap-3 border-t border-line pt-4 lg:flex-row lg:items-start">
         <div className="shrink-0">
           <FieldLabel>Asset</FieldLabel>
           <Segmented
@@ -370,7 +400,6 @@ export default function ControlBar({
             disabled={busy}
           />
         </div>
-
         <div className="min-w-0 flex-1">
           <FieldLabel>{config.assetMode === 'single' ? 'Ticker' : config.assetMode === 'pool' ? 'Pooled assets' : 'Basket allocation'}</FieldLabel>
           {config.assetMode === 'pool' ? (
@@ -473,7 +502,7 @@ export default function ControlBar({
         </div>
       </div>
 
-      {/* Row 2 – how to test it */}
+      {/* How to test it */}
       <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
         <div>
           <FieldLabel>Timeframe</FieldLabel>
@@ -495,6 +524,109 @@ export default function ControlBar({
             disabled={busy}
           />
         </div>
+        <div>
+          <FieldLabel>Direction</FieldLabel>
+          <Segmented
+            ariaLabel="Trade direction mode"
+            options={MODE_OPTIONS}
+            value={config.tradeMode}
+            onChange={(tradeMode) => onChange({ tradeMode })}
+            disabled={busy}
+          />
+        </div>
+
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onStart}
+            disabled={busy || budgetBlocked !== null}
+            title={budgetBlocked ?? undefined}
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-white transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {status === 'loading' ? (
+              <Loader2 size={15} className="animate-spin" />
+            ) : (
+              <Play size={15} fill="currentColor" />
+            )}
+            {status === 'loading' ? 'Loading data…' : status === 'optimizing' ? 'Scanning…' : 'Start Discovery'}
+          </button>
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={!busy}
+            className="inline-flex h-9 items-center gap-2 rounded-lg border border-down/50 bg-down/10 px-4 text-sm font-semibold text-down transition-colors hover:bg-down/20 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-ink-3"
+          >
+            <Square size={13} fill="currentColor" />
+            Stop
+          </button>
+        </div>
+        {subHour && tradesStocks && (
+          <p className="flex basis-full items-center gap-1.5 text-xs text-ink-3">
+            <Info size={13} className="shrink-0" />
+            Yahoo Finance only serves {config.interval} stock candles for the last {YAHOO_MAX_DAYS[config.interval] + 1} days, so stock
+            runs on this timeframe are short. Crypto loads the full {config.range} from Binance.
+          </p>
+        )}
+      </div>
+
+      {/* What the run looks for */}
+      <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">
+        <div>
+          <FieldLabel>Market hypothesis</FieldLabel>
+          <Segmented
+            ariaLabel="Market hypothesis"
+            options={HYPOTHESIS_OPTIONS}
+            value={config.hypothesis}
+            onChange={(hypothesis) => onChange({ hypothesis })}
+            disabled={busy}
+          />
+        </div>
+        <p className="min-w-[260px] flex-1 pt-5 text-xs leading-relaxed text-ink-3">
+          <span className="font-semibold text-ink-2">{hypothesis.label}.</span> {hypothesis.rationale}{' '}
+          <span className="text-ink-2">Entry trigger:</span> {hypothesis.trigger} <span className="text-ink-2">Filter:</span> {hypothesis.filter}{' '}
+          <span className="text-ink-2">{MODE_NOTE[config.tradeMode]}</span>
+        </p>
+      </div>
+      {budgetBlocked !== null && !busy && (
+        <div role="alert" className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
+          <span className="flex min-w-0 flex-1 items-start gap-1.5">
+            <Info size={13} className="mt-0.5 shrink-0" />
+            <span>
+              {budgetBlocked} Extending keeps every earlier trial in the count: the luck hurdle keeps rising and multiple-testing
+              significance degrades further.
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={onExtendBudget}
+            className="inline-flex h-8 shrink-0 items-center rounded-md border border-warn/60 px-3 font-semibold text-warn transition-colors hover:bg-warn/15"
+          >
+            Extend Budget (+{BUDGET_EXTENSION.toLocaleString('en-US')} trials)
+          </button>
+        </div>
+      )}
+
+      {/* Advanced settings */}
+      <div className="mt-4 border-t border-line pt-3">
+        <button
+          type="button"
+          onClick={() => setAdvanced((open) => !open)}
+          aria-expanded={advanced}
+          className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-lg px-1 py-1 text-left transition-colors hover:bg-hover/50"
+        >
+          <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-2">
+            {advanced ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            <SlidersHorizontal size={13} /> Advanced settings
+          </span>
+          <span className="num truncate text-xs text-ink-3">
+            ${config.capital.toLocaleString('en-US')} · {config.feePct}% fee · {config.slippagePct}% + {config.slippageAtrMult}×ATR slippage · {sizingText} ·{' '}
+            {config.maxEvaluations.toLocaleString('en-US')} evals · stop after {config.robustTarget > 0 ? `${config.robustTarget} robust` : 'full budget'} ·{' '}
+            {config.maPeriods === 'integer' ? 'every EMA/SMA length' : 'coarse grid'}
+          </span>
+        </button>
+        {advanced && (
+          <div className="mt-3 space-y-4">
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
         <NumberField
           label="Starting capital"
           prefix="$"
@@ -564,80 +696,6 @@ export default function ControlBar({
           />
         </div>
         <div>
-          <FieldLabel>Mode</FieldLabel>
-          <Segmented
-            ariaLabel="Trade direction mode"
-            options={MODE_OPTIONS}
-            value={config.tradeMode}
-            onChange={(tradeMode) => onChange({ tradeMode })}
-            disabled={busy}
-          />
-        </div>
-
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onStart}
-            disabled={busy || budgetBlocked !== null}
-            title={budgetBlocked ?? undefined}
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-white transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {status === 'loading' ? (
-              <Loader2 size={15} className="animate-spin" />
-            ) : (
-              <Play size={15} fill="currentColor" />
-            )}
-            {status === 'loading' ? 'Loading data…' : status === 'optimizing' ? 'Optimizing…' : 'Start Optimization'}
-          </button>
-          <button
-            type="button"
-            onClick={onStop}
-            disabled={!busy}
-            className="inline-flex h-9 items-center gap-2 rounded-lg border border-down/50 bg-down/10 px-4 text-sm font-semibold text-down transition-colors hover:bg-down/20 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-ink-3"
-          >
-            <Square size={13} fill="currentColor" />
-            Stop
-          </button>
-        </div>
-        {subHour && tradesStocks && (
-          <p className="flex basis-full items-center gap-1.5 text-xs text-ink-3">
-            <Info size={13} className="shrink-0" />
-            Yahoo Finance only serves {config.interval} stock candles for the last {YAHOO_MAX_DAYS[config.interval] + 1} days, so stock
-            runs on this timeframe are short. Crypto loads the full {config.range} from Binance.
-          </p>
-        )}
-      </div>
-      {budgetBlocked !== null && !busy && (
-        <div role="alert" className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          <span className="flex min-w-0 flex-1 items-start gap-1.5">
-            <Info size={13} className="mt-0.5 shrink-0" />
-            <span>
-              {budgetBlocked} Extending keeps every earlier trial in the count: the luck hurdle keeps rising and multiple-testing
-              significance degrades further.
-            </span>
-          </span>
-          <button
-            type="button"
-            onClick={onExtendBudget}
-            className="inline-flex h-8 shrink-0 items-center rounded-md border border-warn/60 px-3 font-semibold text-warn transition-colors hover:bg-warn/15"
-          >
-            Extend Budget (+{BUDGET_EXTENSION.toLocaleString('en-US')} trials)
-          </button>
-        </div>
-      )}
-      {/* Hypothesis – what the run tests; the search only tunes its numbers */}
-      <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">
-        <div>
-          <FieldLabel>Market hypothesis</FieldLabel>
-          <Segmented
-            ariaLabel="Market hypothesis"
-            options={HYPOTHESIS_OPTIONS}
-            value={config.hypothesis}
-            onChange={(hypothesis) => onChange({ hypothesis })}
-            disabled={busy}
-          />
-        </div>
-        <div>
           <FieldLabel>EMA / SMA lengths</FieldLabel>
           <Segmented
             ariaLabel="EMA / SMA length search"
@@ -647,13 +705,8 @@ export default function ControlBar({
             disabled={busy}
           />
         </div>
-        <p className="min-w-[260px] flex-1 pt-5 text-xs leading-relaxed text-ink-3">
-          <span className="font-semibold text-ink-2">{HYPOTHESES[config.hypothesis].label}.</span> {HYPOTHESES[config.hypothesis].rationale}{' '}
-          <span className="text-ink-2">Trigger:</span> {HYPOTHESES[config.hypothesis].trigger} {HYPOTHESES[config.hypothesis].filter}
-        </p>
-      </div>
-      {/* Row 3 – risk and robustness (run settings the optimiser cannot tune) */}
-      <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
+            </div>
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
         <div>
           <FieldLabel>Position sizing</FieldLabel>
           <Segmented
@@ -757,6 +810,9 @@ export default function ControlBar({
             />
           </div>
         </div>
+            </div>
+          </div>
+        )}
       </div>
     </Panel>
   );

@@ -14,7 +14,7 @@ import type { RunContext } from '../lib/config';
 import type { BudgetStatus } from '../lib/trialLedger';
 import { fmtDate, fmtDuration, fmtInt, fmtNum, fmtPct } from '../lib/format';
 import { FITNESS_PATIENCE, type EngineStatus, type ProgressSnapshot, type StopReason } from '../types/trading';
-import { cx, Panel } from './ui';
+import { cx, Panel, StepHeader } from './ui';
 
 interface TelemetryStripProps {
   status: EngineStatus;
@@ -92,21 +92,34 @@ function Tile({ label, children, className }: { label: string; children: ReactNo
   );
 }
 
-/** Robust strategies found, evaluations and population cycle, and the robustness-gate funnel. */
+/** One stage of the pass / fail funnel. */
+interface FunnelStage {
+  label: string;
+  /** What the gate checks, in plain English. */
+  title: string;
+  value: number;
+  /** What the share is measured against (the scored candidates, or the neighbourhoods checked). */
+  of: number;
+  tone: string;
+}
+
+/** Robust strategies found, evaluations, the restart cycle, and the pass / fail funnel of the robustness gates. */
 function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapshot; maxEvaluations: number }): JSX.Element {
   const { robustFound, robustTarget, cycle, funnel, evaluations } = telemetry;
   const share = maxEvaluations > 0 ? Math.min(1, evaluations / maxEvaluations) : 0;
   const reached = robustTarget > 0 && robustFound >= robustTarget;
-  const gate = (label: string, value: number, of: number, title: string): JSX.Element => (
-    <span title={title} className="whitespace-nowrap">
-      {label} <span className="num font-semibold text-ink-2">{fmtInt(value)}</span>
-      {of !== funnel.scored && <span className="num text-ink-3">/{fmtInt(of)}</span>}
-    </span>
-  );
+  const stages: FunnelStage[] = [
+    { label: 'Scored', title: 'Candidate strategies backtested on the search period (train + validation).', value: funnel.scored, of: funnel.scored, tone: 'bg-ink-3/60' },
+    { label: 'Enough trades', title: 'Cleared the timeframe-scaled minimum-trade gates – fewer trades cannot be told apart from luck.', value: funnel.trades, of: funnel.scored, tone: 'bg-accent/70' },
+    { label: 'Profitable out of sample', title: 'Validation Sharpe above 0.3 and a positive validation profit after every cost.', value: funnel.validation, of: funnel.scored, tone: 'bg-accent/70' },
+    { label: 'Consistent over time', title: '3 of 5 time slices profitable (flat slices set aside) and none with a drawdown beyond 35%.', value: funnel.folds, of: funnel.scored, tone: 'bg-accent/70' },
+    { label: 'Beats luck', title: 'Deflated Sharpe of 50% or more: beats the best a random walk is expected to show after this many trials.', value: funnel.dsr, of: funnel.scored, tone: 'bg-accent/70' },
+    { label: 'Stable neighbours', title: 'Nearby parameter settings keep a positive median profit per trade (checked for promising candidates only).', value: funnel.neighbours, of: funnel.neighboursChecked, tone: 'bg-accent/70' },
+  ];
   return (
-    <div className="col-span-full border-t border-line px-4 py-3">
+    <div className="border-t border-line px-4 py-3">
       <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1">
-        <div className="flex items-baseline gap-2" title="Strategies passing every robustness gate on the search period (validation, folds, neighbours, significance). The holdout stays sealed until you lock one.">
+        <div className="flex items-baseline gap-2" title="Strategies passing every robustness gate on the search period. The holdout stays sealed until you lock one.">
           <span className="text-[11px] font-medium uppercase tracking-wider text-ink-3">Robust strategies found</span>
           <span className={cx('num text-lg font-semibold', reached ? 'text-up' : robustFound > 0 ? 'text-warn' : 'text-ink')}>
             {fmtInt(robustFound)}
@@ -114,8 +127,14 @@ function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapsh
           </span>
         </div>
         <div className="num text-xs text-ink-3">
-          <span className="font-semibold text-ink-2">{fmtInt(evaluations)}</span> / {fmtInt(maxEvaluations)} evals
-          <span className="ml-1">(Population cycle {fmtInt(cycle)})</span>
+          <span className="font-semibold text-ink-2">{fmtInt(evaluations)}</span> / {fmtInt(maxEvaluations)} evaluations
+        </div>
+        <div
+          className="num inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-2 py-0.5 text-xs text-ink-2"
+          title={`When the best score has not improved for ${FITNESS_PATIENCE.toLocaleString('en-US')} evaluations, the search keeps its best strategies and re-seeds the rest with fresh random ones (a diversity restart).`}
+        >
+          Restart cycle <span className="font-semibold text-ink">{fmtInt(cycle)}</span>
+          <span className="text-ink-3">· next restart {fmtInt(Math.max(0, FITNESS_PATIENCE - Math.min(telemetry.fitnessStall, FITNESS_PATIENCE)))} evals away</span>
         </div>
       </div>
       <div
@@ -128,16 +147,26 @@ function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapsh
       >
         <div className="h-full rounded-full bg-accent transition-[width] duration-150 ease-linear" style={{ width: `${share * 100}%` }} />
       </div>
-      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-3">
-        <span className="whitespace-nowrap">
-          Of <span className="num font-semibold text-ink-2">{fmtInt(funnel.scored)}</span> scored candidates, cleared:
-        </span>
-        {gate('min trades', funnel.trades, funnel.scored, 'Timeframe-scaled minimum-trade gates')}
-        {gate('validation Sharpe > 0.3', funnel.validation, funnel.scored, 'Validation Sharpe above 0.3 and a positive validation net profit after every cost')}
-        {gate('3 of 5 folds', funnel.folds, funnel.scored, 'At least 3 of the 5 folds profitable and no fold beyond the drawdown cap')}
-        {gate('DSR ≥ 50%', funnel.dsr, funnel.scored, 'Validation Sharpe beats the best a random walk is expected to show after this many trials')}
-        {gate('stable neighbours', funnel.neighbours, funnel.neighboursChecked, 'One-step parameter neighbours keep a positive median expectancy (checked for promising candidates only)')}
-      </div>
+      <div className="mt-3 text-[11px] font-medium uppercase tracking-wider text-ink-3">Pass / fail funnel · each gate on its own</div>
+      <ol className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3 xl:grid-cols-6">
+        {stages.map((stage) => {
+          const ratio = stage.of > 0 ? stage.value / stage.of : 0;
+          return (
+            <li key={stage.label} title={stage.title} className="min-w-0">
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="truncate text-ink-2">{stage.label}</span>
+                <span className="num shrink-0 font-semibold text-ink">{fmtInt(stage.value)}</span>
+              </div>
+              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
+                <div className={cx('h-full rounded-full', stage.tone)} style={{ width: `${Math.max(stage.value > 0 ? 2 : 0, ratio * 100)}%` }} />
+              </div>
+              <div className="num mt-0.5 text-[10.5px] text-ink-3">
+                {stage.of > 0 ? `${fmtPct(ratio * 100, false, ratio < 0.1 && ratio > 0 ? 1 : 0)} of ${fmtInt(stage.of)}` : '–'}
+              </div>
+            </li>
+          );
+        })}
+      </ol>
     </div>
   );
 }
@@ -159,7 +188,15 @@ export default function TelemetryStrip({
   const dsrTone = dsr === null ? 'text-ink-3' : dsr >= 0.95 ? 'text-up' : dsr >= 0.5 ? 'text-warn' : 'text-ink';
 
   return (
-    <Panel className="grid grid-cols-1 divide-y divide-line sm:grid-cols-2 sm:divide-y-0 xl:grid-cols-[1.05fr_0.8fr_1.5fr_1.45fr_1.4fr] xl:divide-x">
+    <Panel>
+      <div className="border-b border-line px-4 py-3">
+        <StepHeader
+          step={2}
+          title="Discovery scanner"
+          hint="Searches the hypothesis until enough strategies pass every robustness gate – the holdout stays sealed throughout."
+        />
+      </div>
+    <div className="grid grid-cols-1 divide-y divide-line sm:grid-cols-2 sm:divide-y-0 xl:grid-cols-[1.05fr_0.8fr_1.5fr_1.45fr_1.4fr] xl:divide-x">
       <Tile label="Engine status">
         <div
           role="status"
@@ -278,7 +315,7 @@ export default function TelemetryStrip({
             </div>
             {context.universe.length > 1 && (
               <div className="num mt-0.5 truncate text-xs text-ink-3" title={context.universe.join(', ')}>
-                Robust universe: {context.universe.length} assets
+                {context.settings.poolAssets ? 'Asset pool' : 'Robust universe'}: {context.universe.length} assets
               </div>
             )}
           </>
@@ -292,6 +329,7 @@ export default function TelemetryStrip({
           </>
         )}
       </Tile>
+    </div>
       <ScanProgress telemetry={telemetry} maxEvaluations={maxEvaluations} />
     </Panel>
   );

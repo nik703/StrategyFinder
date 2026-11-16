@@ -414,6 +414,104 @@ export function donchian(src: Float64Array, period: number, upper: boolean): Flo
   return out;
 }
 
+/** Keltner channel: EMA(close, period) ± mult × ATR(period) (Wilder ATR, like `ta.atr`). */
+export function keltner(
+  high: Float64Array,
+  low: Float64Array,
+  close: Float64Array,
+  period: number,
+  mult: number,
+): { middle: Float64Array; upper: Float64Array; lower: Float64Array } {
+  const n = close.length;
+  const middle = ema(close, period);
+  const range = atr(high, low, close, period);
+  const upper = nanArray(n);
+  const lower = nanArray(n);
+  for (let i = 0; i < n; i++) {
+    const m = middle[i];
+    const r = range[i];
+    if (m === m && r === r) {
+      upper[i] = m + mult * r;
+      lower[i] = m - mult * r;
+    }
+  }
+  return { middle, upper, lower };
+}
+
+/**
+ * Volatility-squeeze release (TTM-style): the squeeze is ON while Bollinger(period, 2σ) lies inside
+ * Keltner(period, kcMult). The output is +1 on the candle the squeeze turns OFF with the close above
+ * the Bollinger basis, −1 when it turns off with the close below it, 0 otherwise (NaN in warm-up).
+ */
+export function squeezeRelease(
+  high: Float64Array,
+  low: Float64Array,
+  close: Float64Array,
+  period: number,
+  kcMult: number,
+): Float64Array {
+  const n = close.length;
+  const bb = bollinger(close, period, 2);
+  const kc = keltner(high, low, close, period, kcMult);
+  const out = nanArray(n);
+  let prevOn = -1; // -1 = unknown (warm-up)
+  for (let i = 0; i < n; i++) {
+    const bu = bb.upper[i];
+    const bl = bb.lower[i];
+    const ku = kc.upper[i];
+    const kl = kc.lower[i];
+    if (!(bu === bu && bl === bl && ku === ku && kl === kl)) {
+      prevOn = -1;
+      continue;
+    }
+    const on = bu < ku && bl > kl ? 1 : 0;
+    if (prevOn !== -1) {
+      const basis = bb.middle[i];
+      out[i] = prevOn === 1 && on === 0 ? (close[i] > basis ? 1 : close[i] < basis ? -1 : 0) : 0;
+    }
+    prevOn = on;
+  }
+  return out;
+}
+
+/**
+ * ATR range expansion: +1 when the candle's true range exceeds `mult` × ATR(period) of the previous
+ * candle and it closed up, −1 when it closed down, 0 otherwise (NaN while the ATR warms up).
+ */
+export function rangeExpansion(
+  high: Float64Array,
+  low: Float64Array,
+  close: Float64Array,
+  period: number,
+  mult: number,
+): Float64Array {
+  const n = close.length;
+  const tr = trueRange(high, low, close);
+  const a = atr(high, low, close, period);
+  const out = nanArray(n);
+  for (let i = 1; i < n; i++) {
+    const prev = a[i - 1];
+    if (prev !== prev) continue;
+    out[i] = tr[i] > mult * prev ? (close[i] > close[i - 1] ? 1 : close[i] < close[i - 1] ? -1 : 0) : 0;
+  }
+  return out;
+}
+
+/**
+ * Pullback to a moving average: +1 when the candle dipped to the average and closed back above it
+ * (Low ≤ MA < Close), −1 when it rallied to it and closed back below (High ≥ MA > Close), else 0.
+ */
+export function pullbackTouch(ma: Float64Array, high: Float64Array, low: Float64Array, close: Float64Array): Float64Array {
+  const n = close.length;
+  const out = nanArray(n);
+  for (let i = 0; i < n; i++) {
+    const m = ma[i];
+    if (m !== m) continue;
+    out[i] = low[i] <= m && close[i] > m ? 1 : high[i] >= m && close[i] < m ? -1 : 0;
+  }
+  return out;
+}
+
 /** `src` shifted `lag` bars back (NaN for the first `lag` bars) – Pine: `src[lag]`. */
 export function lagged(src: Float64Array, lag: number): Float64Array {
   const out = nanArray(src.length);
@@ -622,6 +720,41 @@ export class IndicatorCache {
   /** Lowest low of the previous `period` candles. */
   donchianLower(period: number): Float64Array {
     return this.memo(`dcL:${period}`, () => donchian(this.data.l, period, false));
+  }
+
+  private kc(period: number, mult: number, part: 'U' | 'L'): Float64Array {
+    const base = `kc:${period}:${mult}:`;
+    const hit = this.read(base + part);
+    if (hit !== undefined) return hit;
+    const res = keltner(this.data.h, this.data.l, this.data.c, period, mult);
+    this.write(base + 'U', res.upper);
+    this.write(base + 'L', res.lower);
+    return part === 'U' ? res.upper : res.lower;
+  }
+
+  /** Upper Keltner channel: EMA(period) + mult × ATR(period). */
+  kcUpper(period: number, mult: number): Float64Array {
+    return this.kc(period, mult, 'U');
+  }
+
+  /** Lower Keltner channel: EMA(period) − mult × ATR(period). */
+  kcLower(period: number, mult: number): Float64Array {
+    return this.kc(period, mult, 'L');
+  }
+
+  /** Squeeze release series (+1 / −1 / 0), see `squeezeRelease`. */
+  squeeze(period: number, kcMult: number): Float64Array {
+    return this.memo(`sq:${period}:${kcMult}`, () => squeezeRelease(this.data.h, this.data.l, this.data.c, period, kcMult));
+  }
+
+  /** Range-expansion series (+1 / −1 / 0), see `rangeExpansion`. */
+  rangeExp(period: number, mult: number): Float64Array {
+    return this.memo(`rx:${period}:${mult}`, () => rangeExpansion(this.data.h, this.data.l, this.data.c, period, mult));
+  }
+
+  /** Pullback-to-MA series (+1 / −1 / 0), see `pullbackTouch`. */
+  pullback(type: MaType, period: number): Float64Array {
+    return this.memo(`pb:${type}:${period}`, () => pullbackTouch(this.ma(type, period), this.data.h, this.data.l, this.data.c));
   }
 
   /** Moving average `lag` bars ago (to compare with its current value: the slope's sign). */

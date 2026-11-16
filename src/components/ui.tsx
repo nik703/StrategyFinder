@@ -197,3 +197,72 @@ export function LineKey({ color, dashed = false }: { color: string; dashed?: boo
     />
   );
 }
+
+/* -------------------------------------------------------------------------- */
+
+/** Numbered heading of one step of the guided workflow (1 Setup → 2 Scan → 3 Rank → 4 Workbench). */
+export function StepHeader({
+  step,
+  title,
+  hint,
+  children,
+  id,
+}: {
+  step: number;
+  title: string;
+  hint?: string;
+  children?: ReactNode;
+  id?: string;
+}): JSX.Element {
+  return (
+    <div id={id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className="num grid h-6 w-6 shrink-0 place-items-center rounded-full border border-accent/50 bg-accent/15 text-xs font-semibold text-accent-strong">
+          {step}
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-ink">{title}</h2>
+          {hint && <p className="text-xs text-ink-3">{hint}</p>}
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Tiny equity curve: a single line, green when it ends above its start, red otherwise. */
+export function Sparkline({
+  values,
+  width = 96,
+  height = 28,
+  className,
+}: {
+  values: ArrayLike<number> | null;
+  width?: number;
+  height?: number;
+  className?: string;
+}): JSX.Element {
+  const n = values?.length ?? 0;
+  if (!values || n < 2) return <span className="text-ink-3">–</span>;
+  // At most 80 points: plenty for a sparkline.
+  const step = Math.max(1, Math.floor(n / 80));
+  const points: number[] = [];
+  for (let i = 0; i < n; i += step) points.push(values[i]);
+  if ((n - 1) % step !== 0) points.push(values[n - 1]);
+  let min = Infinity;
+  let max = -Infinity;
+  for (const v of points) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const span = max - min || 1;
+  const path = points
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${((i / (points.length - 1)) * (width - 2) + 1).toFixed(1)},${(height - 1 - ((v - min) / span) * (height - 2)).toFixed(1)}`)
+    .join(' ');
+  const up = points[points.length - 1] >= points[0];
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className={cx('block', className)} aria-hidden="true">
+      <path d={path} fill="none" stroke={up ? 'var(--color-up)' : 'var(--color-down)'} strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
+}

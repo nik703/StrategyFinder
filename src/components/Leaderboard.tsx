@@ -1,6 +1,6 @@
 /**
- * Live, sortable Top-25 leaderboard. Clicking a row previews the strategy on
- * the equity chart and opens the Strategy Breakdown drawer.
+ * Step 3 – the live, sortable Top-25 leaderboard. Clicking a row opens the strategy in the
+ * Strategy Workbench below; ticking up to three rows compares them side by side.
  *
  * Risk-adjusted, selection-bias-aware figures lead: the default order is the
  * deflated Sharpe ratio, and every return figure is labelled in-sample. There is
@@ -8,13 +8,16 @@
  * strategy only, so it can never be sorted on.
  */
 
-import { ChevronDown, ChevronsUpDown, ChevronUp, Lock, Trophy } from 'lucide-react';
+import { ChevronDown, ChevronsUpDown, ChevronUp, Columns3, Lock } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
 import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
 import { overfittingRisk } from '../lib/risk';
 import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type TradeGates, type Verdict } from '../types/trading';
-import { cx, Panel, Pill } from './ui';
+import { cx, Panel, Pill, Sparkline, StepHeader } from './ui';
+
+/** Strategies that can be compared at once. */
+export const MAX_COMPARE = 3;
 
 interface LeaderboardProps {
   strategies: StrategyResult[];
@@ -27,10 +30,14 @@ interface LeaderboardProps {
   gates: TradeGates | null;
   /** True when the gates apply to trades pooled over every asset. */
   pooled: boolean;
+  /** Strategies ticked for comparison (at most `MAX_COMPARE`). */
+  compareIds: string[];
+  onToggleCompare: (strategy: StrategyResult) => void;
 }
 
 type SortKey =
   | 'rank'
+  | 'stress'
   | 'params'
   | 'gates'
   | 'dsr'
@@ -65,7 +72,9 @@ interface Row {
 const DEFAULT_SORT: SortState = { key: 'dsr', dir: 'desc' };
 
 interface Column {
-  key: SortKey | 'indicators';
+  key: SortKey | 'indicators' | 'curve';
+  /** Only shown with "All columns" switched on. */
+  detail?: boolean;
   label: string;
   title?: string;
   align: 'left' | 'right';
@@ -107,8 +116,15 @@ const COLUMNS: Column[] = [
     ),
   },
   {
+    key: 'curve',
+    label: 'Equity',
+    title: 'Equity curve over train + validation (the holdout stays sealed)',
+    align: 'left',
+    render: ({ strategy }) => <Sparkline values={strategy.equity} />,
+  },
+  {
     key: 'gates',
-    label: 'Gates',
+    label: 'Checks',
     title: 'Robustness gates passed on the search period: validation, fold consistency, neighbour stability, significance (trades + DSR ≥ 50%)',
     align: 'left',
     value: ({ strategy }) => gatesPassed(strategy),
@@ -122,15 +138,15 @@ const COLUMNS: Column[] = [
         !r.significance && 'significance',
       ].filter(Boolean);
       return (
-        <span title={r.passed ? 'Passes every robustness gate' : `Fails: ${failed.join(', ')}`}>
-          <Pill tone={r.passed ? 'up' : 'neutral'}>{r.passed ? 'Robust 4/4' : `${gatesPassed(strategy)}/4`}</Pill>
+        <span title={r.passed ? 'Passes every robustness gate on the search period' : `Fails: ${failed.join(', ')}`}>
+          <Pill tone={r.passed ? 'up' : 'neutral'}>{r.passed ? 'All 4 ✓' : `${gatesPassed(strategy)}/4`}</Pill>
         </span>
       );
     },
   },
   {
     key: 'indicators',
-    label: 'Indicators Used',
+    label: 'Strategy',
     align: 'left',
     render: ({ strategy }) => (
       <div className="min-w-[200px] max-w-[340px]">
@@ -139,7 +155,7 @@ const COLUMNS: Column[] = [
             <Pill key={badge}>{badge}</Pill>
           ))}
           <Pill tone="bench">{strategy.genome.archetype === 'TREND' ? 'Trend' : 'Mean rev.'}</Pill>
-          {strategy.genome.shortEntry !== null && <Pill tone="accent">L/S</Pill>}
+          {strategy.genome.shortEntry !== null && <Pill tone="accent">{strategy.genome.shortRegime ? 'Asym. L/S' : 'L/S'}</Pill>}
         </div>
         <div className="num mt-1 truncate text-[11px] text-ink-3" title={groupFormula(strategy.genome.longEntry)}>
           {groupFormula(strategy.genome.longEntry)}
@@ -149,7 +165,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'dsr',
-    label: 'Deflated Sharpe',
+    label: 'Beats luck (DSR)',
     title: 'Deflated Sharpe Ratio of the validation segment: probability the Sharpe is real given every strategy tried so far. 95% or more is needed for a Robust verdict.',
     align: 'right',
     value: ({ strategy }) => strategy.dsr,
@@ -160,7 +176,28 @@ const COLUMNS: Column[] = [
     ),
   },
   {
+    key: 'stress',
+    label: 'Stress test',
+    title:
+      'Monte Carlo: 500 replays of the trades with 10% skipped, the order shuffled and random slippage shocks. Share of replays that end in profit, and the 95th-percentile worst drawdown.',
+    align: 'right',
+    value: ({ strategy }) => strategy.monteCarlo?.probProfit ?? -1,
+    render: ({ strategy }) => {
+      const mc = strategy.monteCarlo;
+      if (!mc) return <span className="text-ink-3">–</span>;
+      return (
+        <span className="inline-flex flex-col items-end leading-tight">
+          <span className={cx('font-semibold', mc.passed ? 'text-up' : mc.probProfit >= 0.6 ? 'text-warn' : 'text-down')}>
+            {fmtPct(mc.probProfit * 100, false, 0)}
+          </span>
+          <span className="text-[10.5px] text-ink-3">DD95 {fmtPct(mc.drawdownP95, false, 0)}</span>
+        </span>
+      );
+    },
+  },
+  {
     key: 'haircut',
+    detail: true,
     label: 'Haircut Sharpe',
     title:
       'Validation Sharpe after a Bonferroni haircut for every strategy tried on this data window, in any run or session (Harvey & Liu). 0 = fully explained by multiple testing.',
@@ -199,6 +236,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'sharpe',
+    detail: true,
     label: 'Sharpe (in-sample)',
     title: 'Annualised Sharpe ratio over train + validation (risk-free rate 0)',
     align: 'right',
@@ -207,6 +245,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'sortino',
+    detail: true,
     label: 'Sortino (in-sample)',
     title: 'Annualised Sortino ratio over train + validation',
     align: 'right',
@@ -236,6 +275,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'winRate',
+    detail: true,
     label: 'Win Rate (%)',
     align: 'right',
     value: ({ strategy }) => strategy.search.winRate,
@@ -243,6 +283,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'profitFactor',
+    detail: true,
     label: 'Profit Factor',
     title: 'Gross profit ÷ gross loss',
     align: 'right',
@@ -251,6 +292,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'roi',
+    detail: true,
     label: 'ROI (in-sample, %)',
     title: 'Return on starting capital over train + validation – the data the search optimised on, so it is biased upwards',
     align: 'right',
@@ -259,6 +301,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'netPnl',
+    detail: true,
     label: 'Net PnL (in-sample, $)',
     title: 'Net profit after fees, slippage and financing over train + validation',
     align: 'right',
@@ -267,6 +310,7 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'alpha',
+    detail: true,
     label: 'Excess ROI vs. B&H (in-sample)',
     title: 'Strategy ROI minus Buy & Hold ROI over train + validation, in percentage points. Not risk-adjusted, so it is not alpha.',
     align: 'right',
@@ -291,8 +335,9 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'params',
+    detail: true,
     label: 'Params',
-    title: 'Number of tunable parameters (hard cap 8, fitness penalty above 4)',
+    title: 'Number of tunable parameters (hard cap 5, +1 for an Asymmetric short regime; fitness penalty above 4)',
     align: 'right',
     value: ({ strategy }) => strategy.params,
     firstDir: 'asc',
@@ -309,15 +354,29 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'fitness',
+    detail: true,
     label: 'Score',
-    title: 'Composite fitness: deflated validation Sharpe and the 25th-percentile fold score, minus drawdown, regime-collapse and complexity penalties, capped at the median of the one-step parameter neighbours',
+    title:
+      'Composite fitness: the median fold score (Sortino, Sharpe, Calmar and expectancy × frequency) plus the deflated validation Sharpe, minus drawdown, regime-collapse and complexity penalties, blended towards the one-step parameter neighbours when they are worse',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
     render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,
   },
 ];
 
-export default function Leaderboard({ strategies, selectedId, lockedId, onSelect, status, gates, pooled }: LeaderboardProps): JSX.Element {
+export default function Leaderboard({
+  strategies,
+  selectedId,
+  lockedId,
+  onSelect,
+  status,
+  gates,
+  pooled,
+  compareIds,
+  onToggleCompare,
+}: LeaderboardProps): JSX.Element {
+  const [allColumns, setAllColumns] = useState(false);
+  const columns = useMemo(() => COLUMNS.filter((column) => allColumns || !column.detail), [allColumns]);
   const gateText =
     gates === null
       ? null
@@ -353,18 +412,24 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
 
   return (
     <Panel className="overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Trophy size={16} className="text-ink-3" />
-          <h2 className="text-sm font-semibold text-ink">Top Strategies Leaderboard</h2>
-          <span className="num rounded-md border border-line bg-raised px-1.5 py-0.5 text-[11px] text-ink-2">
-            {strategies.length} / {LEADERBOARD_SIZE}
-          </span>
-        </div>
-        <p className="text-xs text-ink-3">
-          Sorted by deflated Sharpe. Return figures are in-sample (train + validation). Click a row for the breakdown and to lock one
-          strategy for the holdout.
-        </p>
+      <div className="border-b border-line px-4 py-3">
+        <StepHeader
+          step={3}
+          title={`Ranked leaderboard · ${strategies.length} / ${LEADERBOARD_SIZE}`}
+          hint="Sorted by the chance the edge is real. Returns are in-sample. Click a row to open it in the workbench; tick up to three to compare."
+        >
+          <button
+            type="button"
+            onClick={() => setAllColumns((on) => !on)}
+            aria-pressed={allColumns}
+            className={cx(
+              'inline-flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors',
+              allColumns ? 'border-accent/50 bg-accent/10 text-accent-strong' : 'border-line text-ink-2 hover:bg-hover hover:text-ink',
+            )}
+          >
+            <Columns3 size={13} /> {allColumns ? 'Key columns' : 'All columns'}
+          </button>
+        </StepHeader>
       </div>
 
       {strategies.length === 0 ? (
@@ -391,7 +456,10 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
           <table className="num w-full border-collapse text-sm">
             <thead>
               <tr className="border-b border-line bg-raised/40">
-                {COLUMNS.map((column) => {
+                <th scope="col" className="w-8 pl-4 pr-1 py-2 text-left align-bottom text-[11px] font-medium uppercase tracking-wide text-ink-3" title={`Tick up to ${MAX_COMPARE} strategies to compare them side by side`}>
+                  Cmp
+                </th>
+                {columns.map((column) => {
                   const sortable = column.value !== undefined;
                   const active = sortable && sort.key === column.key;
                   return (
@@ -401,7 +469,7 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
                       title={column.title}
                       aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
                       className={cx(
-                        'px-2.5 py-2 align-bottom text-[11px] font-medium uppercase leading-tight tracking-wide first:pl-4 last:pr-4',
+                        'px-2.5 py-2 align-bottom text-[11px] font-medium uppercase leading-tight tracking-wide last:pr-4',
                         column.align === 'right' ? 'max-w-[104px] text-right' : 'whitespace-nowrap text-left',
                         active ? 'text-ink' : 'text-ink-3',
                       )}
@@ -437,12 +505,14 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
             <tbody>
               {rows.map((row) => {
                 const selected = row.strategy.id === selectedId;
+                const compared = compareIds.includes(row.strategy.id);
+                const compareFull = !compared && compareIds.length >= MAX_COMPARE;
                 return (
                   <tr
                     key={row.strategy.id}
                     tabIndex={0}
                     aria-selected={selected}
-                    aria-label={`Rank ${row.rank}, strategy ${row.strategy.id}. Open breakdown`}
+                    aria-label={`Rank ${row.rank}, strategy ${row.strategy.id}. Open in the workbench`}
                     onClick={() => onSelect(row.strategy)}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' || event.key === ' ') {
@@ -457,11 +527,23 @@ export default function Leaderboard({ strategies, selectedId, lockedId, onSelect
                         : 'hover:bg-hover/70 focus-visible:bg-hover/70',
                     )}
                   >
-                    {COLUMNS.map((column) => (
+                    <td className="w-8 pl-4 pr-1 align-middle" onClick={(event) => event.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={compared}
+                        disabled={compareFull}
+                        onChange={() => onToggleCompare(row.strategy)}
+                        onKeyDown={(event) => event.stopPropagation()}
+                        aria-label={`Compare strategy ${row.strategy.id}`}
+                        title={compareFull ? `At most ${MAX_COMPARE} strategies can be compared` : 'Compare side by side'}
+                        className="h-3.5 w-3.5 cursor-pointer accent-[var(--color-accent)] disabled:cursor-not-allowed"
+                      />
+                    </td>
+                    {columns.map((column) => (
                       <td
                         key={column.key}
                         className={cx(
-                          'px-2.5 py-2 align-middle first:pl-4 last:pr-4',
+                          'px-2.5 py-2 align-middle last:pr-4',
                           column.align === 'right' ? 'whitespace-nowrap text-right' : 'text-left',
                         )}
                       >

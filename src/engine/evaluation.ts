@@ -206,7 +206,7 @@ export function scoreAssets(
   for (let a = 0; a < total; a++) {
     const asset = ctx.assets[a];
     const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
-    scores.push({ base: assetBaseScore(metrics), metrics });
+    scores.push({ base: assetBaseScore(metrics, asset.periodsPerYear), metrics });
     if (a === 0 && dedupe) {
       // The primary asset decides whether this is a new bet at all, before any other work is spent on it.
       tradeHash = tradeLogHash(asset.ws, asset.split.holdoutStart);
@@ -228,18 +228,22 @@ export function tradesPerYear(ctx: EvalContext, a: number, metrics: SearchMetric
   return years > 0 ? metrics.search.trades / years : 0;
 }
 
-/** Lowest trades-per-year rate over the scored assets (Infinity when none is scored). */
-function minTradesPerYear(ctx: EvalContext, scores: AssetScore[]): number {
-  let min = Infinity;
-  scores.forEach((score, a) => {
-    const rate = tradesPerYear(ctx, a, score.metrics);
-    if (rate < min) min = rate;
-  });
-  return min;
+/**
+ * Median trades-per-year rate over the universe (`missing` unscored assets count as unlimited, so a
+ * bound stays an upper bound). The median, like the universe's fitness: one quiet asset of the
+ * universe must not disqualify a strategy that trades often enough everywhere else.
+ */
+function medianTradesPerYear(ctx: EvalContext, scores: AssetScore[], missing = 0): number {
+  const rates = scores.map((score, a) => tradesPerYear(ctx, a, score.metrics));
+  for (let k = 0; k < missing; k++) rates.push(Infinity);
+  if (rates.length === 0) return Infinity;
+  rates.sort((x, y) => x - y);
+  const mid = rates.length >> 1;
+  return rates.length % 2 === 1 ? rates[mid] : rates[mid - 1] === Infinity ? Infinity : (rates[mid - 1] + rates[mid]) / 2;
 }
 
 /**
- * The sample a strategy is gated on: the primary asset's trades and the lowest per-asset trade
+ * The sample a strategy is gated on: the primary asset's trades and the median per-asset trade
  * rate, or – with a pooled universe – the trades summed over every asset (`missing` unscored
  * assets count as unlimited, so a bound stays an upper bound).
  */
@@ -252,7 +256,7 @@ export function sampleOf(
     return {
       trades: scores[0].metrics.search.trades,
       validationTrades: scores[0].metrics.validation.trades,
-      tradesPerYear: minTradesPerYear(ctx, scores),
+      tradesPerYear: medianTradesPerYear(ctx, scores, missing),
     };
   }
   if (missing > 0) return { trades: Infinity, validationTrades: Infinity, tradesPerYear: Infinity };
@@ -276,8 +280,8 @@ function fitnessCeiling(ctx: EvalContext, genome: StrategyGenome, scores: AssetS
     return score.base + deflatedTerm(deflatedSharpeAgainst(score.metrics.validation, ctx.hurdle));
   });
   for (let k = 0; k < missing; k++) assetScores.push(OPTIMISTIC);
-  // The primary asset is always scored first, so its trade counts are exact; unscored assets
-  // cannot lower the minimum trade rate below what the scored ones already show.
+  // The primary asset is always scored first, so its trade counts are exact; unscored assets count
+  // as trading without limit, so the median trade rate stays an upper bound.
   return combineFitness({
     assetScores,
     ...sampleOf(ctx, scores, missing),

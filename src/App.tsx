@@ -5,19 +5,18 @@
  * every indicator, backtest and optimisation step runs in `optimizer.worker.ts`.
  */
 
-import { Activity, Info, Lock, Pin, TriangleAlert, X } from 'lucide-react';
+import { Activity, Info, Lock, TriangleAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ComparePanel from './components/ComparePanel';
 import ControlBar from './components/ControlBar';
-import EquityChart, { BENCHMARK_COLOR, STRATEGY_COLOR } from './components/EquityChart';
-import Leaderboard from './components/Leaderboard';
-import StrategyModal from './components/StrategyModal';
+import Leaderboard, { MAX_COMPARE } from './components/Leaderboard';
+import StrategyWorkbench, { type CrossMarketState } from './components/StrategyWorkbench';
 import TelemetryStrip from './components/TelemetryStrip';
-import { VerdictPill } from './components/Leaderboard';
-import { cx, LineKey, Panel, Pill } from './components/ui';
+import { cx, Panel, StepHeader } from './components/ui';
 import { buildDataset } from './data/basket';
 import { loadMarketData } from './data/marketData';
-import { exitModeLabel, indicatorBadges } from './engine/describe';
 import {
+  crossMarketSuggestion,
   DEFAULT_CONFIG,
   defaultUniverse,
   isCrypto,
@@ -30,7 +29,7 @@ import {
   type RunConfig,
   type RunContext,
 } from './lib/config';
-import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
+import { fmtDate, fmtInt } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
 import { budgetStatus, estimateSearchWindow, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, windowBudget, type TrialWindow } from './lib/trialLedger';
 import { buildSnapshot, fetchSnapshot, type MarketSnapshot } from './lib/marketSnapshot';
@@ -44,7 +43,6 @@ import {
   type ChartAxis,
   type EngineStatus,
   type NamedDataset,
-  type PerformanceMetrics,
   type ProgressSnapshot,
   type RobustnessReport,
   type StopReason,
@@ -95,28 +93,6 @@ const EMPTY_TELEMETRY: ProgressSnapshot = {
   elapsedMs: 0,
 };
 
-interface ComparisonRow {
-  label: string;
-  format: (m: PerformanceMetrics) => string;
-  tone?: (m: PerformanceMetrics) => string;
-  /** False for trade statistics that do not apply to Buy & Hold. */
-  benchmark?: boolean;
-}
-
-/** Risk-adjusted figures first; raw returns after them. */
-const COMPARISON_ROWS: ComparisonRow[] = [
-  { label: 'Sharpe ratio', format: (m) => fmtNum(m.sharpe) },
-  { label: 'Sortino ratio', format: (m) => fmtNum(m.sortino) },
-  { label: 'Max drawdown', format: (m) => fmtPct(m.maxDrawdown) },
-  { label: 'CAGR', format: (m) => fmtPct(m.cagr, true), tone: (m) => toneClass(m.cagr) },
-  { label: 'ROI', format: (m) => fmtPct(m.roi, true), tone: (m) => toneClass(m.roi) },
-  { label: 'Net PnL', format: (m) => fmtUsd(m.netPnl, true), tone: (m) => toneClass(m.netPnl) },
-  { label: 'Win rate', format: (m) => fmtPct(m.winRate), benchmark: false },
-  { label: 'Profit factor', format: (m) => fmtNum(m.profitFactor), benchmark: false },
-  { label: 'Trades', format: (m) => fmtInt(m.trades), benchmark: false },
-  { label: 'Time in market', format: (m) => fmtPct(m.exposure, false, 0) },
-];
-
 export default function App(): JSX.Element {
   const [config, setConfig] = useState<RunConfig>(DEFAULT_CONFIG);
   const [savedTickers, setSavedTickers] = useState<string[]>(loadSavedTickers);
@@ -134,7 +110,11 @@ export default function App(): JSX.Element {
   const [context, setContext] = useState<RunContext | null>(null);
   /** Strategy pinned by clicking a leaderboard row; null = follow the current #1. */
   const [pinned, setPinned] = useState<StrategyResult | null>(null);
-  const [modalOpen, setModalOpen] = useState(false);
+  /** Strategies ticked for side-by-side comparison, by id. */
+  const [compareIds, setCompareIds] = useState<string[]>([]);
+  /** Cross-market generalization checks, by strategy id. */
+  const [crossMarket, setCrossMarket] = useState<Record<string, CrossMarketState>>({});
+  const workbenchRef = useRef<HTMLDivElement | null>(null);
   /** On-demand robustness reports, by strategy id. */
   const [analyses, setAnalyses] = useState<Record<string, Analysis>>({});
   const [pendingAnalyses, setPendingAnalyses] = useState<Record<string, boolean>>({});
@@ -274,10 +254,21 @@ export default function App(): JSX.Element {
           setAnalyses((current) => ({ ...current, [message.strategyId]: { report: message.report, verdict: message.verdict } }));
           setPendingAnalyses((current) => ({ ...current, [message.strategyId]: false }));
           break;
+        case 'cross-market':
+          setCrossMarket((current) => {
+            const previous = current[message.strategyId];
+            return { ...current, [message.strategyId]: { status: 'done', symbols: previous?.symbols ?? [], report: message.report } };
+          });
+          break;
         case 'error':
           setError(message.message);
           setPendingAnalyses({});
           setLockPending(false);
+          setCrossMarket((current) => {
+            const next: Record<string, CrossMarketState> = {};
+            for (const [id, state] of Object.entries(current)) next[id] = state.status === 'loading' ? { ...state, status: 'error', error: message.message } : state;
+            return next;
+          });
           if (!finishedRef.current) {
             setStatus('error');
             disposeWorker();
@@ -317,7 +308,8 @@ export default function App(): JSX.Element {
     setContext(null);
     setSnapshot(null);
     setPinned(null);
-    setModalOpen(false);
+    setCompareIds([]);
+    setCrossMarket({});
     setAnalyses({});
     setPendingAnalyses({});
     setLockedId(null);
@@ -506,12 +498,54 @@ export default function App(): JSX.Element {
     [lockedId, lockPending, status],
   );
 
+  /** Open a strategy in the workbench (step 4) and bring the workbench into view. */
   const selectStrategy = useCallback((strategy: StrategyResult) => {
     setPinned(strategy);
-    setModalOpen(true);
+    window.requestAnimationFrame(() => workbenchRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   }, []);
 
-  const closeModal = useCallback(() => setModalOpen(false), []);
+  const toggleCompare = useCallback((strategy: StrategyResult) => {
+    setCompareIds((current) =>
+      current.includes(strategy.id) ? current.filter((id) => id !== strategy.id) : current.length >= MAX_COMPARE ? current : [...current, strategy.id],
+    );
+  }, []);
+
+  /**
+   * Cross-market generalization check: load the unseen markets with the run's timeframe and history,
+   * then let the worker backtest the frozen rules on them (search-period dates only).
+   */
+  const runCrossMarket = useCallback(async (strategy: StrategyResult, symbols: string[]) => {
+    const worker = workerRef.current;
+    const runContext = contextRef.current;
+    const runId = runIdRef.current;
+    if (!worker || !runContext) return;
+    const unique = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))].slice(0, 8);
+    setCrossMarket((current) => ({ ...current, [strategy.id]: { status: 'loading', symbols: unique } }));
+    try {
+      const loaded = await loadMarketData(unique, runContext.interval, runContext.range);
+      if (runId !== runIdRef.current || workerRef.current !== worker) return;
+      if (loaded.usedFallback !== runContext.simulated) {
+        throw new Error(
+          runContext.simulated
+            ? 'This run used simulated data, but the check could load live candles – live and simulated prices cannot be compared.'
+            : `Could not load live candles for every market (${loaded.fallbackReason ?? 'unknown error'}).`,
+        );
+      }
+      const datasets: NamedDataset[] = unique.map((symbol) => ({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data }));
+      const request: WorkerRequest = {
+        type: 'cross-market',
+        strategyId: strategy.id,
+        genome: strategy.genome,
+        datasets,
+        runSymbols: [...runContext.universe, ...runContext.components.map((component) => component.symbol)],
+      };
+      worker.postMessage(request);
+    } catch (cause) {
+      if (runId !== runIdRef.current) return;
+      const message = cause instanceof Error ? cause.message : 'The cross-market check failed.';
+      setCrossMarket((current) => ({ ...current, [strategy.id]: { status: 'error', symbols: unique, error: message } }));
+    }
+  }, []);
 
   /** "Refresh Latest Price": fetch the newest candles for the run's assets without re-optimising. */
   const refreshSnapshot = useCallback(async () => {
@@ -532,7 +566,6 @@ export default function App(): JSX.Element {
     [leaderboard],
   );
   const displayedRank = rankOf(displayed);
-  const revealed = benchmark?.holdout != null;
   const finished = status === 'converged' || status === 'stopped';
   const busy = status === 'loading' || status === 'optimizing';
 
@@ -569,23 +602,34 @@ export default function App(): JSX.Element {
     setError(null);
   }, [budget]);
 
-  // Opening the breakdown requests a robustness report: once while the run is live
-  // (no verdict yet) and once after it has ended (with the holdout and other assets).
+  // The workbench requests a robustness report (stress curve, stability map, sensitivity): for a
+  // strategy the user picked while the run is live, and for whatever it shows once the run has ended.
+  // Following the moving #1 during a live run does not, so the search is not slowed down.
   useEffect(() => {
-    if (!modalOpen || !displayed || !workerRef.current) return;
-    if (status !== 'optimizing' && !finished) return;
+    if (!displayed || !workerRef.current) return;
+    if (!(finished || (status === 'optimizing' && pinned !== null))) return;
     const crossAssetMissing = !context?.isBasket && displayed.robustness?.crossAsset == null;
     if (displayed.robustness !== null && !crossAssetMissing) return;
     const key = `${displayed.id}|${finished ? 'final' : 'live'}`;
     if (requestedRef.current.has(key)) return;
     requestedRef.current.add(key);
     void requestAnalysis(displayed);
-  }, [modalOpen, displayed, status, finished, context, requestAnalysis]);
+  }, [displayed, pinned, status, finished, context, requestAnalysis]);
 
-  const strategyName = displayed
-    ? `Strategy ${displayed.id}${displayedRank !== null ? ` · #${displayedRank}` : ''}`
-    : null;
-  const capital = context?.settings.initialCapital ?? config.capital;
+  const compared = useMemo(
+    () => compareIds.map((id) => leaderboard.find((entry) => entry.id === id)).filter((entry): entry is StrategyResult => entry !== undefined),
+    [compareIds, leaderboard],
+  );
+  const crossSuggestion = useMemo(() => (context ? crossMarketSuggestion([...context.universe, ...context.components.map((c) => c.symbol)]).join(', ') : ''), [context]);
+  /** Where the user is in the guided workflow. */
+  const stage = displayed ? 4 : leaderboard.length > 0 ? 3 : busy || telemetry.iteration > 0 ? 2 : 1;
+
+  const STEPS = [
+    { n: 1, label: 'Setup', target: 'step-setup' },
+    { n: 2, label: 'Discover', target: 'step-scan' },
+    { n: 3, label: 'Rank & compare', target: 'step-rank' },
+    { n: 4, label: 'Workbench', target: 'step-workbench' },
+  ];
 
   return (
     <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col gap-4 px-4 py-5 sm:px-6">
@@ -596,36 +640,58 @@ export default function App(): JSX.Element {
           </div>
           <div>
             <h1 className="text-lg font-semibold leading-5 text-ink">StrategyFinder</h1>
-            <p className="text-xs text-ink-3">Discover, backtest and optimise trading strategies for stocks, crypto and weighted baskets</p>
+            <p className="text-xs text-ink-3">From market to a verified, exportable strategy – with every overfitting check in plain English</p>
           </div>
         </div>
-        <p className="text-xs text-ink-3">
-          Signals on candle close · fills at next open · fees &amp; slippage included · 60 / 20 / 20 train / validation / holdout
-        </p>
+        <nav aria-label="Workflow" className="flex flex-wrap items-center gap-1">
+          {STEPS.map((step, index) => (
+            <span key={step.n} className="inline-flex items-center gap-1">
+              <a
+                href={`#${step.target}`}
+                aria-current={stage === step.n ? 'step' : undefined}
+                className={cx(
+                  'inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs transition-colors',
+                  stage === step.n
+                    ? 'border-accent/60 bg-accent/15 font-semibold text-ink'
+                    : stage > step.n
+                      ? 'border-line text-ink-2 hover:text-ink'
+                      : 'border-line text-ink-3 hover:text-ink-2',
+                )}
+              >
+                <span className="num">{step.n}</span> {step.label}
+              </a>
+              {index < STEPS.length - 1 && <span aria-hidden="true" className="text-ink-3">›</span>}
+            </span>
+          ))}
+        </nav>
       </header>
 
-      <ControlBar
-        config={config}
-        onChange={updateConfig}
-        savedTickers={savedTickers}
-        onSaveTickers={saveTickers}
-        onRemoveTicker={forgetTicker}
-        status={status}
-        onStart={() => void start()}
-        onStop={stop}
-        budgetBlocked={budgetBlocked}
-        onExtendBudget={extendBudget}
-      />
+      <div id="step-setup" className="scroll-mt-4">
+        <ControlBar
+          config={config}
+          onChange={updateConfig}
+          savedTickers={savedTickers}
+          onSaveTickers={saveTickers}
+          onRemoveTicker={forgetTicker}
+          status={status}
+          onStart={() => void start()}
+          onStop={stop}
+          budgetBlocked={budgetBlocked}
+          onExtendBudget={extendBudget}
+        />
+      </div>
 
-      <TelemetryStrip
-        maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
-        stopReason={stopReason}
-        budget={budget}
-        status={status}
-        telemetry={telemetry}
-        benchmarkSharpe={benchmark?.validation.sharpe ?? null}
-        context={context}
-      />
+      <div id="step-scan" className="scroll-mt-4">
+        <TelemetryStrip
+          maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
+          stopReason={stopReason}
+          budget={budget}
+          status={status}
+          telemetry={telemetry}
+          benchmarkSharpe={benchmark?.validation.sharpe ?? null}
+          context={context}
+        />
+      </div>
 
       {error && (
         <div role="alert" className="flex items-start gap-2 rounded-lg border border-down/40 bg-down/10 px-3 py-2.5 text-sm text-down">
@@ -667,9 +733,9 @@ export default function App(): JSX.Element {
         <div role="status" className="flex items-start gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2.5 text-sm text-ink-2">
           <Lock size={16} className="mt-0.5 shrink-0 text-accent-strong" />
           <div className="min-w-0">
-            <span className="font-semibold text-ink">The holdout is still sealed.</span> Choose ONE strategy, open its breakdown and press{' '}
-            <span className="font-semibold text-ink">Lock &amp; reveal holdout</span>. Only that strategy&apos;s holdout is revealed, once,
-            and the reveal is recorded for every later run on the same symbols and dates.
+            <span className="font-semibold text-ink">The holdout is still sealed.</span> Compare the candidates, choose ONE and press{' '}
+            <span className="font-semibold text-ink">Lock &amp; reveal holdout</span> in its workbench. Only that strategy&apos;s holdout is
+            revealed, once, and the reveal is recorded for every later run on the same symbols and dates.
           </div>
         </div>
       )}
@@ -678,180 +744,72 @@ export default function App(): JSX.Element {
         <div className="rounded-lg border border-line bg-panel px-3 py-2 text-xs text-ink-2">{context.notes.join(' · ')}</div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
-        {/* Equity curve */}
-        <Panel className="flex h-[440px] flex-col pt-3 xl:h-auto xl:min-h-[480px]">
-          <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-3">
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-ink">Equity curve</h2>
-              <p className="num truncate text-xs text-ink-3">
-                {context ? `${context.label} · ${context.interval} · starting capital ${fmtUsd(capital)}` : 'Selected strategy vs. Buy & Hold'}
-              </p>
-            </div>
-            {displayed && (
-              <div className="flex items-center gap-2">
-                {pinned ? (
-                  <button
-                    type="button"
-                    onClick={() => setPinned(null)}
-                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-line px-2 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink"
-                    title="Stop previewing the clicked strategy and follow the current #1"
-                  >
-                    <Pin size={12} /> Follow best
-                  </button>
-                ) : (
-                  <Pill tone="accent">Following #1</Pill>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setModalOpen(true)}
-                  className="inline-flex h-7 items-center rounded-md border border-accent/40 bg-accent/10 px-2 text-xs font-medium text-accent-strong transition-colors hover:bg-accent/20"
-                >
-                  View breakdown
-                </button>
-              </div>
-            )}
-          </div>
-          <div className="min-h-0 flex-1">
-            <EquityChart
-              axis={axis}
-              benchmark={benchmark?.equity ?? null}
-              strategy={displayed?.equity ?? null}
-              strategyName={strategyName}
-              revealed={revealed}
-              initialCapital={capital}
-              interval={context?.interval ?? config.interval}
-              placeholder={
-                status === 'loading'
-                  ? 'Loading market data…'
-                  : 'Pick an asset or build a basket, then press Start Optimization to see the equity curve.'
-              }
-            />
-          </div>
-        </Panel>
-
-        {/* Strategy vs. Buy & Hold */}
-        <Panel className="flex flex-col">
-          <div className="border-b border-line px-4 py-3">
-            <h2 className="text-sm font-semibold text-ink">Strategy vs. Buy &amp; Hold</h2>
-            <p className="text-xs text-ink-3">Train + validation (in-sample) · risk-adjusted first · same candles, capital and costs</p>
-          </div>
-          {benchmark ? (
-            <div className="flex min-h-0 flex-1 flex-col">
-              <table className="num w-full text-sm">
-                <thead>
-                  <tr className="border-b border-line text-[11px] uppercase tracking-wider text-ink-3">
-                    <th scope="col" className="px-4 py-2 text-left font-medium">Metric</th>
-                    <th scope="col" className="whitespace-nowrap px-2 py-2 text-right font-medium">
-                      <span className="inline-flex items-center gap-1.5">
-                        <LineKey color={STRATEGY_COLOR} /> Strategy
-                      </span>
-                    </th>
-                    <th scope="col" className="whitespace-nowrap px-4 py-2 text-right font-medium">
-                      <span className="inline-flex items-center gap-1.5">
-                        <LineKey color={BENCHMARK_COLOR} /> Buy &amp; Hold
-                      </span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {COMPARISON_ROWS.map((row) => (
-                    <tr key={row.label} className="border-b border-line/60 last:border-b-0">
-                      <th scope="row" className="whitespace-nowrap px-4 py-[7px] text-left font-normal text-ink-2">{row.label}</th>
-                      <td className={cx('px-2 py-[7px] text-right font-medium', displayed ? (row.tone?.(displayed.search) ?? 'text-ink') : 'text-ink-3')}>
-                        {displayed ? row.format(displayed.search) : '–'}
-                      </td>
-                      <td className={cx('px-4 py-[7px] text-right', row.benchmark === false ? 'text-ink-3' : (row.tone?.(benchmark.search) ?? 'text-ink-2'))}>
-                        {row.benchmark === false ? '–' : row.format(benchmark.search)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <div className="mt-auto border-t border-line px-4 py-3">
-                {displayed ? (
-                  <>
-                    <div className="flex flex-wrap items-center gap-1">
-                      {indicatorBadges(displayed.genome).map((badge) => (
-                        <Pill key={badge}>{badge}</Pill>
-                      ))}
-                      <Pill tone={displayed.genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exitModeLabel(displayed.genome)}</Pill>
-                    </div>
-                    <p className="num mt-2 text-xs text-ink-3">
-                      Deflated Sharpe{' '}
-                      <span className={cx('font-semibold', displayed.dsr >= 0.95 ? 'text-up' : 'text-ink-2')}>
-                        {fmtPct(displayed.dsr * 100, false, 0)}
-                      </span>{' '}
-                      · {displayed.params} params ·{' '}
-                      {displayed.holdout ? (
-                        <>
-                          holdout Sharpe{' '}
-                          <span className="font-semibold text-ink">{fmtNum(displayed.holdout.sharpe)}</span> vs B&amp;H{' '}
-                          {fmtNum(benchmark.holdout?.sharpe ?? null)}
-                        </>
-                      ) : lockedId !== null ? (
-                        `holdout sealed (spent on ${lockedId})`
-                      ) : finished ? (
-                        'holdout sealed – lock one strategy to reveal it'
-                      ) : (
-                        'holdout sealed until the run ends'
-                      )}
-                    </p>
-                    {(analyses[displayed.id]?.verdict ?? displayed.verdict) !== null && (
-                      <div className="mt-2">
-                        <VerdictPill verdict={analyses[displayed.id]?.verdict ?? displayed.verdict} />
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <p className="text-xs text-ink-3">The Buy &amp; Hold baseline is ready. Strategy figures appear as soon as one is found.</p>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="grid flex-1 place-items-center px-6 py-10 text-center">
-              <p className="text-sm text-ink-3">
-                Net PnL, ROI, CAGR, max drawdown and Sharpe for Buy &amp; Hold appear here once market data has loaded.
-              </p>
-            </div>
-          )}
-        </Panel>
+      <div id="step-rank" className="scroll-mt-4">
+        <Leaderboard
+          strategies={leaderboard}
+          selectedId={displayed?.id ?? null}
+          lockedId={lockedId}
+          onSelect={selectStrategy}
+          status={status}
+          gates={gates}
+          pooled={pooledRun}
+          compareIds={compareIds}
+          onToggleCompare={toggleCompare}
+        />
       </div>
 
-      <Leaderboard
-        strategies={leaderboard}
-        selectedId={displayed?.id ?? null}
-        lockedId={lockedId}
-        onSelect={selectStrategy}
-        status={status}
-        gates={gates}
-        pooled={pooledRun}
-      />
+      {compared.length > 0 && (
+        <ComparePanel
+          strategies={compared}
+          onRemove={(id) => setCompareIds((current) => current.filter((entry) => entry !== id))}
+          onOpen={selectStrategy}
+          onClear={() => setCompareIds([])}
+        />
+      )}
+
+      <div id="step-workbench" ref={workbenchRef} className="scroll-mt-4">
+        {displayed && benchmark && context ? (
+          <StrategyWorkbench
+            strategy={displayed}
+            rank={displayedRank}
+            benchmark={benchmark}
+            context={context}
+            axis={axis}
+            testedCount={telemetry.evaluations}
+            barsPerYear={barsPerYear}
+            analysis={analyses[displayed.id] ?? null}
+            analysisPending={pendingAnalyses[displayed.id] === true}
+            finished={finished}
+            lockedId={lockedId}
+            lockPending={lockPending}
+            onLock={() => lockStrategy(displayed)}
+            snapshot={snapshot}
+            onRefreshSnapshot={refreshSnapshot}
+            pinned={pinned !== null}
+            onFollowBest={() => setPinned(null)}
+            crossMarket={crossMarket[displayed.id] ?? null}
+            crossMarketSuggestion={crossSuggestion}
+            onRunCrossMarket={(symbols) => void runCrossMarket(displayed, symbols)}
+          />
+        ) : (
+          <Panel className="px-4 py-4">
+            <StepHeader step={4} title="Strategy workbench" hint="Verdict, next-entry trigger prices, stress test, stability map, holdout reveal and Pine Script export." />
+            <p className="mt-3 text-sm text-ink-3">
+              {status === 'loading'
+                ? 'Loading market data…'
+                : busy
+                  ? 'Appears as soon as the scanner finds its first strategy.'
+                  : 'Pick a preset or a market above and press Start Discovery. The best strategy opens here automatically; click any leaderboard row to inspect another one.'}
+            </p>
+          </Panel>
+        )}
+      </div>
 
       <footer className="pb-2 text-[11px] leading-relaxed text-ink-3">
         StrategyFinder is a research tool. Backtests are hypothetical, are fitted to past data and do not guarantee future results. Nothing
-        here is financial advice.
+        here is financial advice. Signals on candle close · fills at next open · fees, slippage and financing included · 60 / 20 / 20
+        train / validation / holdout.
       </footer>
-
-      {modalOpen && displayed && benchmark && context && (
-        <StrategyModal
-          strategy={displayed}
-          rank={displayedRank}
-          benchmark={benchmark}
-          context={context}
-          testedCount={telemetry.evaluations}
-          barsPerYear={barsPerYear}
-          analysis={analyses[displayed.id] ?? null}
-          analysisPending={pendingAnalyses[displayed.id] === true}
-          finished={finished}
-          lockedId={lockedId}
-          lockPending={lockPending}
-          onLock={() => lockStrategy(displayed)}
-          snapshot={snapshot}
-          onRefreshSnapshot={refreshSnapshot}
-          onClose={closeModal}
-        />
-      )}
     </div>
   );
 }

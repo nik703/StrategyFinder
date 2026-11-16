@@ -7,12 +7,15 @@
  *   • indicators use the matching `ta.*` built-ins,
  *   • orders are placed on bar close and fill at the next bar's open,
  *   • fee + slippage are charged through `commission_value`,
- *   • SL/TP brackets are attached to the entry so they are live from the fill.
+ *   • SL/TP brackets are attached to the entry so they are live from the fill, then managed after
+ *     every close (trailing ATR stop, breakeven lock at +1R) exactly like the backtester,
+ *   • all three direction modes: Long-Only, Asymmetric L/S and Mirrored L/S,
+ *   • `use_bar_magnifier=false`, so the script runs on every TradingView plan.
  *
  * The script is plain ASCII so it survives any clipboard / editor round-trip.
  */
 
-import { SLOPE_LAG } from '../types/trading';
+import { allowsShorts, SLOPE_LAG } from '../types/trading';
 import type {
   BacktestSettings,
   BasketComponent,
@@ -101,6 +104,16 @@ function atrVar(decl: Declarations, period: number): string {
   return name;
 }
 
+/** Keltner channel EMA(period) ± mult × ATR(period) – written out so it matches StrategyFinder exactly. */
+function keltnerVars(decl: Declarations, period: number, mult: number): [upper: string, lower: string] {
+  const ema = maVar(decl, 'EMA', period);
+  const atr = atrVar(decl, period);
+  const id = `${period}_${ident(mult)}`;
+  decl.add(`kcUpper_${id}`, `kcUpper_${id} = ${ema} + ${float(mult)} * ${atr}`);
+  decl.add(`kcLower_${id}`, `kcLower_${id} = ${ema} - ${float(mult)} * ${atr}`);
+  return [`kcUpper_${id}`, `kcLower_${id}`];
+}
+
 /** Declare what a condition needs and return its Pine operands. */
 function operands(c: Condition, decl: Declarations): { left: string; right: string } {
   switch (c.ind) {
@@ -186,6 +199,37 @@ function operands(c: Condition, decl: Declarations): { left: string; right: stri
       const ma = maVar(decl, c.maType, c.period);
       return { left: ma, right: `${ma}[${SLOPE_LAG}]` };
     }
+    case 'KELTNER': {
+      const [upper, lower] = keltnerVars(decl, c.period, c.mult);
+      return { left: 'close', right: c.variant === 'upper' ? upper : lower };
+    }
+    case 'SQUEEZE': {
+      const id = `${c.period}_${ident(c.mult)}`;
+      const bb = `${c.period}_2`;
+      decl.add(`bb_${bb}`, `[bbBasis_${bb}, bbUpper_${bb}, bbLower_${bb}] = ta.bb(close, ${c.period}, 2.0)`);
+      const [kcUpper, kcLower] = keltnerVars(decl, c.period, c.mult);
+      decl.add(`squeezeOn_${id}`, `squeezeOn_${id} = bbUpper_${bb} < ${kcUpper} and bbLower_${bb} > ${kcLower}`);
+      decl.add(
+        `squeeze_${id}`,
+        `squeeze_${id} = squeezeOn_${id}[1] and not squeezeOn_${id} ? (close > bbBasis_${bb} ? 1 : close < bbBasis_${bb} ? -1 : 0) : 0 // +1 release up, -1 release down`,
+      );
+      return { left: `squeeze_${id}`, right: float(c.level) };
+    }
+    case 'RANGE_EXP': {
+      const atr = atrVar(decl, c.period);
+      const name = `rangeExp_${c.period}_${ident(c.mult)}`;
+      decl.add(
+        name,
+        `${name} = ta.tr(true) > ${float(c.mult)} * ${atr}[1] ? (close > close[1] ? 1 : close < close[1] ? -1 : 0) : 0 // wide-range candle: +1 up, -1 down`,
+      );
+      return { left: name, right: float(c.level) };
+    }
+    case 'PULLBACK': {
+      const ma = maVar(decl, c.maType, c.period);
+      const name = `pullback_${ma}`;
+      decl.add(name, `${name} = low <= ${ma} and close > ${ma} ? 1 : high >= ${ma} and close < ${ma} ? -1 : 0 // +1 support held, -1 resistance held`);
+      return { left: name, right: float(c.level) };
+    }
   }
   throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
 }
@@ -242,9 +286,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   const { sizing } = ctx.settings;
   const timeStop = genome.maxBarsInTrade;
   const { settings } = ctx;
-  const hasShorts = genome.shortEntry !== null && settings.tradeMode === 'long-short';
+  const hasShorts = genome.shortEntry !== null && allowsShorts(settings.tradeMode);
+  const asymmetric = hasShorts && genome.shortRegime != null;
   const dynamic = exit.mode === 'dynamic';
   const trailing = exit.mode === 'dynamic' && exit.trailing;
+  const breakeven = exit.breakeven === true;
   const hasTarget = exit.mode === 'static' || exit.takeProfitAtrMult !== null;
   const hasSignalExit = exit.mode === 'dynamic' && exit.longExit !== null;
   const hasShortSignalExit = exit.mode === 'dynamic' && hasShorts && exit.shortExit !== null;
@@ -258,7 +304,14 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   emitGroup(genome.longEntry, 'longEntry', 'long', 'Long entry', decl, rules);
   if (hasShorts && genome.shortEntry) {
     rules.push('');
-    emitGroup(genome.shortEntry, 'shortEntry', 'short', 'Short entry', decl, rules);
+    emitGroup(
+      genome.shortEntry,
+      'shortEntry',
+      'short',
+      asymmetric ? 'Short entry (mirrored trigger, only inside its own bear-regime filter)' : 'Short entry (mirror of the long rules)',
+      decl,
+      rules,
+    );
   }
   if (exit.mode === 'dynamic' && exit.longExit) {
     rules.push('');
@@ -281,7 +334,13 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     `//  StrategyFinder export - Strategy ${result.id}`,
     `//  Market       : ${label}`,
     `//  Timeframe    : ${TV_INTERVAL[ctx.interval]} candles (apply this script to a ${ctx.interval} chart)`,
-    `//  Mode         : ${hasShorts ? 'Long/Short (shorts mirror the long rules)' : 'Long-Only'}`,
+    `//  Mode         : ${
+      !hasShorts
+        ? 'Long-Only'
+        : asymmetric
+          ? 'Asymmetric Long/Short (shorts: mirrored trigger + their own bear-regime filter)'
+          : 'Mirrored Long/Short (shorts mirror the long rules)'
+    }`,
     `//  Archetype    : ${ARCHETYPE_LABEL[genome.archetype]}`,
     `//  Parameters   : ${countParameters(genome)} tunable values`,
     `//  Tested on    : ${ascii(ctx.venue)}`,
@@ -459,58 +518,63 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
   push('');
 
-  if (exit.mode === 'static') {
-    push(
-      '// Once filled, pin the bracket to the exact fill price.',
-      'if strategy.position_size > 0',
-      '    strategy.exit("Long exit", from_entry="Long", stop=strategy.position_avg_price * (1 - stopLossPct / 100), limit=strategy.position_avg_price * (1 + takeProfitPct / 100))',
-    );
-    if (hasShorts) {
-      push(
-        'if strategy.position_size < 0',
-        '    strategy.exit("Short exit", from_entry="Short", stop=strategy.position_avg_price * (1 + stopLossPct / 100), limit=strategy.position_avg_price * (1 - takeProfitPct / 100))',
-      );
-    }
-    push('');
-  } else if (trailing) {
-    push(
-      '// Trailing ATR stop: after every close the stop ratchets behind the best price since entry.',
-      'var float longTrail  = na',
-      'var float longPeak   = na',
-    );
-    if (hasTarget) push('var float longTarget = na');
-    push(
-      'if strategy.position_size > 0',
-      '    if strategy.position_size[1] <= 0',
-      '        longPeak  := math.max(strategy.position_avg_price, high)',
-      '        longTrail := math.max(strategy.position_avg_price - stopAtrMult * atrValue[1], longPeak - stopAtrMult * atrValue)',
-    );
-    if (hasTarget) push('        longTarget := strategy.position_avg_price + targetAtrMult * atrValue[1]');
-    push(
-      '    else',
-      '        longPeak  := math.max(longPeak, high)',
-      '        longTrail := math.max(longTrail, longPeak - stopAtrMult * atrValue)',
-      `    strategy.exit("Long exit", from_entry="Long", stop=longTrail${hasTarget ? ', limit=longTarget' : ''})`,
-    );
-    if (hasShorts) {
-      push('', 'var float shortTrail  = na', 'var float shortTrough = na');
-      if (hasTarget) push('var float shortTarget = na');
-      push(
-        'if strategy.position_size < 0',
-        '    if strategy.position_size[1] >= 0',
-        '        shortTrough := math.min(strategy.position_avg_price, low)',
-        '        shortTrail  := math.min(strategy.position_avg_price + stopAtrMult * atrValue[1], shortTrough + stopAtrMult * atrValue)',
-      );
-      if (hasTarget) push('        shortTarget := strategy.position_avg_price - targetAtrMult * atrValue[1]');
-      push(
-        '    else',
-        '        shortTrough := math.min(shortTrough, low)',
-        '        shortTrail  := math.min(shortTrail, shortTrough + stopAtrMult * atrValue)',
-        `    strategy.exit("Short exit", from_entry="Short", stop=shortTrail${hasTarget ? ', limit=shortTarget' : ''})`,
-      );
-    }
-    push('');
+  /* ---- Managed exits: exact levels, trailing stop, breakeven lock ------- */
+  // 1R = the initial stop distance. On the fill candle's close the levels are pinned to the fill
+  // price; afterwards the stop only ever moves in the trade's favour.
+  const riskExpr = exit.mode === 'static' ? 'strategy.position_avg_price * stopLossPct / 100' : 'stopAtrMult * atrValue[1]';
+  const targetExpr = (dir: 1 | -1): string =>
+    exit.mode === 'static'
+      ? `strategy.position_avg_price * (1 ${dir === 1 ? '+' : '-'} takeProfitPct / 100)`
+      : exit.takeProfitAtrMult !== null
+        ? `strategy.position_avg_price ${dir === 1 ? '+' : '-'} targetAtrMult * atrValue[1]`
+        : 'na';
+  push(
+    '// ---- Exit management ---------------------------------------------------------',
+    '// 1R = the initial stop distance. After every close the stop is re-sent: it is pinned to the fill',
+    `// price${trailing ? ', ratchets behind the best price since entry (trailing ATR stop)' : ''}${
+      breakeven ? ', moves to the entry once the trade has been 1R in profit (breakeven lock)' : ''
+    } and never moves against the trade.`,
+    'var float longStop   = na',
+    'var float longTarget = na',
+    'var float longRisk   = na',
+    'var float longPeak   = na',
+    'if strategy.position_size > 0',
+    '    if strategy.position_size[1] <= 0',
+    `        longRisk   := ${riskExpr}`,
+    '        longStop   := strategy.position_avg_price - longRisk',
+    `        longTarget := ${targetExpr(1)}`,
+    '        longPeak   := math.max(strategy.position_avg_price, high)',
+    '    else',
+    '        longPeak   := math.max(longPeak, high)',
+  );
+  if (breakeven) {
+    push('    if longPeak >= strategy.position_avg_price + longRisk // +1R reached: breakeven lock', '        longStop := math.max(longStop, strategy.position_avg_price)');
   }
+  if (trailing) push('    longStop := math.max(longStop, longPeak - stopAtrMult * atrValue)');
+  push(`    strategy.exit("Long exit", from_entry="Long", stop=longStop${hasTarget ? ', limit=longTarget' : ''})`);
+  if (hasShorts) {
+    push(
+      '',
+      'var float shortStop   = na',
+      'var float shortTarget = na',
+      'var float shortRisk   = na',
+      'var float shortTrough = na',
+      'if strategy.position_size < 0',
+      '    if strategy.position_size[1] >= 0',
+      `        shortRisk   := ${riskExpr}`,
+      '        shortStop   := strategy.position_avg_price + shortRisk',
+      `        shortTarget := ${targetExpr(-1)}`,
+      '        shortTrough := math.min(strategy.position_avg_price, low)',
+      '    else',
+      '        shortTrough := math.min(shortTrough, low)',
+    );
+    if (breakeven) {
+      push('    if shortTrough <= strategy.position_avg_price - shortRisk // +1R reached: breakeven lock', '        shortStop := math.min(shortStop, strategy.position_avg_price)');
+    }
+    if (trailing) push('    shortStop := math.min(shortStop, shortTrough + stopAtrMult * atrValue)');
+    push(`    strategy.exit("Short exit", from_entry="Short", stop=shortStop${hasTarget ? ', limit=shortTarget' : ''})`);
+  }
+  push('');
 
   if (hasSignalExit) {
     push(
@@ -537,17 +601,15 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     '    strategy.close_all(comment="Window end")',
   );
 
-  if (trailing) {
-    push(
-      '',
-      '// ---- Plots -------------------------------------------------------------------',
-      'plot(strategy.position_size > 0 ? longTrail : na, "Long trailing stop", color=color.new(color.red, 0), style=plot.style_linebr)',
-    );
-    if (hasShorts) {
-      push(
-        'plot(strategy.position_size < 0 ? shortTrail : na, "Short trailing stop", color=color.new(color.orange, 0), style=plot.style_linebr)',
-      );
-    }
+  push(
+    '',
+    '// ---- Plots -------------------------------------------------------------------',
+    'plot(strategy.position_size > 0 ? longStop : na, "Long stop", color=color.new(color.red, 0), style=plot.style_linebr)',
+  );
+  if (hasTarget) push('plot(strategy.position_size > 0 ? longTarget : na, "Long target", color=color.new(color.green, 0), style=plot.style_linebr)');
+  if (hasShorts) {
+    push('plot(strategy.position_size < 0 ? shortStop : na, "Short stop", color=color.new(color.orange, 0), style=plot.style_linebr)');
+    if (hasTarget) push('plot(strategy.position_size < 0 ? shortTarget : na, "Short target", color=color.new(color.teal, 0), style=plot.style_linebr)');
   }
 
   return `${lines.join('\n')}\n`;

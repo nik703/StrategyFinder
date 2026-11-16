@@ -24,6 +24,7 @@
  */
 
 import {
+  allowsShorts,
   REGIME_NAMES,
   SLOPE_LAG,
   TRAIN_FRACTION,
@@ -106,6 +107,14 @@ export function resolveOperands(c: Condition, ind: IndicatorCache): Operands {
       return { left: ind.data.c, right: c.variant === 'upper' ? ind.donchianUpper(c.period) : ind.donchianLower(c.period), level: 0 };
     case 'MA_SLOPE':
       return { left: ind.ma(c.maType, c.period), right: ind.maLagged(c.maType, c.period, SLOPE_LAG), level: 0 };
+    case 'KELTNER':
+      return { left: ind.data.c, right: c.variant === 'upper' ? ind.kcUpper(c.period, c.mult) : ind.kcLower(c.period, c.mult), level: 0 };
+    case 'SQUEEZE':
+      return { left: ind.squeeze(c.period, c.mult), right: null, level: c.level };
+    case 'RANGE_EXP':
+      return { left: ind.rangeExp(c.period, c.mult), right: null, level: c.level };
+    case 'PULLBACK':
+      return { left: ind.pullback(c.maType, c.period), right: null, level: c.level };
   }
   throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
 }
@@ -230,6 +239,12 @@ export class BacktestWorkspace {
   readonly tradeDir: Int8Array;
   /** 1 when the trade was closed on a candle that touched both its stop and its target. */
   readonly tradeAmbiguous: Uint8Array;
+  /** Equity at the trade's entry (before the entry fee) – the base its return is measured on. */
+  readonly tradeEquity: Float64Array;
+  /** Notional at entry as a share of `tradeEquity` (0–1): what a slippage shock is charged on. */
+  readonly tradeExposure: Float64Array;
+  /** Worst intrabar equity while the trade was open, relative to `tradeEquity` (≤ 0): its adverse excursion. */
+  readonly tradeMae: Float64Array;
   tradeCount = 0;
   /** Number of bars simulated by the last run. */
   bars = 0;
@@ -238,7 +253,17 @@ export class BacktestWorkspace {
    * end-of-data liquidation (a bookkeeping step, not a real exit). Null when flat.
    * `stop` and `target` are the levels that apply to the NEXT candle (trailing stops included).
    */
-  openPosition: { dir: 1 | -1; entryBar: number; entryPrice: number; stop: number; target: number } | null = null;
+  openPosition: {
+    dir: 1 | -1;
+    entryBar: number;
+    entryPrice: number;
+    stop: number;
+    target: number;
+    /** 1R: the initial stop distance, in price. */
+    risk: number;
+    /** True once the breakeven lock has moved the stop to the entry price. */
+    breakevenLocked: boolean;
+  } | null = null;
   /** In-market flag per bar (1 when a position is open at the close). */
   readonly inMarket: Uint8Array;
 
@@ -257,6 +282,9 @@ export class BacktestWorkspace {
     this.tradePnl = new Float64Array(n + 1);
     this.tradeDir = new Int8Array(n + 1);
     this.tradeAmbiguous = new Uint8Array(n + 1);
+    this.tradeEquity = new Float64Array(n + 1);
+    this.tradeExposure = new Float64Array(n + 1);
+    this.tradeMae = new Float64Array(n + 1);
   }
 }
 
@@ -312,10 +340,10 @@ export function runBacktest(
   };
   const exit = genome.exit;
   const dynamic = exit.mode === 'dynamic';
-  const allowShort = settings.tradeMode === 'long-short' && genome.shortEntry !== null;
+  const allowShort = allowsShorts(settings.tradeMode) && genome.shortEntry !== null;
 
   const { goLong, goShort, exitLong, exitShort, scratch, equity: eq, equityLow: eqLow, inMarket } = ws;
-  const { tradeEntryBar, tradeExitBar, tradePnl, tradeDir, tradeAmbiguous } = ws;
+  const { tradeEntryBar, tradeExitBar, tradePnl, tradeDir, tradeAmbiguous, tradeEquity, tradeExposure, tradeMae } = ws;
 
   /* ---- 1. Signals (vectorised, search window only) ------------------------- */
   // Only the arrays the simulation will actually read are computed; the others stay stale and untouched.
@@ -348,6 +376,7 @@ export function runBacktest(
   const slMult = exit.mode === 'dynamic' ? exit.stopAtrMult : 0;
   const tpMult = exit.mode === 'dynamic' && exit.takeProfitAtrMult !== null ? exit.takeProfitAtrMult : 0;
   const trailing = exit.mode === 'dynamic' && exit.trailing;
+  const breakeven = exit.breakeven === true;
   const maxBars = genome.maxBarsInTrade ?? 0;
   const riskSizing = settings.sizing.mode === 'risk';
   const riskFrac = settings.sizing.riskPct / 100;
@@ -365,8 +394,25 @@ export function runBacktest(
   let stop = 0;
   let target = 0;
   let extreme = 0;
+  /** 1R of the open trade: its initial stop distance. */
+  let risk = 0;
+  let locked = false;
+  /** Worst intrabar equity of the open trade. */
+  let tradeLow = 0;
   let trades = 0;
   let busted = false;
+  /** Book a closed trade. */
+  const record = (exitBar: number, pnl: number, ambiguous: number): void => {
+    tradeEntryBar[trades] = entryBar;
+    tradeExitBar[trades] = exitBar;
+    tradePnl[trades] = pnl;
+    tradeDir[trades] = pos;
+    tradeAmbiguous[trades] = ambiguous;
+    tradeEquity[trades] = equityBeforeEntry;
+    tradeExposure[trades] = equityBeforeEntry > 0 ? Math.min(1, (qty * entryPrice) / equityBeforeEntry) : 0;
+    tradeMae[trades] = equityBeforeEntry > 0 ? Math.min(0, tradeLow / equityBeforeEntry - 1) : 0;
+    trades++;
+  };
 
   for (let i = 0; i < n; i++) {
     // Fast path: flat, and the previous candle gave no entry signal → nothing can happen on this bar.
@@ -398,12 +444,8 @@ export function runBacktest(
           const sl = slipAt(i);
           const px = pos === 1 ? o * (1 - sl) : o * (1 + sl);
           equity = equityAfterEntryFee + pos * qty * (px - entryPrice) - qty * px * fee;
-          tradeEntryBar[trades] = entryBar;
-          tradeExitBar[trades] = i;
-          tradePnl[trades] = equity - equityBeforeEntry;
-          tradeDir[trades] = pos;
-          tradeAmbiguous[trades] = 0;
-          trades++;
+          if (equity < tradeLow) tradeLow = equity;
+          record(i, equity - equityBeforeEntry, 0);
           // A pure time-stop exit does not re-enter the SAME side on the same open; an opposite
           // entry signal still reverses the position.
           exitedAtOpen = timedOut ? pos : 0;
@@ -436,6 +478,9 @@ export function runBacktest(
             entryBar = i;
             pos = dir;
             extreme = px;
+            risk = stopDist;
+            locked = false;
+            tradeLow = equityAfterEntryFee;
             if (dir === 1) {
               stop = px - stopDist;
               target = dynamic ? (tpMult > 0 ? px + tpMult * a : Infinity) : px * (1 + tpPct);
@@ -472,20 +517,23 @@ export function runBacktest(
 
       if (px === px) {
         equity = equityAfterEntryFee + pos * qty * (px - entryPrice) - qty * px * fee;
-        tradeEntryBar[trades] = entryBar;
-        tradeExitBar[trades] = i;
-        tradePnl[trades] = equity - equityBeforeEntry;
-        tradeDir[trades] = pos;
-        tradeAmbiguous[trades] = ambiguous;
-        trades++;
+        const low = hitStop ? equity : adverse < equity ? adverse : equity;
+        if (low < tradeLow) tradeLow = low;
+        record(i, equity - equityBeforeEntry, ambiguous);
         // A stop realises the worst case; a target exit may still have dipped first.
         if (!hitStop && adverse < worst) worst = adverse;
         if (equity < worst) worst = equity;
         pos = 0;
       } else {
         if (adverse < worst) worst = adverse;
+        if (adverse < tradeLow) tradeLow = adverse;
+        /* -- 3d. Breakeven lock and trailing ATR stop, updated after the candle has closed -- */
+        if (breakeven && !locked && risk > 0 && (pos === 1 ? h >= entryPrice + risk : l <= entryPrice - risk)) {
+          // +1R reached: from the next candle on the trade can no longer turn into a full loss.
+          locked = true;
+          if (pos === 1 ? entryPrice > stop : entryPrice < stop) stop = entryPrice;
+        }
         if (trailing && atr !== null) {
-          /* -- 3d. Trailing ATR stop, updated after the candle has closed -- */
           const a = atr[i];
           if (a === a) {
             if (pos === 1) {
@@ -509,12 +557,8 @@ export function runBacktest(
     let mark = pos === 0 ? equity : equityAfterEntryFee + pos * qty * (c - entryPrice);
     if (pos !== 0 && mark <= 0) {
       // Account wiped out (only reachable through an extreme gap).
-      tradeEntryBar[trades] = entryBar;
-      tradeExitBar[trades] = i;
-      tradePnl[trades] = -equityBeforeEntry;
-      tradeDir[trades] = pos;
-      tradeAmbiguous[trades] = 0;
-      trades++;
+      tradeLow = 0;
+      record(i, -equityBeforeEntry, 0);
       pos = 0;
       equity = 0;
       mark = 0;
@@ -527,7 +571,8 @@ export function runBacktest(
   }
 
   /* ---- 4. Liquidate whatever is still open at the final close ------------ */
-  ws.openPosition = pos !== 0 && n > 0 ? { dir: pos === 1 ? 1 : -1, entryBar, entryPrice, stop, target } : null;
+  ws.openPosition =
+    pos !== 0 && n > 0 ? { dir: pos === 1 ? 1 : -1, entryBar, entryPrice, stop, target, risk, breakevenLocked: locked } : null;
   if (pos !== 0 && n > 0) {
     const last = n - 1;
     // Market order on the final close: candle `last` has closed, so its own ATR is known.
@@ -535,12 +580,8 @@ export function runBacktest(
     const px = pos === 1 ? C[last] * (1 - sl) : C[last] * (1 + sl);
     equity = equityAfterEntryFee + pos * qty * (px - entryPrice) - qty * px * fee;
     if (equity < 0) equity = 0;
-    tradeEntryBar[trades] = entryBar;
-    tradeExitBar[trades] = last;
-    tradePnl[trades] = equity - equityBeforeEntry;
-    tradeDir[trades] = pos;
-    tradeAmbiguous[trades] = 0;
-    trades++;
+    if (equity < tradeLow) tradeLow = equity;
+    record(last, equity - equityBeforeEntry, 0);
     eq[last] = equity;
     if (equity < eqLow[last]) eqLow[last] = equity;
   }
@@ -1286,6 +1327,10 @@ export function benchmarkSearch(
  * ANY of them is disqualified outright (fitness UNFIT). The bar is a number of trades per YEAR of
  * data – 15 a year on daily candles, rising slowly with the number of candles per day (≈ 26 on 4h,
  * ≈ 39 on 1h, ≈ 59 on 15m) – times the years each segment covers, with small absolute floors.
+ * (12 a year was tried in the 2026-11 review: on the AUDIT random walks it let 12–14-trade
+ * validation flukes pass every robustness gate, so the bar stays at 15. Single-market daily
+ * strategies that trade less often belong in a pooled multi-asset run, where the gates apply to
+ * the trades summed over the pool.)
  * A flat count would either disqualify every daily swing strategy or wave through intraday noise.
  * With a pooled multi-asset sample the counts are summed over the assets (see `evaluation.ts`).
  */
@@ -1342,9 +1387,44 @@ export const UNFIT = -1000;
 
 const clampTo = (v: number, min: number, max: number): number => (v < min ? min : v > max ? max : v);
 
-/** Blend of Sortino (60%) and Sharpe (40%) on a Sharpe-like scale, clamped so outliers cannot dominate. */
-function riskAdjusted(m: PerformanceMetrics): number {
-  return 0.6 * (clampTo(m.sortino, -3, 4.5) / 1.5) + 0.4 * clampTo(m.sharpe, -3, 3);
+/** Drawdown floor of the Calmar ratio, in percent: a fold that barely dipped is not "infinitely" good. */
+const CALMAR_DD_FLOOR = 2;
+/** Payoff ratio cap of the R-expectancy (a fold without a single loser is not infinitely good either). */
+const PAYOFF_CAP = 5;
+/** R per year that scores 1 in the edge term (e.g. 0.35 R × 30 trades a year ≈ 10 R). */
+const EDGE_SCALE = 10;
+
+/** Calmar ratio of a segment: CAGR / max drawdown, clamped to ±3. */
+export function calmar(m: PerformanceMetrics): number {
+  return clampTo(m.cagr / Math.max(CALMAR_DD_FLOOR, m.maxDrawdown), -3, 3);
+}
+
+/**
+ * Expectancy × frequency of a segment: the average trade in units of the average loss
+ * (win rate × payoff − loss rate, Van Tharp's R-expectancy) times trades per year – the R a year the
+ * edge earns. 0 without trades or when the bar frequency is unknown.
+ */
+export function edgeRate(m: PerformanceMetrics, periodsPerYear: number): number {
+  if (m.trades === 0 || !(m.bars > 0) || !(periodsPerYear > 0)) return 0;
+  const win = m.winRate / 100;
+  const payoff = Math.min(PAYOFF_CAP, m.payoffRatio);
+  const expectancyR = win * payoff - (1 - win);
+  return expectancyR * ((m.trades * periodsPerYear) / m.bars);
+}
+
+/**
+ * Score of one fold on a Sharpe-like scale, every input clamped so no outlier can dominate:
+ * 35% Sortino, 25% Sharpe, 20% Calmar (return over drawdown) and 20% expectancy × trade
+ * frequency (R a year). The last two reward an edge that pays for its drawdowns and repeats often
+ * enough to matter after costs – not just a smooth curve.
+ */
+export function foldScore(m: PerformanceMetrics, periodsPerYear = 0): number {
+  return (
+    0.35 * (clampTo(m.sortino, -3, 4.5) / 1.5) +
+    0.25 * clampTo(m.sharpe, -3, 3) +
+    0.2 * calmar(m) +
+    0.2 * clampTo(edgeRate(m, periodsPerYear) / EDGE_SCALE, -1.5, 3)
+  );
 }
 
 /** A strategy is consistent when at least this many of the five folds made money (scaled to its active folds). */
@@ -1379,9 +1459,25 @@ export function isActiveFold(fold: PerformanceMetrics): boolean {
   return fold.trades > 0 || fold.exposure > 0;
 }
 
-/** Risk-adjusted score of every fold of the search period, oldest first. */
-export function foldScores(m: SearchMetrics): number[] {
-  return m.folds.map(riskAdjusted);
+/** Score of every fold of the search period, oldest first (see `foldScore`). */
+export function foldScores(m: SearchMetrics, periodsPerYear = 0): number[] {
+  return m.folds.map((fold) => foldScore(fold, periodsPerYear));
+}
+
+/**
+ * The folds a strategy is judged on: when it held a position in at least `MIN_ACTIVE_FOLDS` folds,
+ * only those (a regime filter that sat out a bear year did its job); otherwise every fold. Used by
+ * BOTH the fitness and the fold gate, so the two never disagree about a flat fold.
+ */
+export function judgedFolds(folds: readonly PerformanceMetrics[]): number[] {
+  const all = folds.map((_, k) => k);
+  const active = all.filter((k) => isActiveFold(folds[k]));
+  return active.length >= MIN_ACTIVE_FOLDS ? active : all;
+}
+
+/** Profitable folds a strategy needs among `judged` folds: 3 of 5, scaled to the folds judged. */
+export function foldsNeeded(judged: number): number {
+  return Math.ceil((CONSISTENT_FOLDS / FOLDS) * judged - 1e-9);
 }
 
 /** Regime slices that carry enough bars and trades to be judged. */
@@ -1411,7 +1507,8 @@ export function isSingleRegime(regimes: readonly RegimeMetrics[] | null): boolea
  * Per-asset score, everything except the deflated-Sharpe term (which changes as
  * more strategies are tried and is therefore added separately – see `deflatedTerm`):
  *
- *   + 1.50 × MEDIAN of the fold scores (each 0.6 Sortino + 0.4 Sharpe, clamped)
+ *   + 1.50 × MEDIAN of the fold scores (Sortino, Sharpe, Calmar and expectancy × frequency, clamped –
+ *     see `foldScore`)
  *   + 0.50 when at least 3 of 5 folds made money, else − 0.50 per profitable fold short of that
  *
  *   A fold in which the strategy never held a position is FLAT: it neither made nor lost money.
@@ -1428,14 +1525,12 @@ export function isSingleRegime(regimes: readonly RegimeMetrics[] | null): boolea
  * Consistency is enforced instead by counting profitable folds, and blow-ups by the per-fold
  * drawdown. Nothing here rewards raw return over Buy & Hold.
  */
-export function assetBaseScore(m: SearchMetrics): number {
-  const scores = foldScores(m);
-  const active = m.folds.map(isActiveFold);
-  const activeCount = active.filter(Boolean).length;
-  const judged = activeCount >= MIN_ACTIVE_FOLDS ? m.folds.map((_, k) => k).filter((k) => active[k]) : m.folds.map((_, k) => k);
+export function assetBaseScore(m: SearchMetrics, periodsPerYear = 0): number {
+  const scores = foldScores(m, periodsPerYear);
+  const judged = judgedFolds(m.folds);
   let score = 1.5 * median(judged.map((k) => scores[k]));
   const profitable = judged.filter((k) => m.folds[k].roi > 0).length;
-  const needed = Math.ceil((CONSISTENT_FOLDS / FOLDS) * judged.length - 1e-9);
+  const needed = foldsNeeded(judged.length);
   score += profitable >= needed ? CONSISTENCY_BONUS : -CONSISTENCY_BONUS * (needed - profitable);
   let worstFold = 0;
   for (const fold of m.folds) if (fold.maxDrawdown > worstFold) worstFold = fold.maxDrawdown;
@@ -1486,7 +1581,7 @@ export interface FitnessInputs {
  *
  *   median of the per-asset scores (a single asset without a universe)
  *   − 1.0 when fewer than 2/3 of the universe is profitable on validation
- *   − 0.15 for every tunable parameter above 6
+ *   − 0.15 for every tunable parameter above `FREE_PARAMETERS` (4)
  *   − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
  */
 export function combineFitness(f: FitnessInputs): number {
@@ -1543,11 +1638,15 @@ export function passesValidationGate(validation: PerformanceMetrics): boolean {
   return validation.sharpe > ROBUST_MIN_VALIDATION_SHARPE && validation.netPnl > 0;
 }
 
-/** Multi-fold consistency: at least 3 of the 5 folds profitable and no fold beyond the drawdown cap. */
+/**
+ * Multi-fold consistency: 3 of 5 folds profitable – counted over the folds the strategy was active
+ * in, exactly as the fitness counts them (see `judgedFolds`) – and no fold beyond the drawdown cap.
+ */
 export function passesFoldGate(folds: readonly PerformanceMetrics[]): boolean {
   if (folds.length === 0) return false;
-  const profitable = folds.filter((fold) => fold.roi > 0).length;
-  return profitable >= CONSISTENT_FOLDS && folds.every((fold) => fold.maxDrawdown <= 100 * CATASTROPHIC_FOLD_DRAWDOWN);
+  const judged = judgedFolds(folds);
+  const profitable = judged.filter((k) => folds[k].roi > 0).length;
+  return profitable >= foldsNeeded(judged.length) && folds.every((fold) => fold.maxDrawdown <= 100 * CATASTROPHIC_FOLD_DRAWDOWN);
 }
 
 /** Net profit per trade (0 without trades). */

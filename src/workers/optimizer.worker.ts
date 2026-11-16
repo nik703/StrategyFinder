@@ -76,6 +76,7 @@ import {
   type Rng,
 } from '../engine/genome';
 import { expectedMaxSharpe, haircutSharpe, RunningStats } from '../lib/stats';
+import { monteCarloStress, summarise, tradesFrom, type McTrade } from '../engine/monteCarlo';
 import {
   DEFAULT_ROBUST_TARGET,
   DEFAULT_RUN_EVALUATIONS,
@@ -94,6 +95,9 @@ import {
   type Hypothesis,
   type StabilityGrid,
   type AssetResult,
+  type CrossMarketReport,
+  type CrossMarketRow,
+  type MonteCarloReport,
   type BenchmarkResult,
   type NamedDataset,
   type OptimizerStartPayload,
@@ -200,6 +204,17 @@ scope.onmessage = (event) => {
     }
     return;
   }
+  if (message.type === 'cross-market') {
+    try {
+      if (!session) throw new Error('No optimisation run is available.');
+      const report = crossMarketCheck(session, message.genome, message.datasets, message.runSymbols ?? []);
+      session.crossMarket.set(message.strategyId, report);
+      scope.postMessage({ type: 'cross-market', strategyId: message.strategyId, report });
+    } catch (error) {
+      fail(error);
+    }
+    return;
+  }
   if (message.type === 'lock') {
     try {
       if (!session) throw new Error('No optimisation run is available.');
@@ -272,6 +287,8 @@ interface Session extends EvalContext {
   robust: Map<string, Entry>;
   /** How many candidates cleared each gate. */
   funnel: GateFunnel;
+  /** Cross-market generalization checks the user ran, by strategy id. */
+  crossMarket: Map<string, CrossMarketReport>;
 }
 
 /** Gates for one asset of a pooled universe: the pooled gates shared out over the assets. */
@@ -320,7 +337,7 @@ function correlation(a: Float32Array, b: Float32Array): number {
 
 /** Textbook versions of the run's hypothesis: a sensible starting population that stays inside it. */
 function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: Rng): StrategyGenome[] {
-  const dynamic = (stop: number, target: number | null, trailing: boolean, reversalExit = false): StrategyGenome['exit'] => ({
+  const dynamic = (stop: number, target: number | null, trailing: boolean, reversalExit = false, breakeven = false): StrategyGenome['exit'] => ({
     mode: 'dynamic',
     atrPeriod: 14,
     stopAtrMult: stop,
@@ -329,6 +346,7 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
     reversalExit,
     longExit: null,
     shortExit: null,
+    breakeven,
   });
   const archetype = HYPOTHESES[h].archetype;
   const seed = (conditions: Condition[], exit: StrategyGenome['exit'], maxBarsInTrade: number | null = null): StrategyGenome => ({
@@ -346,6 +364,10 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
   const aboveEma = (period: number): Condition => ({ ind: 'PRICE_MA', maType: 'EMA', period, op: 'gt' });
   const rising = (period: number): Condition => ({ ind: 'MA_SLOPE', maType: 'EMA', period, op: 'gt' });
   const lowerBand: Condition = { ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 };
+  const lowerKeltner: Condition = { ind: 'KELTNER', period: 20, mult: 2, variant: 'lower', op: 'cross_above' };
+  const squeeze: Condition = { ind: 'SQUEEZE', period: 20, mult: 1.5, op: 'gt', level: 0.5 };
+  const expansion: Condition = { ind: 'RANGE_EXP', period: 14, mult: 2, op: 'gt', level: 0.5 };
+  const pullback = (period: number): Condition => ({ ind: 'PULLBACK', maType: 'EMA', period, op: 'gt', level: 0.5 });
   let seeds: StrategyGenome[];
   // Textbook versions with ONE indicator, or one trigger plus one filter from another family.
   switch (h) {
@@ -364,6 +386,11 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
         seed([donchian(20)], dynamic(2, 4, false)),
         seed([{ ind: 'BB', period: 20, mult: 2, variant: 'upper', op: 'cross_above', level: 0 }, { ind: 'VOLUME', period: 20, op: 'gt', level: 1.5 }], dynamic(2.5, null, true)),
         seed([donchian(40), aboveEma(112)], dynamic(3, 6, false)),
+        // TTM-style squeeze release ridden with a trailing stop, locked at breakeven after +1R.
+        seed([squeeze], dynamic(2.5, null, true, false, true)),
+        // Wide-range up candle in a slow uptrend, fixed ATR bracket.
+        seed([expansion, aboveEma(200)], dynamic(2, 4, false, false, true)),
+        seed([{ ind: 'KELTNER', period: 20, mult: 2, variant: 'upper', op: 'cross_above' }, rising(112)], dynamic(2.5, null, true)),
       ];
       break;
     case 'DIP_IN_UPTREND':
@@ -371,6 +398,9 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
         seed([rsi(14, 30), aboveEma(200)], dynamic(2, 3, false)),
         seed([rsi(7, 20), rising(112)], dynamic(2, 3, false)),
         seed([lowerBand, aboveEma(160)], dynamic(1.5, 2.5, false, true)),
+        // Pullback that holds the 20 EMA inside a 200 EMA uptrend, breakeven after +1R.
+        seed([pullback(20), aboveEma(200)], dynamic(2, 4, false, false, true)),
+        seed([lowerKeltner, rising(112)], dynamic(1.5, 3, false)),
       ];
       break;
     case 'RANGE_REVERSION':
@@ -378,6 +408,7 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
         seed([rsi(14, 30)], dynamic(2, 3, false)),
         seed([rsi(14, 30), adx('lt', 20)], dynamic(2, 3, false, true)),
         seed([lowerBand], dynamic(1.5, 2.5, false)),
+        seed([lowerKeltner, adx('lt', 20)], dynamic(1.5, 2.5, false)),
       ];
       break;
   }
@@ -433,8 +464,76 @@ const medianOf = (values: number[]): number => {
 };
 
 /**
+ * Monte Carlo execution stress test of a strategy's search-period trades: the primary asset's, or
+ * every asset's with a pooled universe (the pooled sample is what the strategy was gated on).
+ * Backtests the search period again, so it overwrites the assets' workspaces.
+ */
+function stressTest(s: Session, genome: StrategyGenome): MonteCarloReport | null {
+  const assets = s.pooled ? s.assets : s.assets.slice(0, 1);
+  const trades: McTrade[] = [];
+  for (const asset of assets) {
+    runBacktest(asset.ind, genome, s.settings, asset.ws, asset.split.holdoutStart);
+    trades.push(...tradesFrom(asset.ws, asset.split.holdoutStart));
+  }
+  // Seeded by the strategy itself, so the same strategy always gets the same report.
+  let seed = 0x9e3779b9;
+  for (const ch of genomeSignature(genome)) seed = Math.imul(seed ^ ch.charCodeAt(0), 0x01000193);
+  return monteCarloStress(trades, s.settings, { seed: seed >>> 0 });
+}
+
+/** Unseen assets need at least this many candles before the holdout boundary to be tested. */
+const CROSS_MARKET_MIN_BARS = 150;
+
+/**
+ * Cross-market generalization check: the exact (frozen) rules on assets the search never saw, over
+ * their candles BEFORE the run's holdout boundary (by date), so the holdout stays sealed – a
+ * correlated asset's holdout-period candles would leak the holdout.
+ */
+function crossMarketCheck(s: Session, genome: StrategyGenome, datasets: NamedDataset[], runSymbols: readonly string[]): CrossMarketReport {
+  const primary = s.assets[0];
+  const cutoff = primary.data.t[primary.split.holdoutStart];
+  const inRun = new Set([...s.assets.map((asset) => asset.symbol), ...runSymbols].map((symbol) => symbol.toUpperCase()));
+  const rows: CrossMarketRow[] = [];
+  for (const dataset of datasets) {
+    const { data, symbol } = dataset;
+    let bars = 0;
+    while (bars < data.t.length && data.t[bars] < cutoff) bars++;
+    const empty: CrossMarketRow = { symbol, unseen: !inRun.has(symbol.toUpperCase()), bars, roi: 0, sharpe: 0, maxDrawdown: 0, trades: 0, holdRoi: 0, profitable: false, note: null };
+    if (bars < CROSS_MARKET_MIN_BARS) {
+      rows.push({ ...empty, note: `Only ${bars} candles before ${new Date(cutoff).toISOString().slice(0, 10)} (${CROSS_MARKET_MIN_BARS} needed).` });
+      continue;
+    }
+    const asset = buildAsset(dataset, s.settings, 32 * 1024 * 1024);
+    runBacktest(asset.ind, genome, s.settings, asset.ws, bars);
+    const m = segmentMetrics(asset.ws.equity, 0, bars, s.settings.initialCapital, asset.periodsPerYear, asset.ws);
+    const hold = benchmarkEquity(data, s.settings, bars);
+    rows.push({
+      ...empty,
+      roi: m.roi,
+      sharpe: m.sharpe,
+      maxDrawdown: m.maxDrawdown,
+      trades: m.trades,
+      holdRoi: (hold[bars - 1] / s.settings.initialCapital - 1) * 100,
+      profitable: m.netPnl > 0,
+    });
+  }
+  const tested = rows.filter((row) => row.unseen && row.note === null);
+  const share = tested.length > 0 ? tested.filter((row) => row.profitable).length / tested.length : 0;
+  const medianSharpe = medianOf(tested.map((row) => row.sharpe));
+  return {
+    rows,
+    tested: tested.length,
+    share,
+    medianSharpe,
+    passed: tested.length >= 2 && share >= 2 / 3 - 1e-9 && medianSharpe > 0,
+    cutoff,
+  };
+}
+
+/**
  * Robustness tests on the search period only (the holdout is not touched):
- * ±20% parameter sensitivity, removal of the best trades, and the same rules on other assets.
+ * ±20% parameter sensitivity, removal of the best trades, the same rules on other assets, and
+ * the Monte Carlo execution stress test.
  */
 function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
   const baseScores = scoreAssets(s, genome).scores;
@@ -472,6 +571,8 @@ function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
     crossAsset = { rows, share: rows.filter((row) => row.profitable).length / rows.length };
   }
 
+  const monteCarlo = stressTest(s, genome);
+
   return {
     sensitivity: {
       variants: rois.length,
@@ -487,6 +588,7 @@ function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
     topTrades: { netPnl, netPnlWithout: netPnl - top, removed, profitable: netPnl - top > 0 },
     stability: stabilityGrid(s, genome),
     crossAsset,
+    monteCarlo,
   };
 }
 
@@ -604,6 +706,17 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
   if (!report.topTrades.profitable) notes.push(`Unprofitable without its ${report.topTrades.removed} best trades.`);
   if (report.crossAsset !== null && report.crossAsset.share < 2 / 3 - 1e-9) {
     notes.push(`Profitable on only ${Math.round(report.crossAsset.share * 100)}% of the other assets (two thirds needed).`);
+  }
+  const mc = report.monteCarlo;
+  if (mc && !mc.passed) {
+    notes.push(
+      `Monte Carlo stress test: ${Math.round(mc.probProfit * 100)}% of ${mc.simulations} perturbed paths end in profit (80% needed), ` +
+        `95th-percentile drawdown ${mc.drawdownP95.toFixed(1)}% (under 50% needed).`,
+    );
+  }
+  const cross = s.crossMarket.get(result.id);
+  if (cross && cross.tested > 0 && !cross.passed) {
+    notes.push(`Cross-market check: profitable on ${Math.round(cross.share * 100)}% of ${cross.tested} unseen assets, median Sharpe ${cross.medianSharpe.toFixed(2)}.`);
   }
   const lock = s.locked;
   if (lock !== null && lock.priorReveals > 0) {
@@ -822,6 +935,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     inactive: 0,
     robust: new Map(),
     funnel: { scored: 0, trades: 0, validation: 0, folds: 0, dsr: 0, neighboursChecked: 0, neighbours: 0 },
+    crossMarket: new Map(),
   };
   session = s;
   const { mode, limits, board } = s;
@@ -909,7 +1023,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   let parents: StrategyGenome[] = [];
   const refreshParents = (): void => {
     const fresh = board.filter((entry) => entry.result.foundAt >= cycleStart).map((entry) => entry.result.genome);
-    parents = cycle === 1 ? board.map((entry) => entry.result.genome) : [...hallOfFame.slice(-ELITE_SIZE), ...fresh];
+    // After a restart the cycle's own discoveries lead (and are hill-climbed); the elite follow, so
+    // they still breed through crossover and rank-biased picks without pulling every mutation back
+    // to the optimum the run had stalled on.
+    parents = cycle === 1 ? board.map((entry) => entry.result.genome) : [...fresh, ...hallOfFame.slice(-ELITE_SIZE)];
   };
   /** Rank-biased parent selection: quadratic bias towards the top of the parent population. */
   const pickParent = (): StrategyGenome => parents[Math.floor(rng() * rng() * parents.length)];
@@ -978,6 +1095,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const { scores, pointFitness, dsr } = evaluated;
     const primaryMetrics = scores[0].metrics;
     const equity = curve ?? evaluated.curve ?? primaryCurve(genome);
+    const monteCarlo = summarise(stressTest(s, genome));
     const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.genome, nb.scores).fitness);
     const haircut = haircutSharpe(primaryMetrics.validation, s.hurdleTrials, primary.periodsPerYear);
     return {
@@ -1011,6 +1129,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         assets: searchAssetResults(s, scores),
         robustness: null,
         verdict: null,
+        monteCarlo,
       },
     };
   };

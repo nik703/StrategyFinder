@@ -4,7 +4,7 @@
  */
 
 import { conditionRole } from './genome';
-import { SLOPE_LAG } from '../types/trading';
+import { allowsShorts, SLOPE_LAG } from '../types/trading';
 import type {
   Archetype,
   BacktestSettings,
@@ -81,6 +81,14 @@ export function conditionOperands(c: Condition): { left: string; right: string }
       return { left: 'Close', right: c.variant === 'upper' ? `Highest_High(${c.period})[1]` : `Lowest_Low(${c.period})[1]` };
     case 'MA_SLOPE':
       return { left: `${c.maType}(${c.period})`, right: `${c.maType}(${c.period})[${SLOPE_LAG}]` };
+    case 'KELTNER':
+      return { left: 'Close', right: `KC_${c.variant === 'upper' ? 'Upper' : 'Lower'}(${c.period},${mult(c.mult)})` };
+    case 'SQUEEZE':
+      return { left: `Squeeze_Release(${c.period},BB 2.0,KC ${fmt(c.mult, 2)})`, right: c.level > 0 ? 'up' : 'down' };
+    case 'RANGE_EXP':
+      return { left: `TR / ATR(${c.period})[1]`, right: `${mult(c.mult)} ${c.level > 0 ? 'up' : 'down'}` };
+    case 'PULLBACK':
+      return { left: c.level > 0 ? 'Low <= ' + `${c.maType}(${c.period}) < Close` : `High >= ${c.maType}(${c.period}) > Close`, right: '' };
   }
   return { left: '?', right: '?' };
 }
@@ -88,6 +96,10 @@ export function conditionOperands(c: Condition): { left: string; right: string }
 /** e.g. "RSI(14) < 34" */
 export function conditionFormula(c: Condition): string {
   const { left, right } = conditionOperands(c);
+  // Signed events read as "<event> = up / down"; a pullback is one self-contained formula.
+  if (c.ind === 'PULLBACK') return left;
+  if (c.ind === 'SQUEEZE') return `${left} = ${right}`;
+  if (c.ind === 'RANGE_EXP') return `${left} > ${mult(c.mult)}, close ${c.level > 0 ? 'up' : 'down'}`;
   return `${left} ${OP_SYMBOL[c.op]} ${right}`;
 }
 
@@ -231,6 +243,27 @@ export function conditionSentence(c: Condition): string {
         : `Close ${generic(c.op)} the lowest low of the previous ${c.period} candles${relation(c.op, '', '', '', ' (range breakdown)')}`;
     case 'MA_SLOPE':
       return `The ${c.period}-period ${c.maType} ${relation(c.op, 'is rising', 'is falling', 'turns up', 'turns down')} (vs. ${SLOPE_LAG} candles earlier)`;
+    case 'KELTNER': {
+      const channel = `Keltner channel (${c.period}-period EMA ± ${mult(c.mult)} × ATR)`;
+      return c.variant === 'upper'
+        ? `Close ${generic(c.op)} the upper ${channel}${relation(c.op, '', '', ' (volatility breakout)', '')}`
+        : `Close ${generic(c.op)} the lower ${channel}${relation(c.op, '', '', ' (rejection of the lower channel)', ' (breakdown)')}`;
+    }
+    case 'SQUEEZE':
+      return (
+        `A volatility squeeze releases: the Bollinger Bands (${c.period}, 2σ) were inside the Keltner channel ` +
+        `(${c.period}, ${fmt(c.mult, 2)} × ATR) on the previous candle and break out of it now, closing ` +
+        `${c.level > 0 ? 'above' : 'below'} the ${c.period}-period basis`
+      );
+    case 'RANGE_EXP':
+      return (
+        `A range-expansion candle: its true range exceeds ${mult(c.mult)} × the ${c.period}-period ATR of the previous candle ` +
+        `and it closes ${c.level > 0 ? 'higher' : 'lower'} than the candle before`
+      );
+    case 'PULLBACK':
+      return c.level > 0
+        ? `Price dips to the ${c.period}-period ${c.maType} (low at or below it) and closes back above it (dynamic support holds)`
+        : `Price rallies to the ${c.period}-period ${c.maType} (high at or above it) and closes back below it (dynamic resistance holds)`;
   }
   return conditionFormula(c);
 }
@@ -272,6 +305,12 @@ export function describeShortEntry(genome: StrategyGenome): RuleDescription | nu
   return describeGroup(genome.shortEntry, "Sell short at the next candle's open");
 }
 
+/** How the short rules relate to the long rules, in a few words. */
+export function shortRuleLabel(genome: StrategyGenome): string {
+  if (genome.shortEntry === null) return 'Long-Only';
+  return genome.shortRegime ? 'Asymmetric L/S' : 'Mirrored L/S';
+}
+
 export const ARCHETYPE_LABEL: Record<Archetype, string> = {
   TREND: 'Trend-following',
   MEAN_REVERSION: 'Mean reversion',
@@ -281,11 +320,18 @@ export const ARCHETYPE_LABEL: Record<Archetype, string> = {
 export function describeArchetype(genome: StrategyGenome): string {
   const second = genome.longEntry.conditions[1];
   const hasShorts = genome.shortEntry !== null;
+  const shorts = !hasShorts
+    ? '.'
+    : genome.shortRegime
+      ? '. Shorts use the mirrored trigger, but only while their own bear-market filter says the market is in a downtrend, so the short side sits out bull markets.'
+      : genome.archetype === 'TREND'
+        ? '. Shorts are the exact mirror image: it sells weakness under the same rules.'
+        : '. Shorts are the exact mirror image: it sells strength under the same rules.';
   if (genome.archetype === 'TREND') {
     return (
       'Trend-following: it buys strength. The trigger fires when price or momentum turns up' +
       (second ? ', and the filter only lets trades through in the right market conditions' : '') +
-      (hasShorts ? '. Shorts are the exact mirror image: it sells weakness under the same rules.' : '.')
+      shorts
     );
   }
   const regime = second && conditionRole(second) !== 'FILTER';
@@ -296,7 +342,7 @@ export function describeArchetype(genome: StrategyGenome): string {
       : second
         ? ', and the filter only lets trades through in the right market conditions'
         : '') +
-    (hasShorts ? '. Shorts are the exact mirror image: it sells strength under the same rules.' : '.')
+    shorts
   );
 }
 
@@ -391,6 +437,16 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
     }
   }
 
+  if (exit.breakeven) {
+    const r = exit.mode === 'static' ? `${fmt(exit.stopLossPct, 1)}% of the entry price` : `${mult(exit.stopAtrMult)} × ATR(${exit.atrPeriod})`;
+    bullets.push({
+      title: 'Breakeven lock',
+      text:
+        `Once the trade has moved 1R in favour (1R = the initial stop distance, ${r}), the stop moves to the entry price ` +
+        'after that candle closes, so a winner can no longer turn into a full loss.',
+    });
+  }
+
   if (genome.maxBarsInTrade !== null) {
     bullets.push({
       title: 'Time stop',
@@ -431,7 +487,7 @@ export function describeExit(genome: StrategyGenome, settings: BacktestSettings)
     });
   }
   const borrow = settings.borrowPctPerBar ?? 0;
-  if (borrow > 0 && settings.tradeMode === 'long-short') {
+  if (borrow > 0 && allowsShorts(settings.tradeMode)) {
     bullets.push({
       title: 'Short borrow',
       text: `Every open short pays a borrow fee of ${trimPct(borrow)}% of its notional per candle.`,
@@ -480,6 +536,7 @@ export function exitTags(genome: StrategyGenome): string[] {
     if (genome.exit.longExit) tags.push('Opposite-signal exit');
     if (genome.exit.takeProfitAtrMult === null) tags.push('No target');
   }
+  if (genome.exit.breakeven) tags.push('Breakeven lock');
   if (genome.maxBarsInTrade !== null) tags.push(`${genome.maxBarsInTrade}-bar time stop`);
   return tags;
 }
@@ -512,6 +569,14 @@ function badgeFor(c: Condition): string[] {
       return ['Donchian'];
     case 'MA_SLOPE':
       return [c.maType];
+    case 'KELTNER':
+      return ['Keltner'];
+    case 'SQUEEZE':
+      return ['Squeeze'];
+    case 'RANGE_EXP':
+      return ['Range expansion'];
+    case 'PULLBACK':
+      return [c.maType];
   }
 }
 
@@ -525,7 +590,7 @@ function allGroups(genome: StrategyGenome): { group: RuleGroup; role: string }[]
   return groups;
 }
 
-const BADGE_ORDER = ['RSI', 'MACD', 'EMA', 'SMA', 'Donchian', 'BB', 'Stoch', 'ADX', 'Volume', 'Supertrend', 'CCI', 'ATR'];
+const BADGE_ORDER = ['RSI', 'MACD', 'EMA', 'SMA', 'Donchian', 'BB', 'Keltner', 'Squeeze', 'Range expansion', 'Stoch', 'ADX', 'Volume', 'Supertrend', 'CCI', 'ATR'];
 
 /** Unique indicator names used anywhere in the strategy, in a stable order. */
 export function indicatorBadges(genome: StrategyGenome): string[] {
@@ -581,6 +646,14 @@ function usageFor(c: Condition): { name: string; params: string }[] {
       return [{ name: 'Donchian channel', params: `previous ${c.period} candles` }];
     case 'MA_SLOPE':
       return [{ name: c.maType, params: `period ${c.period} · slope over ${SLOPE_LAG} candles` }];
+    case 'KELTNER':
+      return [{ name: 'Keltner channel', params: `EMA ${c.period} ± ${mult(c.mult)} × ATR(${c.period})` }];
+    case 'SQUEEZE':
+      return [{ name: 'Bollinger / Keltner squeeze', params: `period ${c.period} · BB 2.0σ inside KC ${fmt(c.mult, 2)} × ATR` }];
+    case 'RANGE_EXP':
+      return [{ name: 'ATR range expansion', params: `true range > ${mult(c.mult)} × ATR(${c.period})[1]` }];
+    case 'PULLBACK':
+      return [{ name: c.maType, params: `period ${c.period} · touch-and-hold pullback` }];
   }
 }
 
@@ -601,7 +674,7 @@ export function listIndicators(genome: StrategyGenome): IndicatorUsage[] {
   }
   if (genome.exit.mode === 'dynamic') {
     const { exit } = genome;
-    const stop = `${exit.trailing ? 'trailing stop' : 'stop'} ×${mult(exit.stopAtrMult)}`;
+    const stop = `${exit.trailing ? 'trailing stop' : 'stop'} ×${mult(exit.stopAtrMult)}${exit.breakeven ? ' · breakeven at +1R' : ''}`;
     const target = exit.takeProfitAtrMult !== null ? ` · target ×${mult(exit.takeProfitAtrMult)}` : '';
     add('ATR', `period ${exit.atrPeriod} · ${stop}${target}`, 'Stop / target');
   }

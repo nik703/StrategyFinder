@@ -15,6 +15,8 @@ import type { BacktestSettings, StrategyGenome } from '../types/trading';
 import { cx, Pill } from './ui';
 
 interface NextEntryForecastProps {
+  /** Extra classes for the card (the margin around it). */
+  className?: string;
   genome: StrategyGenome;
   settings: BacktestSettings;
   snapshot: MarketSnapshot | null;
@@ -200,7 +202,7 @@ function nearest(f: NextEntryForecast): string {
   return `${priced.side === 'long' ? 'Long' : 'Short'} ${fmtPrice(priced.triggerPrice)} (${fmtPct(priced.movePct, true, 2)})${priced.status === 'blocked' ? ' · blocked' : ''}`;
 }
 
-export default function NextEntryForecast({ genome, settings, snapshot, onRefresh }: NextEntryForecastProps): JSX.Element {
+export default function NextEntryForecast({ className, genome, settings, snapshot, onRefresh }: NextEntryForecastProps): JSX.Element {
   const [results, setResults] = useState<ForecastResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [computing, setComputing] = useState(false);
@@ -248,7 +250,7 @@ export default function NextEntryForecast({ genome, settings, snapshot, onRefres
   };
 
   return (
-    <section className="mx-5 mb-5 rounded-xl border border-accent/30 bg-raised/40 p-4" aria-labelledby="next-entry-title">
+    <section className={cx('rounded-xl border border-accent/30 bg-raised/40 p-4', className ?? 'mx-5 mb-5')} aria-labelledby="next-entry-title">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -331,6 +333,18 @@ export default function NextEntryForecast({ genome, settings, snapshot, onRefres
                   <dd className="text-ink">{forecast.position.timeStopIn === null ? 'None' : `${forecast.position.timeStopIn} candles left`}</dd>
                 </div>
               </dl>
+              {(forecast.position.breakevenLocked || forecast.position.breakevenAt !== null) && (
+                <p className="num mt-1.5 text-xs text-ink-2">
+                  Breakeven lock:{' '}
+                  {forecast.position.breakevenLocked ? (
+                    <span className="font-medium text-up">active – the stop sits at the entry price, this trade can no longer become a full loss</span>
+                  ) : (
+                    <>
+                      moves the stop to the entry once price reaches <span className="font-medium text-ink">{fmtPrice(forecast.position.breakevenAt)}</span> (+1R)
+                    </>
+                  )}
+                </p>
+              )}
               {forecast.position.exitAtNextOpen && <p className="mt-1.5 text-xs font-medium text-warn">{forecast.position.exitAtNextOpen}</p>}
             </div>
           )}

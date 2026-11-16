@@ -296,21 +296,28 @@ describe('next-entry solver: parity with the backtester on random strategies', (
     // Volatility-scaled slippage on, so the fill check exercises the ATR-based model too.
     const atrSlip: BacktestSettings = { ...settings, slippageAtrMult: 0.1 };
     let verified = 0;
+    let asymmetricShorts = 0;
     for (let i = 0; i < 160; i++) {
-      const g = randomGenome(rng, 'long-short', DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
-      const run = i % 2 === 0 ? settings : atrSlip;
+      // Mirrored and Asymmetric L/S alternate, so both short constructions are proven against the backtester.
+      const mode = i % 4 < 2 ? 'long-short' : 'asymmetric';
+      const g = randomGenome(rng, mode, DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
+      const base = i % 2 === 0 ? settings : atrSlip;
+      const run: BacktestSettings = { ...base, tradeMode: mode };
       const f = solveNextEntry({ data, genome: g, settings: run });
       for (const side of [f.long, f.short]) {
         if (side.status === 'trigger' || side.status === 'now') {
           verifyTrigger(data, g, run, side);
           verified++;
+          if (mode === 'asymmetric' && side.side === 'short') asymmetricShorts++;
         }
         expect(side.readiness).toBeGreaterThanOrEqual(0);
         expect(side.readiness).toBeLessThanOrEqual(100);
       }
     }
     expect(verified).toBeGreaterThan(40);
-  }, 120_000);
+    // On a mostly rising market the bear-regime gate blocks most Asymmetric shorts; the ones that can fire are verified exactly.
+    expect(asymmetricShorts).toBeGreaterThan(1);
+  }, 180_000);
 
   it('the 2,000-candle window gives the same answers as the full 17,520-candle history', () => {
     const data = series('ETH-USD', '1h', '2y');

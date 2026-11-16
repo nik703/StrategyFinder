@@ -9,6 +9,7 @@ import {
   DEFAULT_RUN_EVALUATIONS,
   DEFAULT_STOCK_UNIVERSE,
   INTERVAL_MS,
+  allowsShorts,
   type CandleSeries,
 } from '../types/trading';
 import type {
@@ -88,6 +89,17 @@ export const DEFAULT_BORROW_PCT_YEAR = 2;
 export const DEFAULT_SLIPPAGE_ATR_MULT = 0.03;
 
 export const isCrypto = (symbol: string): boolean => /-(USD|USDT|USDC)$/.test(symbol.trim().toUpperCase());
+
+/** Liquid markets the cross-market check suggests, by asset class (the run's own symbols are skipped). */
+const CROSS_MARKET_CRYPTO = ['SOL-USD', 'BNB-USD', 'XRP-USD', 'ADA-USD', 'AVAX-USD', 'ETH-USD', 'BTC-USD', 'DOGE-USD', 'LINK-USD', 'LTC-USD'];
+const CROSS_MARKET_STOCKS = ['QQQ', 'IWM', 'DIA', 'SPY', 'MSFT', 'GOOGL', 'AMZN', 'AAPL', 'META', 'NVDA'];
+
+/** Three correlated markets the run never saw, for the cross-market generalization check. */
+export function crossMarketSuggestion(runSymbols: readonly string[]): string[] {
+  const used = new Set(runSymbols.map((symbol) => symbol.toUpperCase()));
+  const crypto = runSymbols.filter(isCrypto).length >= runSymbols.length / 2;
+  return (crypto ? CROSS_MARKET_CRYPTO : CROSS_MARKET_STOCKS).filter((symbol) => !used.has(symbol)).slice(0, 3);
+}
 
 export const defaultUniverse = (symbol: string): string =>
   (isCrypto(symbol) ? DEFAULT_CRYPTO_UNIVERSE : DEFAULT_STOCK_UNIVERSE).join(', ');
@@ -208,11 +220,12 @@ export function tradesCrypto(config: RunConfig): boolean {
 export type Financing = 'none' | 'funding' | 'borrow';
 
 /**
- * Long-Only runs are treated as spot positions: no financing. Long/Short crypto is traded as a
- * perpetual, so every position pays funding; Long/Short stocks pay a borrow fee on the shorts.
+ * Long-Only runs are treated as spot positions: no financing. Long/Short crypto (Asymmetric or
+ * Mirrored) is traded as a perpetual, so every position pays funding; Long/Short stocks pay a
+ * borrow fee on the shorts.
  */
 export function financingFor(config: RunConfig): Financing {
-  if (config.tradeMode !== 'long-short') return 'none';
+  if (!allowsShorts(config.tradeMode)) return 'none';
   return tradesCrypto(config) ? 'funding' : 'borrow';
 }
 

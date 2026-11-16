@@ -254,6 +254,8 @@ interface YahooChart {
           close?: Array<number | null>;
           volume?: Array<number | null>;
         }>;
+        /** Daily candles only: the close adjusted for dividends and splits. */
+        adjclose?: Array<{ adjclose?: Array<number | null> }>;
       };
     }> | null;
   };
@@ -293,6 +295,9 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
   const timestamps = result?.timestamp;
   const quote = result?.indicators?.quote?.[0];
   if (!result || !timestamps || !quote) throw new UpstreamError(`Yahoo Finance returned no data for ${symbol}`);
+  // Daily candles are dividend-adjusted: every price of a candle is scaled by adjclose / close, so a
+  // long position earns the dividends Buy & Hold earns and ex-dividend gaps are not mistaken for moves.
+  const adjusted = intraday ? undefined : result.indicators?.adjclose?.[0]?.adjclose;
 
   const offsetMs = (result.meta?.gmtoffset ?? 0) * 1000;
   const candles: Candle[] = [];
@@ -304,13 +309,15 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
     const c = quote.close?.[i];
     const v = quote.volume?.[i];
     if (typeof ts !== 'number' || !isPrice(o) || !isPrice(h) || !isPrice(l) || !isPrice(c)) continue;
+    const adj = adjusted?.[i];
+    const k = isPrice(adj) ? adj / c : 1;
     const ms = ts * 1000;
     const t = intraday
       ? // Intraday: floor to the start of the UTC bucket (hourly bars of US sessions start at :30).
         Math.floor(ms / bucket) * bucket
       : // Daily: 00:00 UTC of the exchange-local trading date.
         Math.floor((ms + offsetMs) / DAY_MS) * DAY_MS;
-    candles.push({ t, o, h, l, c, v: typeof v === 'number' && Number.isFinite(v) ? v : 0 });
+    candles.push({ t, o: o * k, h: h * k, l: l * k, c: c * k, v: typeof v === 'number' && Number.isFinite(v) ? v : 0 });
   }
   if (candles.length === 0) throw new UpstreamError(`Yahoo Finance returned no candles for ${symbol}`);
 

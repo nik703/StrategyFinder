@@ -639,6 +639,79 @@ describe('optimizer worker', () => {
   });
 });
 
+describe('Monte Carlo stress test and cross-market generalization check', () => {
+  it('stress-tests every leaderboard strategy and checks its frozen rules on unseen markets with the holdout sealed', async () => {
+    const settings = settingsFor('asymmetric');
+    const btc = dataset('BTC-USD', '1d', '5y');
+    const messages = await runOptimizer([btc], settings, { seed: 77, maxEvaluations: 400, hypothesis: 'VOL_BREAKOUT' });
+    const ready = messages[0] as Of<'ready'>;
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.type).toBe('done');
+    expect(done.strategies.length).toBeGreaterThan(0);
+    for (const s of done.strategies) {
+      // Asymmetric L/S: every strategy carries its own short regime filter.
+      expect(s.genome.shortRegime).toBeTruthy();
+      expect(s.genome.shortEntry?.conditions[1]).toEqual(s.genome.shortRegime);
+      // Every leaderboard entry carries the headline Monte Carlo numbers (no chart bands).
+      const mc = s.monteCarlo;
+      expect(mc).toBeTruthy();
+      if (!mc) continue;
+      expect(mc.simulations).toBeGreaterThanOrEqual(200);
+      expect(mc.probProfit).toBeGreaterThanOrEqual(0);
+      expect(mc.probProfit).toBeLessThanOrEqual(1);
+      expect(mc.drawdownP95).toBeGreaterThanOrEqual(0);
+      expect('bands' in mc).toBe(false);
+      expect(mc.trades).toBe(s.search.trades);
+    }
+
+    const top = done.strategies[0];
+    // The on-demand analysis carries the full report, with the equity-path bands for the chart.
+    const analysis = request({ type: 'analyze', strategyId: top.id, genome: top.genome }) as Of<'analysis'>;
+    expect(analysis.type).toBe('analysis');
+    expect(analysis.report.monteCarlo?.bands.p50.length).toBeGreaterThan(10);
+    expect(analysis.report.monteCarlo?.probProfit).toBe(top.monteCarlo?.probProfit);
+
+    // Cross-market check: two unseen assets and one the run was scored on.
+    const sol = dataset('SOL-USD', '1d', '5y');
+    const bnb = dataset('BNB-USD', '1d', '5y');
+    const reply = request({ type: 'cross-market', strategyId: top.id, genome: top.genome, datasets: [sol, bnb, btc] }) as Of<'cross-market'>;
+    expect(reply.type).toBe('cross-market');
+    const report = reply.report;
+    expect(report.rows.map((row) => row.symbol)).toEqual(['SOL-USD', 'BNB-USD', 'BTC-USD']);
+    expect(report.rows.map((row) => row.unseen)).toEqual([true, true, false]);
+    expect(report.tested).toBe(2);
+    // The holdout stays sealed: only candles before the run's holdout boundary are traded.
+    const cutoff = ready.axis.time[ready.axis.holdoutPos];
+    expect(report.cutoff).toBe(cutoff);
+    for (const row of report.rows) {
+      expect(row.note).toBeNull();
+      expect(row.bars).toBeLessThanOrEqual(ready.axis.holdoutIndex + 1);
+      expect(row.bars).toBeGreaterThan(ready.axis.holdoutIndex - 5);
+    }
+    // Frozen rules: exactly a backtest of the same genome over those candles.
+    const ws = new BacktestWorkspace(sol.data.c.length);
+    runBacktest(new IndicatorCache(sol.data), top.genome, settings, ws, report.rows[0].bars);
+    const m = segmentMetrics(ws.equity, 0, report.rows[0].bars, settings.initialCapital, barsPerYear(sol.data.t), ws);
+    expect(report.rows[0].roi).toBeCloseTo(m.roi, 9);
+    expect(report.rows[0].trades).toBe(m.trades);
+    const unseen = report.rows.filter((row) => row.unseen);
+    expect(report.share).toBeCloseTo(unseen.filter((row) => row.profitable).length / unseen.length, 12);
+    expect(report.passed).toBe(report.share >= 2 / 3 - 1e-9 && report.medianSharpe > 0);
+
+    // A leg of the run (e.g. of a basket) is never counted as unseen.
+    const legs = request({ type: 'cross-market', strategyId: top.id, genome: top.genome, datasets: [sol], runSymbols: ['SOL-USD'] }) as Of<'cross-market'>;
+    expect(legs.report.rows[0].unseen).toBe(false);
+    expect(legs.report.tested).toBe(0);
+
+    // A history that ends before enough candles exist is reported, not traded.
+    const short = { symbol: 'NEW-USD', data: { ...sol.data, t: sol.data.t.map((t) => t + 4 * 365 * 86_400_000) } };
+    const late = request({ type: 'cross-market', strategyId: top.id, genome: top.genome, datasets: [short] }) as Of<'cross-market'>;
+    expect(late.report.tested).toBe(0);
+    expect(late.report.rows[0].note).toMatch(/candles before/);
+    expect(late.report.passed).toBe(false);
+  }, 300_000);
+});
+
 describe('acceptance: pure noise must not look like an edge', () => {
   /*
    * The walks of docs/AUDIT.md §0, reproduced exactly: 1,826 daily candles (≈ 5 years), 3.5% daily

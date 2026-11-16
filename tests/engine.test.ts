@@ -3,6 +3,10 @@ import { buildDataset, normalizeWeights } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
 import {
   assetBaseScore,
+  calmar,
+  edgeRate,
+  foldScore,
+  judgedFolds,
   collapsedRegimes,
   emptyMetrics,
   CATASTROPHIC_FOLD_DRAWDOWN,
@@ -71,6 +75,8 @@ import {
   genomeSignature,
   GRIDS,
   isCoherent,
+  isEventCondition,
+  isShortRegime,
   LOOKBACK_GRID,
   MAX_PARAMETERS,
   mirrorCondition,
@@ -104,6 +110,7 @@ import {
   type RegimeMetrics,
   type StrategyGenome,
   type StrategyResult,
+  type TradeMode,
 } from '../src/types/trading';
 
 const NOW = Date.UTC(2026, 0, 15);
@@ -398,7 +405,7 @@ describe('event triggers, reversals and new primitives', () => {
     const rng = mulberry32(3);
     for (let i = 0; i < 400; i++) {
       const g = randomGenome(rng, 'long-only', DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
-      expect(['cross_above', 'cross_below']).toContain(g.longEntry.conditions[0].op);
+      expect(isEventCondition(g.longEntry.conditions[0])).toBe(true);
     }
   });
 });
@@ -871,7 +878,8 @@ describe('backtester', () => {
     // A trend follower that loses a little in two sideways folds keeps most of its score: the
     // median, not the second-worst fold, is graded, and 3 of 5 profitable folds earn the bonus.
     const trend = assetBaseScore(of([1.2, -0.2, 1.0, -0.1, 0.9]));
-    expect(trend).toBeCloseTo(1.5 * (0.6 * (1.35 / 1.5) + 0.4 * 0.9) + CONSISTENCY_BONUS, 9);
+    // Fold score: 35% Sortino / 1.5 + 25% Sharpe + 20% Calmar + 20% expectancy × frequency (both 0 here).
+    expect(trend).toBeCloseTo(1.5 * (0.35 * (1.35 / 1.5) + 0.25 * 0.9) + CONSISTENCY_BONUS, 9);
     expect(assetBaseScore(of([1.2, -0.2, -0.3, -0.1, 0.9]))).toBeLessThan(trend - 2 * CONSISTENCY_BONUS);
     // A catastrophic drawdown in any single fold costs at least 3 points.
     const blowUp = asMetrics([fold(1.2), fold(-0.2), fold(1.0, 8, 100 * CATASTROPHIC_FOLD_DRAWDOWN + 10), fold(-0.1), fold(0.9)]);
@@ -879,7 +887,7 @@ describe('backtester', () => {
     // Flat folds (no position at all – a regime filter sitting out a bear year) are set aside once
     // the strategy was active in at least three folds ...
     const sitsOut = asMetrics([fold(0, 0), fold(0, 0), fold(1.0), fold(0.8), fold(-0.2)]);
-    expect(assetBaseScore(sitsOut)).toBeCloseTo(1.5 * (0.6 * (1.2 / 1.5) + 0.4 * 0.8) + CONSISTENCY_BONUS, 9);
+    expect(assetBaseScore(sitsOut)).toBeCloseTo(1.5 * (0.35 * (1.2 / 1.5) + 0.25 * 0.8) + CONSISTENCY_BONUS, 9);
     // ... but not before: two active folds out of five are judged on all five.
     const barelyActive = asMetrics([fold(0, 0), fold(0, 0), fold(0, 0), fold(1.0), fold(0.8)]);
     expect(assetBaseScore(barelyActive)).toBeCloseTo(0 - 1 * CONSISTENCY_BONUS, 9);
@@ -887,6 +895,35 @@ describe('backtester', () => {
     // The fold boundaries cut the search period into five equal, sequential pieces.
     const bounds = foldBounds(splitFor(1000));
     expect(bounds).toEqual([0, 160, 320, 480, 640, 800]);
+  });
+
+  it('rewards Calmar and expectancy x frequency in every fold, and judges flat folds the same way in the gate', () => {
+    const m = (over: Partial<PerformanceMetrics>): PerformanceMetrics => ({ ...emptyMetrics(), ...over });
+    // Calmar: CAGR over max drawdown (2% floor), clamped to ±3.
+    expect(calmar(m({ cagr: 30, maxDrawdown: 15 }))).toBeCloseTo(2, 12);
+    expect(calmar(m({ cagr: 30, maxDrawdown: 0.5 }))).toBe(3);
+    expect(calmar(m({ cagr: -10, maxDrawdown: 20 }))).toBeCloseTo(-0.5, 12);
+    // R-expectancy x trades a year: 45% winners at 2:1 payoff = 0.35 R a trade; 20 trades over 365 daily bars.
+    const edge = m({ trades: 20, winRate: 45, payoffRatio: 2, bars: 365 });
+    expect(edgeRate(edge, 365)).toBeCloseTo(0.35 * 20, 9);
+    expect(edgeRate(edge, 0)).toBe(0); // unknown bar frequency
+    expect(edgeRate(m({ trades: 0, bars: 365 }), 365)).toBe(0);
+    // More trades with the same per-trade edge score higher; a losing edge scores lower.
+    const often = m({ trades: 60, winRate: 45, payoffRatio: 2, bars: 365, sharpe: 1, sortino: 1.5, cagr: 20, maxDrawdown: 10 });
+    const rarely = { ...often, trades: 10 };
+    const losing = { ...often, winRate: 25 };
+    expect(foldScore(often, 365)).toBeGreaterThan(foldScore(rarely, 365));
+    expect(foldScore(losing, 365)).toBeLessThan(foldScore(rarely, 365));
+    // The fold gate now sets flat folds aside exactly like the fitness: a regime filter that sat out
+    // two folds and made money in two of the three it traded passes (it failed before the review).
+    const fold = (roi: number, trades = 8, maxDrawdown = 5): PerformanceMetrics => m({ roi, trades, exposure: trades > 0 ? 30 : 0, maxDrawdown });
+    const sitsOut = [fold(0, 0), fold(0, 0), fold(4), fold(-1), fold(3)];
+    expect(passesFoldGate(sitsOut)).toBe(true);
+    expect(judgedFolds(sitsOut)).toEqual([2, 3, 4]);
+    // Below three active folds every fold counts, flat ones as not profitable.
+    expect(passesFoldGate([fold(0, 0), fold(0, 0), fold(0, 0), fold(4), fold(3)])).toBe(false);
+    // One losing active fold of three is fine; two are not.
+    expect(passesFoldGate([fold(0, 0), fold(0, 0), fold(-2), fold(-1), fold(3)])).toBe(false);
   });
 
   it('penalises regime collapse and disqualifies one-regime strategies', () => {
@@ -997,13 +1034,12 @@ function numericParams(c: Condition): number[] {
   return out;
 }
 
-function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): void {
+function assertValid(genome: StrategyGenome, mode: TradeMode): void {
   // Structure.
   expect(genome.longEntry.logic).toBe('AND');
   expect(genome.longEntry.conditions.length).toBeGreaterThanOrEqual(1);
   expect(genome.longEntry.conditions.length).toBeLessThanOrEqual(3);
   expect(isCoherent(genome)).toBe(true);
-  expect(countParameters(genome)).toBeLessThanOrEqual(MAX_PARAMETERS);
   expect('sizing' in genome).toBe(false);
 
   // Hypothesis (search-built genomes) or archetype (hand-built ones).
@@ -1013,8 +1049,9 @@ function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): 
     expect(conformsTo(genome)).toBe(true);
     expect(genome.archetype).toBe(HYPOTHESES[genome.hypothesis].archetype);
     // The entry trigger is always a discrete event, never a state that holds bar after bar.
-    expect(['cross_above', 'cross_below']).toContain(trigger.op);
+    expect(isEventCondition(trigger)).toBe(true);
     for (const filter of rest) expect(['gt', 'lt']).toContain(filter.op);
+    for (const filter of rest) expect(isEventCondition(filter)).toBe(false);
   } else if (genome.archetype === 'TREND') {
     expect(role).toBe('TREND_UP');
     for (const second of rest) expect(conditionRole(second)).toBe('FILTER');
@@ -1023,9 +1060,16 @@ function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): 
     for (const second of rest) expect(['FILTER', 'TREND_UP']).toContain(conditionRole(second));
   }
 
-  // Shorts are the exact mirror of the longs.
+  // Shorts: none, the exact mirror of the longs, or the mirrored trigger inside the short's own bear regime.
   if (mode === 'long-only') expect(genome.shortEntry).toBeNull();
-  else expect(genome.shortEntry).toEqual(mirrorGroup(genome.longEntry));
+  else if (mode === 'long-short') expect(genome.shortEntry).toEqual(mirrorGroup(genome.longEntry));
+  else {
+    expect(genome.shortRegime).toBeTruthy();
+    expect(isShortRegime(genome.shortRegime as Condition)).toBe(true);
+    expect(genome.shortEntry?.conditions).toEqual([mirrorCondition(trigger), genome.shortRegime]);
+  }
+  if (mode !== 'asymmetric') expect(genome.shortRegime).toBeUndefined();
+  expect(countParameters(genome)).toBeLessThanOrEqual(MAX_PARAMETERS + (mode === 'asymmetric' ? 1 : 0));
 
   // Grids.
   for (const c of conditionsOf(genome)) {
@@ -1057,7 +1101,7 @@ function assertValid(genome: StrategyGenome, mode: 'long-only' | 'long-short'): 
     if (genome.archetype === 'MEAN_REVERSION' && genome.hypothesis === undefined) expect(exit.reversalExit).toBe(false);
     if (exit.reversalExit) {
       expect(exit.longExit?.conditions).toEqual([mirrorCondition(trigger)]);
-      if (mode === 'long-short') expect(exit.shortExit?.conditions).toEqual([trigger]);
+      if (mode !== 'long-only') expect(exit.shortExit?.conditions).toEqual([trigger]);
       else expect(exit.shortExit).toBeNull();
     } else {
       expect(exit.longExit).toBeNull();
@@ -1129,7 +1173,7 @@ describe('genome', () => {
   it('generates, mutates and recombines only genomes built from the run\'s hypothesis', () => {
     const rng = mulberry32(42);
     const families = new Set<string>();
-    for (const mode of ['long-only', 'long-short'] as const) {
+    for (const mode of ['long-only', 'long-short', 'asymmetric'] as const) {
       for (const h of HYPOTHESIS_IDS) {
         let genome = randomGenome(rng, mode, DEFAULT_LIMITS, h);
         let reversals = 0;
@@ -1178,7 +1222,9 @@ describe('genome', () => {
       }
     }
     // The building blocks: event triggers, slow regime states and confirmation states – no oscillator soup.
-    expect([...families].sort()).toEqual(['ADX', 'BB', 'DONCHIAN', 'MACD', 'MA_CROSS', 'MA_SLOPE', 'PRICE_MA', 'RSI', 'VOLUME']);
+    expect([...families].sort()).toEqual([
+      'ADX', 'BB', 'DONCHIAN', 'KELTNER', 'MACD', 'MA_CROSS', 'MA_SLOPE', 'PRICE_MA', 'PULLBACK', 'RANGE_EXP', 'RSI', 'SQUEEZE', 'VOLUME',
+    ]);
   });
 
   it('starts about 60% of random strategies as a single indicator, the rest with one orthogonal filter', () => {
@@ -1493,7 +1539,7 @@ describe('descriptions and Pine export', () => {
 
   it('exports syntactically well-formed Pine Script v5 for every kind of genome', () => {
     const rng = mulberry32(99);
-    for (const mode of ['long-only', 'long-short'] as const) {
+    for (const mode of ['long-only', 'long-short', 'asymmetric'] as const) {
       for (const sizing of [RISK.sizing, SETTINGS.sizing, { mode: 'risk', riskPct: 1, compounding: true }] as const) {
         const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
         for (let i = 0; i < 150; i++) {
@@ -1508,7 +1554,14 @@ describe('descriptions and Pine export', () => {
           expect(script).toContain(`Archetype    : ${ARCHETYPE_LABEL[genome.archetype]}`);
           expect(script).toContain(`Parameters   : ${countParameters(genome)} tunable values`);
           expect(script).toContain('strategy.entry("Long", strategy.long, qty=orderQty)');
-          expect(script.includes('strategy.entry("Short"')).toBe(mode === 'long-short');
+          expect(script.includes('strategy.entry("Short"')).toBe(mode !== 'long-only');
+          expect(script).toContain(
+            mode === 'long-only' ? 'Mode         : Long-Only' : mode === 'asymmetric' ? 'Mode         : Asymmetric Long/Short' : 'Mode         : Mirrored Long/Short',
+          );
+          // Managed exits: the stop is re-sent after every close; breakeven and trailing only when the genome has them.
+          expect(script).toContain('strategy.exit("Long exit", from_entry="Long", stop=longStop');
+          expect(script.includes('// +1R reached: breakeven lock')).toBe(genome.exit.breakeven === true);
+          expect(script.includes('longStop := math.max(longStop, longPeak - stopAtrMult * atrValue)')).toBe(genome.exit.mode === 'dynamic' && genome.exit.trailing);
           // Never more than the account can buy.
           expect(script).toContain('maxQty = math.max(strategy.equity, 0) / (close * (1 + costPct / 100))');
           expect(script).toMatch(sizing.mode === 'full' ? /orderQty = maxQty/ : /math\.min\(riskCapital \* riskPct \/ 100 \/ stopDistance, maxQty\)/);
@@ -1533,7 +1586,10 @@ describe('descriptions and Pine export', () => {
             const single = /^(?:var float )?([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]/.exec(line);
             if (single) declared.add(single[1]);
           }
-          const used = code.match(/\b(?:rsi|ema|sma|macdLine|macdSignal|macdHist|bbUpper|bbLower|bbBasis|bbPctB|bbWidth|atr|atrPct|stochK|stochD|diPlus|diMinus|adx|volRatio|supertrend|cci)_[0-9_]+\b/g) ?? [];
+          const used =
+            code.match(
+              /\b(?:rsi|ema|sma|macdLine|macdSignal|macdHist|bbUpper|bbLower|bbBasis|bbPctB|bbWidth|atr|atrPct|stochK|stochD|diPlus|diMinus|adx|volRatio|supertrend|cci|kcUpper|kcLower|squeezeOn|squeeze|rangeExp|pullback_ema|pullback_sma|donchianHigh|donchianLow)_[0-9_]+\b/g,
+            ) ?? [];
           for (const name of used) expect(declared.has(name)).toBe(true);
           for (const name of ['orderQty', 'maxQty', 'goLong', 'canEnter', 'stopTicks']) expect(declared.has(name)).toBe(true);
         }
@@ -1560,8 +1616,15 @@ describe('descriptions and Pine export', () => {
     const trailScript = generatePineScript({ ...resultFor(timed, RISK), holdout: resultFor(timed, RISK).validation }, ctx(RISK));
     expect(trailScript).toContain('[supertrend_10_3, supertrendDir_10_3] = ta.supertrend(3.0, 10)');
     expect(trailScript).toContain('stopDistance = stopAtrMult * atrValue');
-    expect(trailScript).toContain('longTrail := math.max(longTrail, longPeak - stopAtrMult * atrValue)');
-    expect(trailScript).toContain('shortTrail  := math.min(shortTrail, shortTrough + stopAtrMult * atrValue)');
+    expect(trailScript).toContain('longStop := math.max(longStop, longPeak - stopAtrMult * atrValue)');
+    expect(trailScript).toContain('shortStop := math.min(shortStop, shortTrough + stopAtrMult * atrValue)');
+    expect(trailScript).toContain('        longRisk   := stopAtrMult * atrValue[1]');
+    expect(trailScript).toContain('        longStop   := strategy.position_avg_price - longRisk');
+    // Static brackets are pinned to the fill price after the fill candle, a breakeven lock moves the stop to the entry.
+    expect(staticScript).toContain('        longRisk   := strategy.position_avg_price * stopLossPct / 100');
+    expect(staticScript).toContain('        longTarget := strategy.position_avg_price * (1 + takeProfitPct / 100)');
+    const locked = generatePineScript(resultFor({ ...DIP, exit: { ...DIP.exit, breakeven: true } } as StrategyGenome, longOnly), ctx(longOnly));
+    expect(locked).toContain('    if longPeak >= strategy.position_avg_price + longRisk // +1R reached: breakeven lock\n        longStop := math.max(longStop, strategy.position_avg_price)');
     expect(trailScript).toContain('maxBarsInTrade = input.int(20, "Time stop (bars in trade)"');
     expect(trailScript).toContain('timedOut = strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBarsInTrade - 1');
     expect(trailScript).toContain('if timedOut\n    strategy.close_all(comment="Time stop")');

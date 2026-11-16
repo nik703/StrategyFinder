@@ -4,6 +4,19 @@ Discover, backtest and optimise algorithmic trading strategies for stocks, crypt
 multi-asset baskets. The whole engine (indicators, backtester, evolutionary optimiser) runs in a Web Worker
 in your browser; a single Netlify Function proxies market data. Zero-config deploy on Netlify.
 
+The app is one guided page in four steps:
+
+1. **Market & preset** – one-click presets (*Crypto Multi-Asset Swing (4h)*, *Trend Breakout (1d)*,
+   *Stock Momentum (1d)*, *Intraday Scalp (15m)*) set the assets, timeframe, realistic fees, direction mode
+   and hypothesis; every other setting sits in an **Advanced settings** drawer.
+2. **Discovery scanner** – live progress, the restart cycle and a pass / fail funnel of every robustness gate.
+3. **Ranked leaderboard** – equity sparklines, the key risk / return figures, a Monte Carlo stress column
+   and single-click side-by-side comparison of up to three strategies.
+4. **Strategy workbench** – a plain-English *Strategy verdict* with a status badge for every check, the
+   equity curve, the Next Entry Forecast with exact trigger prices, the Monte Carlo stress curve, the
+   parameter-stability heatmap, a cross-market check on unseen markets, the one-shot locked holdout reveal
+   and the 1-click Pine Script v5 export.
+
 > Research tool only. Backtests are hypothetical and fitted to past data. Nothing here is financial advice.
 
 ## Quick start
@@ -22,7 +35,7 @@ Other commands:
 | Command | What it does |
 | --- | --- |
 | `npm run dev` | Vite only, on <http://localhost:5173>. A small dev middleware serves the same `market-data` function, so live data works here too. |
-| `npm test` | Unit and integration tests (indicators, backtester, genome, Pine export, function, optimiser worker). |
+| `npm test` | Unit and integration tests (indicators, backtester, genome, direction modes, exits, Monte Carlo, diagnostics, Pine export, function, optimiser worker). |
 | `npm run build` | Type-check, then build to `dist/`. |
 | `npm run preview` | Serve the production build locally. |
 
@@ -56,8 +69,8 @@ Browser (main thread)                      Web Worker                         Ne
 ┌──────────────────────────┐   start/stop  ┌───────────────────────────┐      ┌──────────────────────┐
 │ React UI                 │ ────────────▶ │ indicators.ts             │      │ market-data.ts       │
 │ control bar · telemetry  │               │ backtester.ts             │      │  Binance (crypto)    │
-│ chart · leaderboard      │ ◀──────────── │ genome.ts                 │      │  Yahoo (stocks, …)   │
-│ strategy breakdown       │  progress /   │ optimizer.worker.ts       │      │  normalise + CORS    │
+│ leaderboard · compare    │ ◀──────────── │ genome.ts                 │      │  Yahoo (stocks, …)   │
+│ strategy workbench       │  progress /   │ optimizer.worker.ts       │      │  normalise + CORS    │
 └──────────────────────────┘  leaderboard  └───────────────────────────┘      └──────────────────────┘
         │  GET /.netlify/functions/market-data?symbols=…&interval=…&range=…              ▲
         └────────────────────────────────────────────────────────────────────────────────┘
@@ -82,7 +95,9 @@ line up: daily bars sit at 00:00 UTC of the exchange-local date, hourly bars at 
 bars in UTC-aligned buckets. `15m` loads at most `1y` and `30m` at most `2y` (about 35,000 crypto
 candles; longer requests get a 400). Yahoo serves 15m / 30m history for the last 60 days only and hourly
 history for about 730 days, so stock requests longer than that are shortened (the response carries a
-`note`). Crypto pairs come from Binance and get the full range.
+`note`). Crypto pairs come from Binance and get the full range. Daily Yahoo candles are
+**dividend-adjusted** (every price of a candle is scaled by `adjclose / close`), so a long position earns the
+dividends Buy & Hold earns and ex-dividend gaps are not mistaken for price moves.
 
 ### Backtester
 
@@ -92,13 +107,16 @@ history for about 730 days, so stock requests longer than that are shortened (th
   candle. Volatile candles and volatile assets cost more to trade.
 - **Long/Short runs pay financing by default.** Crypto is shorted as a perpetual: every open position pays
   funding (default 0.01% per 8h). Stock and ETF shorts pay a borrow fee (default 2% a year). Long-Only runs
-  are treated as spot positions and pay no financing.
+  are treated as spot positions and pay no financing. This applies to both Asymmetric and Mirrored L/S.
 - **Sizing is a run setting, not something the optimiser tunes.** Default: risk 2% of the starting capital at
   the stop, no compounding, exposure capped at 1× equity. Options: compounding, or 100% of equity.
 - Stops and targets are simulated intrabar from the entry candle. A gap through a level fills at the open.
   If one candle touches both the stop and the target, the stop is assumed to fill first, and the trade is
   counted as "ambiguous" so you can see how often that assumption was needed.
 - ATR levels use the ATR of the signal candle. Trailing stops update only after a candle has closed.
+- **Breakeven lock** (an exit option): once a candle has traded 1R in the trade's favour (1R = the initial
+  stop distance), the stop moves to the entry price from the next candle on, so a winner can no longer turn
+  into a full loss. It combines with fixed brackets and with the trailing ATR stop.
 - **Max drawdown uses intrabar worst-case marks**: the low of every candle a long is open, the high for a short.
 - Buy & Hold buys at the first open with the same costs and capital.
 
@@ -138,16 +156,25 @@ are deliberately **parsimonious** – simple rules trade more often and leave le
 | Hypothesis | Entry triggers (events) | The one optional filter |
 |---|---|---|
 | **Trend following** – time-series momentum | EMA or SMA crossover · close crosses above an EMA or SMA · Donchian breakout (close above the prior N-candle high) · MACD signal cross | ADX above a level, or (breakout trigger only) close > slow EMA/SMA / slow EMA/SMA rising |
-| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA/SMA · slow EMA/SMA rising · volume above average |
-| **Buy the dip in an uptrend** – short-term overreaction | RSI crosses back above an oversold level · close crosses back above the lower Bollinger band | **required**: close > slow EMA/SMA or slow EMA/SMA rising |
-| **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower band | ADX below a level |
+| **Volatility breakout** – volatility clusters; a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger or **Keltner** band · **Bollinger-inside-Keltner squeeze release** · **ATR range expansion** (a candle with a true range of several ATRs closing higher) | close > slow EMA/SMA · slow EMA/SMA rising · volume above average |
+| **Trend pullback** (buy the dip in an uptrend) – short-term overreaction | RSI crosses back above an oversold level · close back above the lower Bollinger or **Keltner** band · **pullback to dynamic support** (the candle dips to a short EMA/SMA and closes back above it) | **required**: close > slow EMA/SMA or slow EMA/SMA rising |
+| **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower Bollinger or Keltner band | ADX below a level |
 
 - Mutations stay inside the hypothesis: they tune a number, swap or redraw the entry trigger, add / drop /
   swap the regime or confirmation filter, or change the exit. They never flip a filter's direction or
   change the archetype. A mutation is **guaranteed to differ** from its parent.
-- In Long/Short mode the short rules are the exact mirror of the long rules. An actionable opposite-side
-  entry **reverses** an open position at the next open – also on the open a time stop fires (the time stop
-  only blocks re-entering the same side) – in the backtester and in the Pine export alike.
+- **Direction mode** (a run setting):
+  - **Long-Only** (the default) never sells short – equities and spot crypto drift upwards over time and
+    charge for shorting, so a mirrored short side mostly bleeds in bull markets.
+  - **Asymmetric L/S** shorts with the mirrored trigger, but only inside the short side's **own bear-regime
+    filter** (close below a slow EMA/SMA, or a falling slow EMA/SMA). That filter is a separate gene, tuned
+    independently of the long rules (it gets one parameter slot of its own), so the short side sits out
+    bull markets instead of fading every pullback.
+  - **Mirrored L/S** uses the exact mirror image of the long rules for the shorts.
+
+  An actionable opposite-side entry **reverses** an open position at the next open – also on the open a
+  time stop fires (the time stop only blocks re-entering the same side) – in the backtester, the Next Entry
+  Forecast and the Pine export alike.
 - **EMA / SMA lengths: every integer by default.** Each moving average can be an EMA or an SMA (a
   crossover uses the same type for both). With **EMA / SMA lengths → Every integer** (the default) the
   search fine-tunes each length one candle at a time, e.g. EMA(23) × EMA(87). That covers crossovers,
@@ -169,9 +196,11 @@ are deliberately **parsimonious** – simple rules trade more often and leave le
 - **At most 5 tunable numbers** per strategy, exits included, with a fitness penalty for the 5th. Settings
   that would add parameters without adding an idea are fixed: the exit ATR period (14, the same ATR that
   scales slippage), the MACD signal (10), the ADX filter period (14) and the volume average (20).
-- **Exits:** static % stop and target, or ATR stop (1–4×) with optional ATR target (1.5–8×), trailing stop,
-  **opposite-signal exit** (the mirrored trigger closes the trade; any hypothesis) and an optional time
-  stop (5, 10, 20 or 40 bars). A trailing stop is only kept when the target sits at least 1 ATR beyond the stop.
+- **Exits:** static % stop and target, or ATR stop (1–4×) with optional ATR target (1.5–8×), trailing ATR
+  stop, **breakeven lock** at +1R, **opposite-signal exit** (the mirrored trigger closes the trade; any
+  hypothesis) and an optional time stop (5, 10, 20 or 40 bars). Half of the random ATR exits trail, and most
+  trailing exits carry no fixed target, so winners can ride a trend. A trailing stop is only kept when the
+  target sits at least 1 ATR beyond the stop; a breakeven lock only when the target lies beyond 1R.
 
 ### Optimiser, trial budget and scanning
 
@@ -196,7 +225,8 @@ members, or injects a fresh random genome.
   it passes **all** of these gates on the search period (the holdout stays sealed):
   1. **Validation:** validation Sharpe above 0.3 and a positive validation net profit after fees and
      volatility slippage;
-  2. **Folds:** at least 3 of the 5 sequential folds profitable, none beyond the 35% fold drawdown cap;
+  2. **Folds:** at least 3 of the 5 sequential folds profitable (flat folds set aside exactly as the fitness
+     does, see below), none beyond the 35% fold drawdown cap;
   3. **Neighbourhood:** the one-grid-step parameter neighbours keep a positive median expectancy per trade;
   4. **Significance:** the timeframe-scaled minimum-trade gates, and a deflated Sharpe of at least 50% – the
      validation Sharpe beats the best a random walk is expected to reach after that many trials.
@@ -207,7 +237,9 @@ members, or injects a fresh random genome.
 - **Diversity restarts instead of early exit.** When **1,500** evaluations in a row fail to improve the best
   composite fitness, the run does not stop: it keeps the best 5 strategies in a hall of fame and re-seeds
   the rest of its parent population with fresh random single- and dual-indicator genomes (a new
-  **population cycle**), so a long scan escapes the local optimum it stalled on.
+  **population cycle**), so a long scan escapes the local optimum it stalled on. In a new cycle the cycle's
+  own discoveries lead and are hill-climbed; the elite still breed, but no longer pull every mutation back to
+  the optimum the run had stalled on.
 - The live scan row shows robust strategies found / target, evaluations / budget with the population cycle,
   and how many scored candidates cleared each gate (minimum trades, validation Sharpe, 3 of 5 folds, DSR,
   stable neighbours), so you can see why candidates are being filtered.
@@ -234,12 +266,16 @@ median per-asset score, trade counts are gated per asset (not pooled), and there
 than 2/3 of the assets are profitable on validation. The leaderboard and chart show the primary asset.
 
 The search period (train + validation) is cut into **5 equal, sequential folds**, and every fold is scored
-on its own (0.6 Sortino + 0.4 Sharpe, clamped). Fitness rests on the **median** fold score, plus a
+on its own, every input clamped: **35% Sortino, 25% Sharpe, 20% Calmar** (CAGR ÷ max drawdown) and
+**20% expectancy × trade frequency** (the average trade in units of the average loss – win rate × payoff −
+loss rate – times trades per year: the R a year the edge earns). The last two reward an edge that pays for
+its drawdowns and repeats often enough to survive costs, not just a smooth curve. Fitness rests on the **median** fold score, plus a
 **consistency bonus** when at least 3 of the 5 folds made money (and a penalty per profitable fold short of
 that), and a **severe penalty** when any single fold suffers a drawdown beyond 35%. A fold in which the
 strategy never held a position is **flat**: once the strategy was active in at least 3 folds, flat folds
 are left out of the median and the consistency count (60% of the active folds must be profitable), so a
-regime filter that sat out a bear year is not punished for doing its job. Grading the 25th-percentile
+regime filter that sat out a bear year is not punished for doing its job – and the fold *gate* of the
+robust scan uses exactly the same rule (it used to count flat folds as losers). Grading the 25th-percentile
 fold, as before, punished trend followers for every sideways year. Raw return over Buy & Hold does not
 count: it is a bet on the market's direction, not evidence of an edge.
 
@@ -266,12 +302,16 @@ length of the data**: 15 trades per year of data on daily candles, rising slowly
 candles per day (≈ 26 on 4h, ≈ 39 on 1h, ≈ 59 on 15m), times the years of the search period and of the
 validation segment, with floors of 30 and 10 trades. On 5 years of daily data that is 60 train + validation
 and 15 validation trades; the holdout gate of a Robust verdict is computed the same way (16). A strategy
-below any gate is disqualified outright. The counts are the primary asset's – or pooled over an asset pool.
+below any gate is disqualified outright. The counts are the primary asset's – or pooled over an asset pool;
+with a Robust universe the trades-per-year gate uses the **median** asset (one quiet universe asset no
+longer disqualifies a strategy that trades often enough everywhere else). A 12-a-year bar was tried in the
+2026-11 review and rejected: on the audit's random walks it let 12–14-trade validation flukes pass every
+gate. Daily strategies that trade less often belong in a pooled run.
 
 ```
   median of the per-asset scores
 − 1.0 when fewer than 2/3 of the universe is profitable on validation
-− 0.15 for each tunable parameter above 6
+− 0.15 for each tunable parameter above 4
 − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
 ```
 
@@ -302,23 +342,44 @@ correlate above 0.9 count as the same idea and only the fitter one is listed.
 
 ### Robustness panel and verdict
 
-When a run ends (or on demand from the strategy drawer) each strategy is tested on train + validation:
+When a run ends (or when you pick a strategy in the workbench) it is tested on train + validation:
 
 - **Parameter sensitivity:** every parameter is moved by ±20% (snapped to its grid, or to the next grid step
   when ±20% rounds back). Fragile when the worst variant loses more than half of the original ROI.
 - **Top-trade removal:** net PnL without the 5 best trades.
 - **Cross-asset:** the exact rules, untuned, on every universe asset.
+- **Monte Carlo execution stress test** (`src/engine/monteCarlo.ts`, the StrategyQuant X / AmiBroker kind):
+  500 replays of the strategy's search-period trades, each with 10% of the trades skipped at random, the
+  order shuffled, and every fill charged an extra adverse slippage shock (exponential, mean = the run's
+  whole per-side cost – fee + slippage floor, at least 5 bp – so costs double on average, with a 5% chance
+  of a 5× spike). With a pooled asset pool the replayed trades are the pooled ones. Each trade's worst intrabar excursion is replayed
+  too, so drawdowns are intrabar worst cases. It reports the **probability of profit** and the
+  **95th-percentile worst-case drawdown**; it passes at ≥ 80% and < 50%. Every leaderboard entry carries the
+  headline numbers; the workbench draws the percentile bands of the paths.
+- **Cross-market generalization check** (workbench, on demand): the strategy's frozen rules on related
+  markets the search never saw – for example SOL and BNB for a strategy found on BTC and ETH – using only
+  their candles **before the run's holdout boundary**, so the holdout stays sealed. It passes when at least
+  two unseen markets are tested, two thirds of them make money and the median Sharpe is positive. Assets that
+  were part of the run are listed but not counted.
 
 Verdict (only the locked strategy gets one): **Overfit** when its deflated Sharpe is below 50% or it lost
 money (or had a non-positive Sharpe) on the holdout. **Robust** only when ALL of these hold: deflated Sharpe
 ≥ 95%; holdout Sharpe 95% confidence interval above zero; holdout Sharpe above Buy & Hold's; at least 30
-holdout trades; every test above passes; the holdout period was never revealed before; live (not simulated)
-data. **Fragile** otherwise; the drawer lists every unmet condition.
+holdout trades; every test above passes (including the Monte Carlo stress test and, when it was run, the
+cross-market check); the holdout period was never revealed before; live (not simulated) data. **Fragile**
+otherwise; the workbench lists every unmet condition.
+
+The workbench translates all of this into a **Strategy verdict** box (why it looks strong, what to watch
+out for) and six status badges with plain-English tooltips: *Beats luck* (deflated Sharpe), *Consistent
+over time* (folds), *Survives stress* (Monte Carlo), *Stable parameters* (neighbourhood), *Works on other
+markets* (cross-market check) and *Holdout*.
 
 ### Next Entry Forecast
 
-The top of the strategy breakdown shows where the strategy stands on the latest closed candle
-(`src/engine/nextEntrySolver.ts`):
+The Strategy workbench shows where the strategy stands on the latest closed candle
+(`src/engine/nextEntrySolver.ts`), for all three direction modes (an Asymmetric short side is forecast
+with its bear-regime filter, and every new building block – Keltner bands, squeeze releases, range
+expansions, pullbacks – is solved exactly like the other conditions):
 
 - **Trigger price.** A synthetic next candle (open = last close, close = P) is appended to the last
   2,000 candles and run through the backtester's own indicator cache and rule evaluators. A 241-point
@@ -327,7 +388,8 @@ The top of the strategy breakdown shows where the strategy stands on the latest 
   fill at the following open (plus slippage), and the stop loss and take profit at that fill.
 - **Pending entries.** If the rule already fired on the last candle, the entry is pending for the next
   open. If a position is open, the card shows its live stop, target, time stop and the close that
-  would trigger a signal exit or reversal (the stop is the backtester's own trailing stop).
+  would trigger a signal exit or reversal (the stop is the backtester's own trailing stop), and the
+  price at +1R that will lock the stop at breakeven – or that the lock is already active.
 - **Blockers.** A filter no single candle can satisfy (for example a low ADX, or a volume spike, with
   the next candle assumed to trade at average volume) is reported next to the price the rest of the
   rule needs, e.g. `$148.20 (Blocked: ADX(7) 12.1 < 15)`.
@@ -348,7 +410,11 @@ the strategy, not whether price will get there.
   (6 driftless, 6 with +40% a year of drift, one hypothesis per run, whole boards), no strategy reached a
   95% deflated Sharpe, none met the holdout conditions of a Robust verdict, and every locked #1 was rated
   Overfit. On five years of daily candles the breakout and dip-buy hypotheses rarely reach the minimum
-  number of trades at all – use 4h or 1h candles for them.
+  number of trades at all – use 4h or 1h candles for them. On live Binance pools (4h and daily, every
+  hypothesis, see `docs/AUDIT.md`) no strategy cleared the significance gate at the default budget either,
+  although several Asymmetric L/S strategies beat Buy & Hold on their holdout and generalised to unseen
+  coins: a year of validation data cannot separate a Sharpe-1.5 edge from the luckiest of 25,000 trials.
+  Run the benchmark yourself with `LIVE_BENCHMARK=1 npx vitest run tests/live-benchmark.test.ts`.
 - **The holdout is a one-shot test.** Re-running on the same dataset and picking the run whose holdout looks
   best turns the holdout into training data. The reveal log makes that visible and blocks a Robust verdict
   on a holdout that has been seen before.
@@ -357,11 +423,13 @@ the strategy, not whether price will get there.
 - **Daily bars cannot resolve intrabar order.** The "ambiguous candles" count shows how many trades relied on
   the stop-first assumption. The drawer warns above 10%.
 - **Baskets are synthetic.** Components are aligned on shared timestamps and combined into a buy-and-hold
-  index. Basket highs and lows are sums of component highs and lows, which is a conservative envelope.
-  The Robust universe is not available for baskets.
+  index. A basket candle's high and low are its body widened by the root-sum-square of the legs' wicks (the
+  sum of the legs' highs would be a price the basket almost never trades at). The Robust universe is not
+  available for baskets.
 - **Crypto is tested on the USDT pair.** `XRP-USD` is routed to `XRPUSDT` on Binance; the telemetry tile and
   the drawer show the instrument actually used.
-- **Pine export is a faithful translation, not a guarantee of identical numbers.** It sets
+- **Pine export is a faithful translation, not a guarantee of identical numbers.** It supports all three
+  direction modes, every building block, the trailing ATR stop and the breakeven lock, and sets
   `use_bar_magnifier=false` so it compiles on every TradingView plan; Premium users can switch it to `true`
   to settle candles that touch both stop and target with lower-timeframe data. The code is generated and
   syntax-tested here but was not run on TradingView.
@@ -378,6 +446,8 @@ src/engine/backtester.ts          Execution model, metrics, split, benchmark, fi
 src/engine/genome.ts              Market hypotheses, grids, random generation, mutation, repair
 src/engine/describe.ts            Plain-English rules and badges
 src/engine/pine.ts                Pine Script v5 exporter
+src/engine/monteCarlo.ts          Monte Carlo execution stress test
+src/engine/nextEntrySolver.ts     Next Entry Forecast: trigger prices and readiness
 src/workers/optimizer.worker.ts   Optimisation loop (Web Worker)
 src/workers/evaluator.worker.ts   Evaluator pool member: scores candidate strategies
 src/engine/evaluation.ts          Shared scoring code and the evaluator protocol
@@ -385,8 +455,11 @@ src/lib/stats.ts                  Deflated Sharpe Ratio, haircut Sharpe, confide
 src/lib/holdoutLog.ts             Holdout reveal log (symbols + date window, overlap matching)
 src/lib/trialLedger.ts            Cumulative trial budget per data window (overlap matching)
 src/lib/risk.ts                   Overfitting risk score
+src/lib/diagnostics.ts            Plain-English check badges and the Strategy verdict
+src/lib/presets.ts                One-click quick-start presets
 src/data/                         Data loader, offline generator, basket builder
-src/components/                   ControlBar, TelemetryStrip, EquityChart, Leaderboard, StrategyModal
+src/components/                   ControlBar + PresetCards (1), TelemetryStrip (2), Leaderboard + ComparePanel (3),
+                                  StrategyWorkbench (4) with NextEntryForecast, MonteCarloChart, StabilityHeatmap
 src/App.tsx                       Dashboard and worker orchestration
 tests/                            Vitest suites
 ```

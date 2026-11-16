@@ -17,10 +17,13 @@
  *   • at most 5 tunable numbers in total, exits included – ATR period, MACD
  *     signal and filter periods are fixed at textbook values; static stop /
  *     target grids are scaled to the candle timeframe;
- *   • exits: fixed or ATR brackets, a trailing stop, a time stop and an
- *     opposite-signal exit (the mirrored trigger closes the trade);
+ *   • exits: fixed or ATR brackets, a trailing ATR stop, a breakeven lock (the stop moves to the
+ *     entry price once the trade is 1R in profit), a time stop and an opposite-signal exit (the
+ *     mirrored trigger closes the trade);
  *   • every strategy follows its hypothesis's archetype (TREND or MEAN_REVERSION);
- *   • short rules are always the mirror image of the long rules;
+ *   • direction modes: Long-Only (no shorts), Mirrored L/S (shorts are the mirror image of the long
+ *     rules) and Asymmetric L/S (shorts use the mirrored trigger but only inside their own,
+ *     independently tuned bear-regime filter – see `shortRegime`);
  *   • every number comes from a coarse, round-number grid;
  *   • a strategy may tune at most `MAX_PARAMETERS` numbers in total;
  *   • position sizing is a run setting, not a gene.
@@ -152,6 +155,12 @@ export const GRIDS = {
   atrPercent: [0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10],
   adxLevel: range(15, 40, 5),
   volumeRatio: [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3],
+  /** Keltner channel width in ATRs. */
+  kcMult: [1, 1.5, 2, 2.5, 3],
+  /** Keltner width of the squeeze test (Bollinger is fixed at 2σ): 1.5 is the TTM classic. */
+  squeezeKc: [1, 1.25, 1.5, 2],
+  /** True range / ATR ratio that counts as a range expansion. */
+  rangeExp: [1.5, 2, 2.5, 3],
 } as const;
 
 /** One entry trigger plus at most ONE filter. */
@@ -273,6 +282,13 @@ function oscillatorMid(c: Condition): number | null {
  */
 export function conditionRole(c: Condition): ConditionRole {
   if (isFilter(c)) return 'FILTER';
+  if (c.ind === 'SQUEEZE' || c.ind === 'RANGE_EXP') return c.level > 0 ? 'TREND_UP' : 'TREND_DOWN';
+  if (c.ind === 'PULLBACK') return c.level > 0 ? 'OVERSOLD' : 'OVERBOUGHT';
+  if (c.ind === 'KELTNER') {
+    const up = c.op === 'gt' || c.op === 'cross_above';
+    if (c.variant === 'lower') return up ? 'OVERSOLD' : 'TREND_DOWN';
+    return up ? 'TREND_UP' : 'OVERBOUGHT';
+  }
   const mid = oscillatorMid(c);
   if (mid !== null) return (c as { level: number }).level < mid ? 'OVERSOLD' : 'OVERBOUGHT';
   if (c.ind === 'BB') return c.variant === 'lower' ? 'OVERSOLD' : 'OVERBOUGHT';
@@ -324,6 +340,12 @@ export function mirrorCondition(c: Condition): Condition {
       return { ...c, variant: c.variant === 'upper' ? 'lower' : 'upper', op: flipOp(c.op) };
     case 'MA_SLOPE':
       return { ...c, op: flipOp(c.op) };
+    case 'KELTNER':
+      return { ...c, variant: c.variant === 'upper' ? 'lower' : 'upper', op: flipOp(c.op) };
+    case 'SQUEEZE':
+    case 'RANGE_EXP':
+    case 'PULLBACK':
+      return { ...c, op: flipOp(c.op), level: -c.level };
   }
 }
 
@@ -420,8 +442,37 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
       return [['period', lookbacks(10, 112, limits)]];
     case 'MA_SLOPE':
       return [['period', maLookbacks(MIN_SLOPE_LOOKBACK, 200, limits), fineMa(limits)]];
+    case 'KELTNER':
+      return [
+        ['period', lookbacks(10, 56, limits)],
+        ['mult', GRIDS.kcMult],
+      ];
+    case 'SQUEEZE':
+      return [
+        ['period', lookbacks(10, 40, limits)],
+        ['mult', GRIDS.squeezeKc],
+      ];
+    case 'RANGE_EXP':
+      return [
+        ['period', lookbacks(7, 30, limits)],
+        ['mult', GRIDS.rangeExp],
+      ];
+    case 'PULLBACK':
+      // A short-term average that acts as dynamic support inside the trend.
+      return [['period', maLookbacks(5, SHORT_LOOKBACK, limits), fineMa(limits)]];
   }
 }
+
+/** True for the signed event series (+1 / −1 / 0) that are compared against ±0.5. */
+export const isSignedEvent = (c: Condition): c is Extract<Condition, { ind: 'SQUEEZE' | 'RANGE_EXP' | 'PULLBACK' }> =>
+  c.ind === 'SQUEEZE' || c.ind === 'RANGE_EXP' || c.ind === 'PULLBACK';
+
+/**
+ * True when a condition is a discrete EVENT (true on the candle something happens, not on every
+ * candle a state holds): a crossover, or one of the signed one-candle events (a squeeze release,
+ * a range expansion, a pullback that holds its average). Every entry trigger is one.
+ */
+export const isEventCondition = (c: Condition): boolean => c.op === 'cross_above' || c.op === 'cross_below' || isSignedEvent(c);
 
 type Fields = Record<string, number | string>;
 
@@ -431,7 +482,12 @@ function normalizeCondition(input: Condition, slot: Slot, limits: GenomeLimits):
   const fields = c as unknown as Fields;
 
   // Operators.
-  if (isFilter(c)) {
+  if (isSignedEvent(c)) {
+    // A one-candle event: "is +1" (long) or "is −1" (short).
+    const up = c.op === 'gt' || c.op === 'cross_above';
+    c.op = up ? 'gt' : 'lt';
+    c.level = up ? 0.5 : -0.5;
+  } else if (isFilter(c)) {
     if (c.op === 'cross_above') c.op = 'gt';
     if (c.op === 'cross_below') c.op = 'lt';
   } else {
@@ -441,12 +497,12 @@ function normalizeCondition(input: Condition, slot: Slot, limits: GenomeLimits):
       const low = (fields.level as number) < mid;
       if (low && c.op === 'gt') c.op = 'lt';
       if (!low && c.op === 'lt') c.op = 'gt';
-    } else if (c.ind === 'BB' || c.ind === 'DONCHIAN') {
+    } else if (c.ind === 'BB' || c.ind === 'DONCHIAN' || c.ind === 'KELTNER') {
       if (c.variant === 'lower' && c.op === 'gt') c.op = 'lt';
       if (c.variant === 'upper' && c.op === 'lt') c.op = 'gt';
     }
   }
-  if (slot === 'regime') c.op = c.op === 'lt' || c.op === 'cross_below' ? 'lt' : 'gt';
+  if (slot === 'regime' && !isSignedEvent(c)) c.op = c.op === 'lt' || c.op === 'cross_below' ? 'lt' : 'gt';
 
   // Fixed, non-tunable fields.
   if (c.ind === 'STOCH') {
@@ -590,6 +646,41 @@ const PRIMITIVES = {
     template: () => ({ ind: 'BB', period: 20, mult: 2, variant: 'lower', op: 'cross_above', level: 0 }),
     matches: (c) => c.ind === 'BB' && c.variant === 'lower' && c.op === 'cross_above',
   },
+  KC_BREAKOUT: {
+    id: 'KC_BREAKOUT',
+    slot: 'trigger',
+    // Close breaks above the Keltner channel: a move larger than the recent ATR envelope.
+    template: () => ({ ind: 'KELTNER', period: 20, mult: 2, variant: 'upper', op: 'cross_above' }),
+    matches: (c) => c.ind === 'KELTNER' && c.variant === 'upper' && c.op === 'cross_above',
+  },
+  KC_REJECTION: {
+    id: 'KC_REJECTION',
+    slot: 'trigger',
+    // Close back above the lower Keltner channel after a stretch below it.
+    template: () => ({ ind: 'KELTNER', period: 20, mult: 2, variant: 'lower', op: 'cross_above' }),
+    matches: (c) => c.ind === 'KELTNER' && c.variant === 'lower' && c.op === 'cross_above',
+  },
+  SQUEEZE_RELEASE: {
+    id: 'SQUEEZE_RELEASE',
+    slot: 'trigger',
+    // Bollinger bands leave the Keltner channel after a squeeze, closing above the basis.
+    template: () => ({ ind: 'SQUEEZE', period: 20, mult: 1.5, op: 'gt', level: 0.5 }),
+    matches: (c) => c.ind === 'SQUEEZE' && c.op === 'gt',
+  },
+  RANGE_EXPANSION: {
+    id: 'RANGE_EXPANSION',
+    slot: 'trigger',
+    // A wide-range up candle: true range of 2+ ATRs closing higher.
+    template: () => ({ ind: 'RANGE_EXP', period: 14, mult: 2, op: 'gt', level: 0.5 }),
+    matches: (c) => c.ind === 'RANGE_EXP' && c.op === 'gt',
+  },
+  MA_PULLBACK: {
+    id: 'MA_PULLBACK',
+    slot: 'trigger',
+    // Price dips to a short EMA/SMA and closes back above it: dynamic support held.
+    template: () => ({ ind: 'PULLBACK', maType: 'EMA', period: 20, op: 'gt', level: 0.5 }),
+    matches: (c) => c.ind === 'PULLBACK' && c.op === 'gt' && c.period <= SHORT_LOOKBACK,
+  },
   // ---- Regime filters: slow states ---------------------------------------------------------------
   ABOVE_SLOW_MA: {
     id: 'ABOVE_SLOW_MA',
@@ -602,6 +693,19 @@ const PRIMITIVES = {
     slot: 'regime',
     template: (limits) => (hasGrid(MIN_SLOPE_LOOKBACK, 200, limits) ? { ind: 'MA_SLOPE', maType: 'EMA', period: 112, op: 'gt' } : null),
     matches: (c) => c.ind === 'MA_SLOPE' && c.op === 'gt' && c.period >= MIN_SLOPE_LOOKBACK,
+  },
+  // ---- Short-side regime filters (Asymmetric L/S): the bear-market mirror of the two above ------
+  BELOW_SLOW_MA: {
+    id: 'BELOW_SLOW_MA',
+    slot: 'regime',
+    template: (limits) => (hasGrid(SLOW_LOOKBACK, 200, limits) ? { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'lt' } : null),
+    matches: (c) => c.ind === 'PRICE_MA' && c.op === 'lt' && c.period >= SLOW_LOOKBACK,
+  },
+  SLOW_MA_FALLING: {
+    id: 'SLOW_MA_FALLING',
+    slot: 'regime',
+    template: (limits) => (hasGrid(MIN_SLOPE_LOOKBACK, 200, limits) ? { ind: 'MA_SLOPE', maType: 'EMA', period: 112, op: 'lt' } : null),
+    matches: (c) => c.ind === 'MA_SLOPE' && c.op === 'lt' && c.period >= MIN_SLOPE_LOOKBACK,
   },
   // ---- Confirmation filters: fast states ---------------------------------------------------------
   ADX_TRENDING: {
@@ -635,10 +739,17 @@ interface HypothesisSlots {
 /** The primitives each hypothesis may put in each entry slot. */
 const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
   TREND_FOLLOWING: { triggers: ['MA_CROSS', 'PRICE_MA_CROSS', 'DONCHIAN_BREAKOUT', 'MACD_CROSS'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: ['ADX_TRENDING'] },
-  VOL_BREAKOUT: { triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: ['VOLUME_SURGE'] },
-  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: [] },
-  RANGE_REVERSION: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: [], confirms: ['ADX_RANGING'] },
+  VOL_BREAKOUT: {
+    triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT', 'KC_BREAKOUT', 'SQUEEZE_RELEASE', 'RANGE_EXPANSION'],
+    regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'],
+    confirms: ['VOLUME_SURGE'],
+  },
+  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION', 'KC_REJECTION', 'MA_PULLBACK'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: [] },
+  RANGE_REVERSION: { triggers: ['RSI_REJECTION', 'BB_REJECTION', 'KC_REJECTION'], regimes: [], confirms: ['ADX_RANGING'] },
 };
+
+/** The bear-regime filters an Asymmetric L/S short side may use. */
+const SHORT_REGIMES: readonly PrimitiveId[] = ['BELOW_SLOW_MA', 'SLOW_MA_FALLING'];
 
 /**
  * The market hypotheses a run can test. Each is a distinct, economically motivated idea; its
@@ -646,9 +757,12 @@ const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
  *
  *   TREND_FOLLOWING  EMA/SMA cross · close crosses above an EMA/SMA · Donchian breakout · MACD cross
  *                    | one of: close > slow EMA/SMA · slow EMA/SMA rising · ADX > level
- *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | one of: close > slow EMA/SMA · slow EMA/SMA rising · volume surge
- *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA/SMA or slow EMA/SMA rising
- *   RANGE_REVERSION  RSI back above oversold · back inside lower band | optional: ADX < level
+ *   VOL_BREAKOUT     Donchian breakout · upper Bollinger / Keltner break · Bollinger-in-Keltner squeeze
+ *                    release · ATR range expansion
+ *                    | one of: close > slow EMA/SMA · slow EMA/SMA rising · volume surge
+ *   DIP_IN_UPTREND   RSI back above oversold · back inside the lower Bollinger / Keltner band · pullback
+ *                    that holds a short EMA/SMA | REQUIRED: close > slow EMA/SMA or slow EMA/SMA rising
+ *   RANGE_REVERSION  RSI back above oversold · back inside the lower Bollinger / Keltner band | optional: ADX < level
  *
  *   The filter is always from another indicator family than the trigger, so a moving-average or MACD
  *   trigger can only be filtered by ADX.
@@ -673,20 +787,22 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     short: 'Breakout',
     archetype: 'TREND',
     rationale:
-      'A close beyond the recent range or volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
-    trigger: 'Close breaks above the prior Donchian high or the upper Bollinger band.',
+      'Volatility clusters: after a quiet squeeze, a close beyond the recent range or volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
+    trigger:
+      'Close breaks above the prior Donchian high or the upper Bollinger / Keltner band, a Bollinger-inside-Keltner squeeze releases upwards, or a wide-range candle (true range of several ATRs) closes higher.',
     filter: 'Optional, one only: close above a slow EMA/SMA, a rising slow EMA/SMA, or volume above its average.',
     filterRequired: false,
-    replaces: 'Band-width and ATR "squeeze" filters, which describe the same volatility state.',
+    replaces: 'Band-width and ATR-percent filters, which describe the same volatility state as the squeeze.',
   },
   DIP_IN_UPTREND: {
     id: 'DIP_IN_UPTREND',
-    label: 'Buy the dip in an uptrend',
-    short: 'Dip-buy',
+    label: 'Trend pullback',
+    short: 'Pullback',
     archetype: 'MEAN_REVERSION',
     rationale:
       'Short-term overreaction: sharp pullbacks inside a long-term uptrend tend to be partly reversed, as buyers are paid to absorb forced selling.',
-    trigger: 'Pullback rejection: RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
+    trigger:
+      'Pullback rejection: RSI crosses back above an oversold level, the close crosses back above the lower Bollinger or Keltner band, or price dips to a short EMA/SMA and closes back above it.',
     filter: 'Required, and the only one: close above a slow EMA/SMA or a rising slow EMA/SMA.',
     filterRequired: true,
     replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
@@ -697,7 +813,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     short: 'Range',
     archetype: 'MEAN_REVERSION',
     rationale: 'In trendless markets prices oscillate around a mean, so oversold readings tend to revert.',
-    trigger: 'RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
+    trigger: 'RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger or Keltner band.',
     filter: 'Optional, one only: ADX below a level – only trade when no trend is present.',
     filterRequired: false,
     replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
@@ -758,6 +874,7 @@ export function conformsTo(g: StrategyGenome, limits: GenomeLimits = DEFAULT_LIM
     return false;
   }
   if (g.exit.mode === 'dynamic' && g.exit.reversalExit && !allowsReversalExit(h, g.archetype)) return false;
+  if (g.shortRegime && !isShortRegime(g.shortRegime, limits)) return false;
   return true;
 }
 
@@ -855,7 +972,7 @@ export function hypothesisTrigger(rng: Rng, h: Hypothesis, limits: GenomeLimits,
  * Indicator family of a condition. Two conditions of the same family measure the same thing – two
  * moving-average rules, two momentum oscillators, two bands – so an entry may not pair them.
  */
-export type IndicatorClass = 'moving-average' | 'oscillator' | 'band' | 'volatility' | 'trend-strength' | 'volume';
+export type IndicatorClass = 'moving-average' | 'oscillator' | 'band' | 'volatility' | 'trend-strength' | 'volume' | 'pullback';
 
 export function indicatorClass(c: Condition): IndicatorClass {
   switch (c.ind) {
@@ -879,6 +996,14 @@ export function indicatorClass(c: Condition): IndicatorClass {
       return c.variant === 'strength' ? 'trend-strength' : 'moving-average';
     case 'VOLUME':
       return 'volume';
+    case 'KELTNER':
+      return 'band';
+    case 'SQUEEZE':
+    case 'RANGE_EXP':
+      return 'volatility';
+    case 'PULLBACK':
+      // A price-action event at a SHORT average (≤ 30 candles): orthogonal to a slow (100+) regime average.
+      return 'pullback';
   }
 }
 
@@ -923,8 +1048,49 @@ export function hypothesisPrimitives(h: Hypothesis): HypothesisSlots {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Asymmetric L/S: the short side's own bear-regime filter                  */
+/* -------------------------------------------------------------------------- */
+
+/** True when `c` is a short-side regime filter: close below a slow EMA/SMA, or a falling slow EMA/SMA. */
+export function isShortRegime(c: Condition, limits: GenomeLimits = DEFAULT_LIMITS): boolean {
+  return slotPrimitive(c, SHORT_REGIMES, limits) !== null;
+}
+
+/** A random short-side regime filter, or null when the history is too short for a slow average. */
+export function drawShortRegime(rng: Rng, limits: GenomeLimits): Condition | null {
+  const shuffled = [...SHORT_REGIMES].sort(() => rng() - 0.5);
+  for (const id of shuffled) {
+    const c = drawPrimitive(rng, id, 'TREND', limits);
+    if (c && isShortRegime(c, limits)) return c;
+  }
+  return null;
+}
+
+/**
+ * Deterministic short regime for a genome that has none yet: the mirror of the long side's regime
+ * filter when it has one (close above a slow EMA → close below it), else close below the slowest
+ * EMA the data supports. Null when no slow average fits the history.
+ */
+function defaultShortRegime(longConditions: readonly Condition[], limits: GenomeLimits): Condition | null {
+  for (const c of longConditions.slice(1)) {
+    const mirrored = normalizeCondition(mirrorCondition(c), 'regime', limits);
+    if (isShortRegime(mirrored, limits)) return mirrored;
+  }
+  for (const id of SHORT_REGIMES) {
+    const template = PRIMITIVES[id].template(limits);
+    if (template === null) continue;
+    const c = normalizeCondition(template, 'regime', limits);
+    if (isShortRegime(c, limits)) return c;
+  }
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Exits                                                                     */
 /* -------------------------------------------------------------------------- */
+
+/** Share of random strategies whose exit carries a breakeven lock (stop to entry after +1R). */
+const BREAKEVEN_RATE = 0.3;
 
 function randomStaticExit(rng: Rng, limits: GenomeLimits): ExitGene {
   const grids = staticGrids(limits);
@@ -932,6 +1098,7 @@ function randomStaticExit(rng: Rng, limits: GenomeLimits): ExitGene {
     mode: 'static',
     stopLossPct: pick(rng, grids.stopLossPct),
     takeProfitPct: pick(rng, grids.takeProfitPct),
+    breakeven: rng() < BREAKEVEN_RATE,
   };
 }
 
@@ -939,17 +1106,20 @@ function randomStaticExit(rng: Rng, limits: GenomeLimits): ExitGene {
 const ATR_EXIT_RATE = 0.7;
 
 function randomDynamicExit(rng: Rng, allowReversal: boolean): DynamicExit {
-  const trailing = rng() < 0.4;
+  // Half of the ATR exits trail the stop, and most trailing exits have no fixed target, so winners
+  // can ride a trend instead of being capped at a few ATRs.
+  const trailing = rng() < 0.5;
   const reversalExit = allowReversal && rng() < 0.35;
   return {
     mode: 'dynamic',
     atrPeriod: FIXED_ATR_PERIOD,
     stopAtrMult: pick(rng, GRIDS.stopAtrMult),
     trailing,
-    takeProfitAtrMult: (trailing || reversalExit) && rng() < 0.45 ? null : pick(rng, GRIDS.takeProfitAtrMult),
+    takeProfitAtrMult: (trailing && rng() < 0.6) || (reversalExit && rng() < 0.45) ? null : pick(rng, GRIDS.takeProfitAtrMult),
     reversalExit,
     longExit: null,
     shortExit: null,
+    breakeven: rng() < BREAKEVEN_RATE,
   };
 }
 
@@ -981,6 +1151,7 @@ export function cloneGenome(g: StrategyGenome): StrategyGenome {
     ...(g.hypothesis !== undefined ? { hypothesis: g.hypothesis } : {}),
     longEntry: cloneGroup(g.longEntry),
     shortEntry: g.shortEntry ? cloneGroup(g.shortEntry) : null,
+    ...(g.shortRegime ? { shortRegime: { ...g.shortRegime } } : {}),
     exit,
     maxBarsInTrade: g.maxBarsInTrade,
   };
@@ -1013,6 +1184,21 @@ function parameterHandles(g: StrategyGenome, limits: GenomeLimits): Handle[] {
       });
     }
   });
+  // Asymmetric L/S: the short side's own regime filter is tuned independently.
+  const shortRegime = g.shortRegime;
+  if (shortRegime) {
+    const fields = shortRegime as unknown as Fields;
+    for (const [key, grid, fine] of conditionSpecs(shortRegime, 'regime', limits)) {
+      if (grid.length === 0) continue;
+      handles.push({
+        label: `Short ${parameterLabel(shortRegime, key, 1).replace(/^Regime /, 'regime ')}`,
+        grid,
+        fine: fine === true,
+        get: () => fields[key] as number,
+        set: (v) => (fields[key] = v),
+      });
+    }
+  }
   const exit = g.exit;
   if (exit.mode === 'static') {
     const grids = staticGrids(limits);
@@ -1063,8 +1249,23 @@ function parameterLabel(c: Condition, key: string, index: number): string {
               ? 'Volume'
               : c.ind === 'MA_CROSS'
                 ? 'MA'
-                : c.ind;
-  const what = c.ind === 'VOLUME' && key === 'level' ? 'ratio' : (KEY_NAMES[key] ?? key);
+                : c.ind === 'KELTNER'
+                  ? 'Keltner'
+                  : c.ind === 'SQUEEZE'
+                    ? 'Squeeze'
+                    : c.ind === 'RANGE_EXP'
+                      ? 'Range expansion'
+                      : c.ind === 'PULLBACK'
+                        ? `${c.maType} pullback`
+                        : c.ind;
+  const what =
+    c.ind === 'VOLUME' && key === 'level'
+      ? 'ratio'
+      : (c.ind === 'KELTNER' || c.ind === 'SQUEEZE') && key === 'mult'
+        ? 'width (× ATR)'
+        : c.ind === 'RANGE_EXP' && key === 'mult'
+          ? '× ATR'
+          : (KEY_NAMES[key] ?? key);
   return `${index > 0 ? (isFilter(c) ? 'Confirm ' : 'Regime ') : ''}${name} ${what}`;
 }
 
@@ -1150,9 +1351,10 @@ export function countParameters(g: StrategyGenome, limits: GenomeLimits = DEFAUL
 }
 
 /**
- * Deterministic clean-up: snap every number onto its grid, derive the mirrored
- * short rules and reversal exits, and enforce the exit sanity rules and the
- * parameter cap. Does NOT fix an entry that violates its archetype – see `repairGenome`.
+ * Deterministic clean-up: snap every number onto its grid, derive the short rules (mirrored, or
+ * the mirrored trigger plus the short regime filter in Asymmetric mode) and the reversal exits,
+ * and enforce the exit sanity rules and the parameter cap. Does NOT fix an entry that violates its
+ * archetype – see `repairGenome`.
  */
 export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome {
   const hypothesis = input.hypothesis;
@@ -1167,10 +1369,14 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
 
   let exit: ExitGene;
   if (input.exit.mode === 'static') {
+    const stopLossPct = snap(input.exit.stopLossPct, staticGrids(limits).stopLossPct);
+    const takeProfitPct = snap(input.exit.takeProfitPct, staticGrids(limits).takeProfitPct);
     exit = {
       mode: 'static',
-      stopLossPct: snap(input.exit.stopLossPct, staticGrids(limits).stopLossPct),
-      takeProfitPct: snap(input.exit.takeProfitPct, staticGrids(limits).takeProfitPct),
+      stopLossPct,
+      takeProfitPct,
+      // A breakeven lock at +1R only matters when the target lies beyond 1R.
+      breakeven: input.exit.breakeven === true && takeProfitPct > stopLossPct,
     };
   } else {
     const stopAtrMult = snap(input.exit.stopAtrMult, GRIDS.stopAtrMult);
@@ -1193,7 +1399,15 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
       reversalExit,
       longExit: null,
       shortExit: null,
+      breakeven: input.exit.breakeven === true && (takeProfitAtrMult === null || takeProfitAtrMult > stopAtrMult),
     };
+  }
+
+  // Asymmetric L/S: the short side's own bear-regime filter (kept when valid, otherwise a default).
+  let shortRegime: Condition | null = null;
+  if (mode === 'asymmetric' && conditions.length > 0) {
+    const given = input.shortRegime ? normalizeCondition(input.shortRegime, 'regime', limits) : null;
+    shortRegime = given !== null && isShortRegime(given, limits) ? given : defaultShortRegime(conditions, limits);
   }
 
   const genome: StrategyGenome = {
@@ -1201,12 +1415,15 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
     ...(hypothesis !== undefined ? { hypothesis } : {}),
     longEntry,
     shortEntry: null,
+    ...(shortRegime ? { shortRegime } : {}),
     exit,
     maxBarsInTrade,
   };
 
-  // Parameter cap: shed the least essential pieces first.
-  while (countParameters(genome, limits) > MAX_PARAMETERS) {
+  // Parameter cap: shed the least essential pieces first. The short regime filter of an Asymmetric
+  // strategy is a separate side's gate and gets one slot of its own on top of the cap.
+  const cap = MAX_PARAMETERS + (shortRegime ? 1 : 0);
+  while (countParameters(genome, limits) > cap) {
     if (genome.maxBarsInTrade !== null && (genome.exit.mode === 'static' || genome.exit.takeProfitAtrMult !== null)) {
       genome.maxBarsInTrade = null;
       maxBarsInTrade = null;
@@ -1218,12 +1435,17 @@ export function normalizeGenome(input: StrategyGenome, mode: TradeMode, limits: 
   }
 
   // Derived parts.
+  const trigger = genome.longEntry.conditions[0];
   if (mode === 'long-short') genome.shortEntry = mirrorGroup(genome.longEntry);
-  if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit && genome.longEntry.conditions.length > 0) {
-    const trigger = genome.longEntry.conditions[0];
+  // Asymmetric: the mirrored trigger, only inside the short regime. Without a slow average to
+  // define a bear regime (very short history) the short side stays off rather than trade unfiltered.
+  if (mode === 'asymmetric' && trigger !== undefined && shortRegime) {
+    genome.shortEntry = { logic: 'AND', conditions: [mirrorCondition(trigger), { ...shortRegime }] };
+  }
+  if (genome.exit.mode === 'dynamic' && genome.exit.reversalExit && trigger !== undefined) {
     genome.exit.longExit = { logic: 'AND', conditions: [mirrorCondition(trigger)] };
     // The short entry trigger is the mirrored long trigger, so its reversal is the long trigger itself.
-    genome.exit.shortExit = mode === 'long-short' ? { logic: 'AND', conditions: [{ ...trigger }] } : null;
+    genome.exit.shortExit = genome.shortEntry !== null ? { logic: 'AND', conditions: [{ ...trigger }] } : null;
   }
   return genome;
 }
@@ -1280,11 +1502,13 @@ export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h:
     const filter = hypothesisFilter(rng, h, limits, trigger);
     if (filter) conditions.push(filter);
   }
+  const shortRegime = mode === 'asymmetric' ? drawShortRegime(rng, limits) : null;
   const genome: StrategyGenome = {
     archetype: spec.archetype,
     hypothesis: h,
     longEntry: { logic: 'AND', conditions },
     shortEntry: null,
+    ...(shortRegime ? { shortRegime } : {}),
     exit: rng() < ATR_EXIT_RATE ? randomDynamicExit(rng, allowsReversalExit(h, spec.archetype)) : randomStaticExit(rng, limits),
     maxBarsInTrade: rng() < 0.15 ? pick(rng, TIME_STOP_GRID) : null,
   };
@@ -1300,7 +1524,7 @@ export function randomGenome(rng: Rng, mode: TradeMode, limits: GenomeLimits, h:
  * drop / swap the regime or confirmation filter, or change the exit. They never flip a filter's
  * direction or change the archetype.
  */
-type MutationKind = 'tweak' | 'trigger' | 'filter' | 'exit' | 'time';
+type MutationKind = 'tweak' | 'trigger' | 'filter' | 'exit' | 'time' | 'short';
 
 const MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [
   ['tweak', 0.45],
@@ -1309,6 +1533,8 @@ const MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [
   ['exit', 0.15],
   ['time', 0.1],
 ];
+/** Asymmetric L/S genomes also redraw their short regime filter now and then. */
+const ASYMMETRIC_MUTATION_WEIGHTS: readonly (readonly [MutationKind, number])[] = [...MUTATION_WEIGHTS, ['short', 0.08]];
 /**
  * A filter mutation removes an existing optional filter with probability `FILTER_DROP_RATE`, and adds
  * one to a single-indicator strategy with probability `FILTER_ADD_RATE` (otherwise it tunes a number).
@@ -1369,20 +1595,23 @@ function tweak(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
 function mutateExit(rng: Rng, g: StrategyGenome, allowReversal: boolean, limits: GenomeLimits): void {
   const exit = g.exit;
   if (exit.mode === 'static') {
-    g.exit = randomDynamicExit(rng, allowReversal);
+    // Mostly switch to ATR exits; sometimes toggle the breakeven lock of the fixed bracket.
+    if (rng() < 0.3) exit.breakeven = !exit.breakeven;
+    else g.exit = randomDynamicExit(rng, allowReversal);
     return;
   }
   const r = rng();
-  const options = allowReversal ? 4 : 3;
+  const options = allowReversal ? 5 : 4;
   const k = Math.floor(r * options);
   if (k === 0) g.exit = randomStaticExit(rng, limits);
   else if (k === 1) exit.trailing = !exit.trailing;
   else if (k === 2) exit.takeProfitAtrMult = exit.takeProfitAtrMult === null ? pick(rng, GRIDS.takeProfitAtrMult) : null;
+  else if (k === 3) exit.breakeven = !exit.breakeven;
   else exit.reversalExit = !exit.reversalExit;
 }
 
 function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: GenomeLimits): void {
-  const kind = pickWeighted(rng, MUTATION_WEIGHTS);
+  const kind = pickWeighted(rng, g.shortRegime ? ASYMMETRIC_MUTATION_WEIGHTS : MUTATION_WEIGHTS);
   const spec = HYPOTHESES[h];
   const slots = entrySlots(g, limits);
   const rebuild = (): void => {
@@ -1423,6 +1652,13 @@ function applyMutation(rng: Rng, g: StrategyGenome, h: Hypothesis, limits: Genom
       if (g.maxBarsInTrade === null) g.maxBarsInTrade = pick(rng, TIME_STOP_GRID);
       else if (rng() < 0.5) g.maxBarsInTrade = null;
       else g.maxBarsInTrade = pick(rng, TIME_STOP_GRID.filter((v) => v !== g.maxBarsInTrade));
+      return;
+    }
+    case 'short': {
+      // A fresh short regime: the other filter type, or new numbers for the same one.
+      const next = drawShortRegime(rng, limits);
+      if (next) g.shortRegime = next;
+      else tweak(rng, g, limits);
       return;
     }
   }
@@ -1474,11 +1710,13 @@ export function crossoverGenomes(
   const entryFromA = rng() < 0.5;
   const entrySource = cloneGenome(entryFromA ? a : b);
   const exitSource = cloneGenome(entryFromA ? b : a);
+  const shortRegime = rng() < 0.5 ? entrySource.shortRegime : exitSource.shortRegime;
   const child: StrategyGenome = {
     archetype: entrySource.archetype,
     ...(entrySource.hypothesis !== undefined ? { hypothesis: entrySource.hypothesis } : {}),
     longEntry: entrySource.longEntry,
     shortEntry: null,
+    ...(shortRegime ? { shortRegime } : {}),
     exit: exitSource.exit,
     maxBarsInTrade: rng() < 0.5 ? entrySource.maxBarsInTrade : exitSource.maxBarsInTrade,
   };
@@ -1563,10 +1801,12 @@ function conditionKey(c: Condition): string {
 /** Canonical string identity of a genome (derived parts are implied and not included). */
 export function genomeSignature(g: StrategyGenome): string {
   const exit =
-    g.exit.mode === 'static'
+    (g.exit.mode === 'static'
       ? `S:${g.exit.stopLossPct}:${g.exit.takeProfitPct}`
-      : `D:${g.exit.atrPeriod}:${g.exit.stopAtrMult}:${g.exit.trailing ? 1 : 0}:${g.exit.takeProfitAtrMult ?? 'x'}:${g.exit.reversalExit ? 1 : 0}`;
-  return `${g.hypothesis ?? '-'}|${g.archetype}|${g.longEntry.conditions.map(conditionKey).join(';')}|${g.shortEntry ? 'LS' : 'L'}|${exit}|${g.maxBarsInTrade ?? 'x'}`;
+      : `D:${g.exit.atrPeriod}:${g.exit.stopAtrMult}:${g.exit.trailing ? 1 : 0}:${g.exit.takeProfitAtrMult ?? 'x'}:${g.exit.reversalExit ? 1 : 0}`) +
+    (g.exit.breakeven ? ':BE' : '');
+  const shorts = g.shortEntry === null ? 'L' : g.shortRegime ? `AS(${conditionKey(g.shortRegime)})` : 'LS';
+  return `${g.hypothesis ?? '-'}|${g.archetype}|${g.longEntry.conditions.map(conditionKey).join(';')}|${shorts}|${exit}|${g.maxBarsInTrade ?? 'x'}`;
 }
 
 /**
@@ -1578,8 +1818,9 @@ export function genomeNiche(g: StrategyGenome): string {
   const families = g.longEntry.conditions.map((c) => c.ind).sort();
   const trigger = g.longEntry.conditions[0]?.op ?? '';
   const exit =
-    g.exit.mode === 'static'
+    (g.exit.mode === 'static'
       ? 'S'
-      : `D${g.exit.trailing ? 't' : ''}${g.exit.takeProfitAtrMult !== null ? 'p' : ''}${g.exit.reversalExit ? 'r' : ''}`;
+      : `D${g.exit.trailing ? 't' : ''}${g.exit.takeProfitAtrMult !== null ? 'p' : ''}${g.exit.reversalExit ? 'r' : ''}`) +
+    (g.exit.breakeven ? 'b' : '');
   return `${g.hypothesis ?? g.archetype}|${families.join('+')}|${trigger}|${exit}${g.maxBarsInTrade === null ? '' : 'T'}`;
 }

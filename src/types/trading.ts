@@ -115,7 +115,24 @@ export interface BasketComponent {
 /*  Strategy genome                                                           */
 /* -------------------------------------------------------------------------- */
 
-export type TradeMode = 'long-only' | 'long-short';
+/**
+ * Direction mode of a run:
+ *   long-only   – never sells short (the default: equities and spot crypto drift upwards, and shorts
+ *                 pay funding or borrow);
+ *   asymmetric  – shorts use the mirrored entry trigger but ONLY inside their own, independently
+ *                 tuned bear-regime filter (close below a slow EMA/SMA, or a falling slow EMA/SMA), so
+ *                 the short side sits out bull markets instead of fading every pullback;
+ *   long-short  – mirrored Long/Short: the short rules are the exact mirror image of the long rules.
+ */
+export type TradeMode = 'long-only' | 'asymmetric' | 'long-short';
+export const TRADE_MODES: readonly TradeMode[] = ['long-only', 'asymmetric', 'long-short'];
+export const TRADE_MODE_LABEL: Record<TradeMode, string> = {
+  'long-only': 'Long-Only',
+  asymmetric: 'Asymmetric L/S',
+  'long-short': 'Mirrored L/S',
+};
+/** True when a run in this mode may open short positions. */
+export const allowsShorts = (mode: TradeMode): boolean => mode !== 'long-only';
 
 /** Comparison operator applied as `left <op> right` on closed candles. */
 export type CmpOp = 'gt' | 'lt' | 'cross_above' | 'cross_below';
@@ -170,7 +187,30 @@ export type Condition =
    */
   | { ind: 'DONCHIAN'; period: number; variant: 'upper' | 'lower'; op: CmpOp }
   /** MA(period) <op> the same MA `SLOPE_LAG` candles earlier – the sign of the trend's slope */
-  | { ind: 'MA_SLOPE'; maType: MaType; period: number; op: CmpOp };
+  | { ind: 'MA_SLOPE'; maType: MaType; period: number; op: CmpOp }
+  /**
+   * Keltner channel EMA(period) ± mult × ATR(period).
+   * upper: Close <op> upper channel (a volatility breakout)
+   * lower: Close <op> lower channel (a pullback / rejection at the lower channel)
+   */
+  | { ind: 'KELTNER'; period: number; mult: number; variant: 'upper' | 'lower'; op: CmpOp }
+  /**
+   * Volatility-squeeze release: Bollinger(period, 2σ) was inside Keltner(period, mult × ATR) on the
+   * previous candle and is not on this one. The series is +1 when the release closes above the
+   * Bollinger basis, −1 when it closes below, 0 otherwise; `level` is +0.5 (long) or −0.5 (short).
+   */
+  | { ind: 'SQUEEZE'; period: number; mult: number; op: CmpOp; level: number }
+  /**
+   * ATR range expansion: this candle's true range exceeds `mult` × ATR(period) of the previous
+   * candle. +1 when it closed up, −1 when it closed down, 0 otherwise; `level` is ±0.5.
+   */
+  | { ind: 'RANGE_EXP'; period: number; mult: number; op: CmpOp; level: number }
+  /**
+   * Pullback to dynamic support: the candle touched MA(period) and closed back on the trend side –
+   * +1 when Low ≤ MA < Close (support held), −1 when High ≥ MA > Close (resistance held), else 0;
+   * `level` is ±0.5.
+   */
+  | { ind: 'PULLBACK'; maType: MaType; period: number; op: CmpOp; level: number };
 
 /** Candles over which an MA_SLOPE condition measures the slope. */
 export const SLOPE_LAG = 10;
@@ -195,7 +235,7 @@ export type ConditionRole = 'TREND_UP' | 'TREND_DOWN' | 'OVERSOLD' | 'OVERBOUGHT
  * TREND:          buy strength – one TREND_UP trigger, optionally gated by a FILTER.
  * MEAN_REVERSION: buy weakness – one OVERSOLD or short-term TREND_DOWN trigger, optionally
  *                 gated by a slow up-trend regime filter or a FILTER.
- * Shorts are always the exact mirror image of the long rules.
+ * Shorts mirror the long trigger; in Asymmetric mode they also need their own bear-regime filter.
  */
 export type Archetype = 'TREND' | 'MEAN_REVERSION';
 
@@ -214,6 +254,8 @@ export interface StaticExit {
   stopLossPct: number;
   /** % of entry price, from STATIC_PCT_GRID. */
   takeProfitPct: number;
+  /** Breakeven lock: once the trade has moved 1R in favour, the stop moves to the entry price. */
+  breakeven?: boolean;
 }
 
 /** ATR-driven exits: ATR stop, optional ATR target, optional trailing, optional indicator-reversal exit. */
@@ -233,6 +275,8 @@ export interface DynamicExit {
   longExit: RuleGroup | null;
   /** Derived: mirror of the short entry trigger when `reversalExit` is on, else null. */
   shortExit: RuleGroup | null;
+  /** Breakeven lock: once the trade has moved 1R (the initial stop distance) in favour, the stop moves to the entry price. */
+  breakeven?: boolean;
 }
 
 export type ExitGene = StaticExit | DynamicExit;
@@ -243,8 +287,16 @@ export interface StrategyGenome {
   hypothesis?: Hypothesis;
   /** conditions[0] is the trigger, conditions[1] the optional filter. */
   longEntry: RuleGroup;
-  /** Derived: the mirror image of `longEntry` in Long/Short mode, null in Long-Only mode. */
+  /**
+   * Derived: null in Long-Only mode; the mirror image of `longEntry` in Mirrored L/S mode; the
+   * mirrored trigger AND `shortRegime` in Asymmetric L/S mode.
+   */
   shortEntry: RuleGroup | null;
+  /**
+   * Asymmetric L/S only: the short side's own bear-regime filter (close below a slow EMA/SMA, or a
+   * falling slow EMA/SMA), tuned independently of the long rules. Absent in the other modes.
+   */
+  shortRegime?: Condition | null;
   exit: ExitGene;
   /** Time stop: close the trade at the open after this many bars (null = disabled). */
   maxBarsInTrade: number | null;
@@ -399,6 +451,78 @@ export interface StabilityGrid {
   baseY: number;
 }
 
+/**
+ * Monte Carlo execution stress test of a strategy's search-period trades (see `engine/monteCarlo.ts`):
+ * hundreds of re-played trade sequences with 10% of the trades skipped at random, the order
+ * shuffled and random adverse slippage shocks on every fill.
+ */
+export interface MonteCarloSummary {
+  simulations: number;
+  /** Trades in the sample each path is drawn from. */
+  trades: number;
+  /** Share of paths that end with a profit (0–1). */
+  probProfit: number;
+  /** 95th-percentile worst-case max drawdown over the paths, in percent (intrabar marks included). */
+  drawdownP95: number;
+  /** Median and 5th-percentile total return of the paths, in percent. */
+  medianReturn: number;
+  p5Return: number;
+  /** Max drawdown of the original trade sequence, measured the same way, in percent. */
+  baseDrawdown: number;
+  /** probProfit ≥ 80% and a 95th-percentile drawdown below 50%. */
+  passed: boolean;
+}
+
+/** Percentile bands of the Monte Carlo equity paths (multiples of starting equity) by trade number. */
+export interface MonteCarloBands {
+  /** Trade numbers the bands are sampled at (0 = start). */
+  x: number[];
+  p5: number[];
+  p25: number[];
+  p50: number[];
+  p75: number[];
+  p95: number[];
+}
+
+export interface MonteCarloReport extends MonteCarloSummary {
+  bands: MonteCarloBands;
+}
+
+/** One unseen asset of a cross-market generalization check. */
+export interface CrossMarketRow {
+  symbol: string;
+  /** False when the asset was part of the run (it is then not unseen and not counted). */
+  unseen: boolean;
+  /** Candles tested (the asset's history before the run's holdout boundary). */
+  bars: number;
+  roi: number;
+  sharpe: number;
+  maxDrawdown: number;
+  trades: number;
+  /** Buy & Hold return over the same candles, in percent. */
+  holdRoi: number;
+  profitable: boolean;
+  /** Null when the asset could not be tested (too little history); the reason is in `note`. */
+  note: string | null;
+}
+
+/**
+ * Cross-market generalization check: the strategy's exact (frozen) rules on correlated assets the
+ * search never saw, over the dates before the run's holdout boundary – so the holdout stays sealed.
+ */
+export interface CrossMarketReport {
+  rows: CrossMarketRow[];
+  /** Unseen assets with enough history. */
+  tested: number;
+  /** Share of those that made money (0–1). */
+  share: number;
+  medianSharpe: number;
+  /** At least 2 assets tested, two thirds profitable and a positive median Sharpe. */
+  passed: boolean;
+  /** Last date tested (the run's holdout boundary), ms. */
+  cutoff: number;
+}
+
 export interface RobustnessReport {
   sensitivity: {
     /** Number of ±20% single-parameter variants that were re-tested. */
@@ -421,6 +545,8 @@ export interface RobustnessReport {
   };
   /** Parameter-stability map (null when the strategy has no tunable parameter). */
   stability?: StabilityGrid | null;
+  /** Monte Carlo execution stress test with its equity-path bands (null without trades). */
+  monteCarlo?: MonteCarloReport | null;
   /** Null when no other assets were available. */
   crossAsset: {
     rows: { symbol: string; roi: number; sharpe: number; trades: number; profitable: boolean }[];
@@ -503,6 +629,8 @@ export interface StrategyResult {
   sample?: SampleInfo;
   /** Robustness gates (search period only), re-checked whenever the luck hurdle moves. */
   robust?: RobustChecks;
+  /** Monte Carlo execution stress test of the search-period trades (leaderboard entries only). */
+  monteCarlo?: MonteCarloSummary | null;
 }
 
 export interface BenchmarkResult {
@@ -625,7 +753,16 @@ export type WorkerRequest =
    * period had already been revealed (from the persistent holdout log); `simulated` marks fallback data.
    * Both stop the strategy from being rated Robust.
    */
-  | { type: 'lock'; strategyId: string; priorReveals: number; simulated: boolean };
+  | { type: 'lock'; strategyId: string; priorReveals: number; simulated: boolean }
+  /** Cross-market generalization check of one strategy on unseen assets (see `CrossMarketReport`). */
+  | {
+      type: 'cross-market';
+      strategyId: string;
+      genome: StrategyGenome;
+      datasets: NamedDataset[];
+      /** Every symbol the run itself used (basket legs included): those are never counted as unseen. */
+      runSymbols?: string[];
+    };
 
 export interface ProgressSnapshot {
   /** Candidates proposed, including duplicates that were not evaluated. */
@@ -716,6 +853,7 @@ export type WorkerResponse =
   | { type: 'analysis'; strategyId: string; report: RobustnessReport; verdict: Verdict | null }
   /** The locked strategy with its holdout, robustness report and verdict, plus the Buy & Hold holdout. */
   | { type: 'locked'; strategy: StrategyResult; benchmark: BenchmarkResult }
+  | { type: 'cross-market'; strategyId: string; report: CrossMarketReport }
   | { type: 'error'; message: string };
 
 export type EngineStatus = 'idle' | 'loading' | 'optimizing' | 'stopped' | 'converged' | 'error';

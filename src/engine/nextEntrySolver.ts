@@ -21,7 +21,7 @@ import { BacktestWorkspace, evaluateCondition, evaluateGroup, fillSlippage, reso
 import { conditionOperands, conditionFormula } from './describe';
 import { conditionRole } from './genome';
 import { IndicatorCache } from './indicators';
-import type { BacktestSettings, CmpOp, Condition, OHLCV, RuleGroup, StrategyGenome } from '../types/trading';
+import { allowsShorts, type BacktestSettings, type CmpOp, type Condition, type OHLCV, type RuleGroup, type StrategyGenome } from '../types/trading';
 
 /** Trailing candles used when probing the next bar (enough for every 200-bar lookback to converge). */
 export const SOLVER_WINDOW = 2000;
@@ -117,6 +117,10 @@ export interface PositionForecast {
   exitAtNextOpen: string | null;
   /** Bars left before the time stop closes the trade (null = no time stop). */
   timeStopIn: number | null;
+  /** Breakeven lock: price at +1R that moves the stop to the entry (null without a lock, or once locked). */
+  breakevenAt: number | null;
+  /** True once the breakeven lock has moved the stop to the entry price. */
+  breakevenLocked: boolean;
   /** Next-candle close that would trigger an indicator exit or a reversal, with its source. */
   signalExitPrice: number | null;
   signalExitSource: string | null;
@@ -318,7 +322,13 @@ function scaleOf(c: Condition, atr: number, right: number): { scale: number; uni
     case 'MACD':
     case 'DONCHIAN':
     case 'MA_SLOPE':
+    case 'KELTNER':
       return priceUnit;
+    case 'SQUEEZE':
+    case 'RANGE_EXP':
+    case 'PULLBACK':
+      // One-candle events: there is no distance to measure, only whether the next candle can fire them.
+      return { scale: 1, unit: 'event', price: false };
     case 'BB':
       if (c.variant === 'pctb') return { scale: 0.1, unit: '%B', price: false };
       if (c.variant === 'bandwidth') return { scale: Math.max(0.1, 0.2 * Math.abs(right)), unit: 'pts', price: false };
@@ -345,6 +355,17 @@ function fmtValue(value: number, price: boolean): string {
     return value.toPrecision(4);
   }
   return String(Number(value.toFixed(abs >= 100 ? 1 : abs >= 1 ? 2 : 3)));
+}
+
+/** The signed event series (+1 / −1 / 0): a squeeze release, a range expansion, a pullback that holds. */
+const isEvent = (c: Condition): boolean => c.ind === 'SQUEEZE' || c.ind === 'RANGE_EXP' || c.ind === 'PULLBACK';
+
+/** Short name of an event condition for the checklist. */
+function eventName(c: Condition): string {
+  if (c.ind === 'SQUEEZE') return `Squeeze release ${c.level > 0 ? 'up' : 'down'} (BB ${c.period} inside KC ${c.mult})`;
+  if (c.ind === 'RANGE_EXP') return `Range expansion ${c.level > 0 ? 'up' : 'down'} (TR > ${c.mult} × ATR ${c.period})`;
+  if (c.ind === 'PULLBACK') return `Pullback ${c.level > 0 ? 'holding above' : 'rejected below'} ${c.maType}(${c.period})`;
+  return conditionFormula(c);
 }
 
 function jobOf(group: RuleGroup, index: number, exit: boolean): ConditionCheck['job'] {
@@ -385,6 +406,31 @@ function checkConditions(
     else if (reachable) state = 'pending';
     else if (crossing && gap < 0) state = 'reset';
     else state = 'blocked';
+
+    if (isEvent(c)) {
+      // An event either can or cannot fire on the next candle; there is no partial distance.
+      const name = eventName(c);
+      const text =
+        state === 'met'
+          ? `${name}: fired on the last candle [Met]`
+          : state === 'pending'
+            ? `${name}: can fire on the next candle at the right close [Pending]`
+            : `${name}: cannot fire on the next candle${c.ind === 'SQUEEZE' ? ' (no squeeze is in progress)' : ''} [Blocked]`;
+      return {
+        formula: conditionFormula(c),
+        job: jobOf(group, i, exit),
+        state,
+        leftLabel: name,
+        rightLabel: '',
+        left,
+        right,
+        op: c.op,
+        distance: null,
+        unit: 'event',
+        proximity: state === 'met' ? 1 : state === 'pending' ? 0.5 : 0.05,
+        text,
+      };
+    }
 
     const distance = state === 'met' ? null : Math.max(0, gap) / scale;
     let proximity: number;
@@ -549,7 +595,7 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
   if (n < 3) throw new Error('Not enough candles to forecast the next entry.');
   const last = n - 1;
   const lastClose = data.c[last];
-  const shortsEnabled = settings.tradeMode === 'long-short' && genome.shortEntry !== null;
+  const shortsEnabled = allowsShorts(settings.tradeMode) && genome.shortEntry !== null;
   const notes: string[] = [];
 
   // Exact current state from the full history, with the backtester itself.
@@ -612,7 +658,9 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       summary: '',
     };
     if (!group || (side === 'short' && !shortsEnabled)) {
-      base.reason = 'Long-Only mode: this strategy never sells short.';
+      base.reason = !allowsShorts(settings.tradeMode)
+        ? 'Long-Only mode: this strategy never sells short.'
+        : 'No short rule: the Asymmetric short side needs a slow EMA/SMA for its bear-regime filter, and this history is too short for one.';
       base.summary = sideSummary(base);
       return base;
     }
@@ -737,6 +785,7 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       }
     }
 
+    const breakeven = genome.exit.breakeven === true;
     position = {
       dir: side,
       entryTime: data.t[open.entryBar],
@@ -749,6 +798,8 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       timeStopIn,
       signalExitPrice,
       signalExitSource,
+      breakevenAt: breakeven && !open.breakevenLocked && open.risk > 0 ? open.entryPrice + dir * open.risk : null,
+      breakevenLocked: breakeven && open.breakevenLocked,
     };
   }
 

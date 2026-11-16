@@ -1,11 +1,28 @@
 /**
- * Strategy Breakdown drawer: a human-readable explanation of the selected
- * strategy – indicators and exact parameters, plain-English entry and exit
- * rules, in-sample vs. out-of-sample metrics, and a Pine Script v5 export.
+ * Step 4 – the Strategy Workbench: everything about the selected strategy on one page.
+ *
+ *   • a plain-English verdict and a status badge for every robustness check,
+ *   • the equity curve against Buy & Hold and the Next Entry Forecast (trigger prices, readiness),
+ *   • the Monte Carlo stress curve and the parameter-stability heatmap,
+ *   • the cross-market generalization check and the one-shot locked holdout reveal,
+ *   • the exact rules, the train / validation / holdout figures and the 1-click Pine Script v5 export.
  */
 
-import { Check, CircleCheck, CircleX, Copy, Info, Loader2, Lock, TriangleAlert, X } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  Check,
+  CircleCheck,
+  CircleDashed,
+  CircleX,
+  Copy,
+  Download,
+  Globe,
+  Info,
+  Loader2,
+  Lock,
+  Pin,
+  TriangleAlert,
+} from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   ARCHETYPE_LABEL,
   describeArchetype,
@@ -14,6 +31,7 @@ import {
   describeShortEntry,
   indicatorBadges,
   listIndicators,
+  shortRuleLabel,
   type RuleDescription,
 } from '../engine/describe';
 import { FREE_PARAMETERS, HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
@@ -22,20 +40,32 @@ import StabilityHeatmap from './StabilityHeatmap';
 import { MIN_HOLDOUT_TRADES_FLOOR } from '../engine/backtester';
 import { generatePineScript } from '../engine/pine';
 import type { RunContext } from '../lib/config';
+import { diagnosticBadges, strategyVerdict, type BadgeStatus, type DiagnosticBadge } from '../lib/diagnostics';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
 import { sharpeConfidenceInterval } from '../lib/stats';
-import type { BenchmarkResult, PerformanceMetrics, RobustnessReport, StrategyResult, Verdict } from '../types/trading';
+import type { BenchmarkResult, ChartAxis, CrossMarketReport, PerformanceMetrics, RobustnessReport, StrategyResult, Verdict } from '../types/trading';
 import type { MarketSnapshot } from '../lib/marketSnapshot';
+import EquityChart, { BENCHMARK_COLOR, STRATEGY_COLOR } from './EquityChart';
 import { VerdictPill } from './Leaderboard';
+import MonteCarloChart from './MonteCarloChart';
 import NextEntryForecast from './NextEntryForecast';
-import { cx, Pill } from './ui';
+import { cx, LineKey, Panel, Pill, StepHeader } from './ui';
 
-interface StrategyModalProps {
+/** State of a cross-market check for one strategy. */
+export interface CrossMarketState {
+  status: 'loading' | 'done' | 'error';
+  symbols: string[];
+  report?: CrossMarketReport;
+  error?: string;
+}
+
+interface StrategyWorkbenchProps {
   strategy: StrategyResult;
   /** Current leaderboard rank, or null when the strategy has since dropped out of the Top 25. */
   rank: number | null;
   benchmark: BenchmarkResult;
   context: RunContext;
+  axis: ChartAxis | null;
   /** Strategies this run has evaluated (earlier runs on the window are in `context.priorTrials`). */
   testedCount: number;
   barsPerYear: number;
@@ -55,14 +85,21 @@ interface StrategyModalProps {
   snapshot: MarketSnapshot | null;
   /** Fetch fresh candles for the forecast. */
   onRefreshSnapshot: () => Promise<void>;
-  onClose: () => void;
+  /** True when the user picked this strategy (false: the workbench follows the current #1). */
+  pinned: boolean;
+  onFollowBest: () => void;
+  /** Cross-market check of this strategy, if one was run. */
+  crossMarket: CrossMarketState | null;
+  /** Default unseen tickers for the cross-market check. */
+  crossMarketSuggestion: string;
+  onRunCrossMarket: (symbols: string[]) => void;
 }
 
 /* -------------------------------------------------------------------------- */
 
-function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }): JSX.Element {
+function Section({ title, hint, children, className }: { title: string; hint?: string; children: ReactNode; className?: string }): JSX.Element {
   return (
-    <section className="border-t border-line px-5 py-5">
+    <section className={cx('border-t border-line px-5 py-5', className)}>
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-2">{title}</h3>
         {hint && <span className="text-[11px] text-ink-3">{hint}</span>}
@@ -172,11 +209,67 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-export default function StrategyModal({
+/* -------------------------------------------------------------------------- */
+
+const BADGE_STYLE: Record<BadgeStatus, { box: string; icon: ReactNode; word: string }> = {
+  pass: { box: 'border-up/35 bg-up/10', icon: <CircleCheck size={15} className="text-up" />, word: 'Pass' },
+  warn: { box: 'border-warn/35 bg-warn/10', icon: <TriangleAlert size={15} className="text-warn" />, word: 'Caution' },
+  fail: { box: 'border-down/35 bg-down/10', icon: <CircleX size={15} className="text-down" />, word: 'Fail' },
+  pending: { box: 'border-line bg-raised/50', icon: <CircleDashed size={15} className="text-ink-3" />, word: 'Not yet' },
+};
+
+function Badge({ badge }: { badge: DiagnosticBadge }): JSX.Element {
+  const style = BADGE_STYLE[badge.status];
+  return (
+    <div className={cx('min-w-0 rounded-lg border px-3 py-2', style.box)} title={badge.tooltip}>
+      <div className="flex items-center gap-1.5">
+        {style.icon}
+        <span className="truncate text-xs font-semibold text-ink">{badge.label}</span>
+        <span className="sr-only">{style.word}</span>
+      </div>
+      <div className="num mt-0.5 truncate text-sm font-semibold text-ink">{badge.value}</div>
+      <div className="mt-0.5 truncate text-[10.5px] uppercase tracking-wider text-ink-3">{badge.metric}</div>
+    </div>
+  );
+}
+
+const VERDICT_STYLE: Record<ReturnType<typeof strategyVerdict>['tone'], string> = {
+  strong: 'border-up/40 bg-up/10',
+  promising: 'border-accent/40 bg-accent/10',
+  mixed: 'border-warn/40 bg-warn/10',
+  weak: 'border-down/40 bg-down/10',
+};
+
+/** Compact Strategy vs Buy & Hold figures next to the equity curve. */
+const VS_ROWS: { label: string; format: (m: PerformanceMetrics) => string; benchmark?: boolean }[] = [
+  { label: 'Sharpe', format: (m) => fmtNum(m.sharpe) },
+  { label: 'Sortino', format: (m) => fmtNum(m.sortino) },
+  { label: 'Max drawdown', format: (m) => fmtPct(m.maxDrawdown) },
+  { label: 'CAGR', format: (m) => fmtPct(m.cagr, true) },
+  { label: 'ROI', format: (m) => fmtPct(m.roi, true) },
+  { label: 'Trades', format: (m) => fmtInt(m.trades), benchmark: false },
+  { label: 'Win rate', format: (m) => fmtPct(m.winRate), benchmark: false },
+  { label: 'Time in market', format: (m) => fmtPct(m.exposure, false, 0) },
+];
+
+function download(filename: string, text: string): void {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export default function StrategyWorkbench({
   strategy,
   rank,
   benchmark,
   context,
+  axis,
   testedCount,
   barsPerYear,
   analysis,
@@ -187,41 +280,30 @@ export default function StrategyModal({
   onLock,
   snapshot,
   onRefreshSnapshot,
-  onClose,
-}: StrategyModalProps): JSX.Element {
-  const closeRef = useRef<HTMLButtonElement>(null);
+  pinned,
+  onFollowBest,
+  crossMarket,
+  crossMarketSuggestion,
+  onRunCrossMarket,
+}: StrategyWorkbenchProps): JSX.Element {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   /** Locking is irreversible, so it takes two clicks. */
   const [confirmLock, setConfirmLock] = useState(false);
   const [showCode, setShowCode] = useState(false);
+  const [crossInput, setCrossInput] = useState(crossMarketSuggestion);
   const { genome } = strategy;
   const report = analysis?.report ?? strategy.robustness;
   const verdict = analysis?.verdict ?? strategy.verdict;
   const revealed = strategy.holdout !== null;
   const risk = useMemo(() => overfittingRisk(strategy), [strategy]);
   const hypothesis = genome.hypothesis ? HYPOTHESES[genome.hypothesis] : null;
-
-  // Close on Escape, lock background scroll, and move focus into the dialog.
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    const overflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    closeRef.current?.focus();
-    return () => {
-      window.removeEventListener('keydown', onKey);
-      document.body.style.overflow = overflow;
-      previous?.focus?.();
-    };
-  }, [onClose]);
+  const trials = context.priorTrials.count + testedCount;
 
   useEffect(() => {
     setCopyState('idle');
     setConfirmLock(false);
   }, [strategy.id]);
+  useEffect(() => setCrossInput(crossMarket?.symbols.join(', ') ?? crossMarketSuggestion), [strategy.id, crossMarket, crossMarketSuggestion]);
 
   const indicators = useMemo(() => listIndicators(genome), [genome]);
   const longEntry = useMemo(() => describeLongEntry(genome), [genome]);
@@ -231,6 +313,11 @@ export default function StrategyModal({
     () => (strategy.holdout ? sharpeConfidenceInterval(strategy.holdout, barsPerYear) : null),
     [strategy.holdout, barsPerYear],
   );
+  const cross = crossMarket?.report ?? null;
+  const diagnostics = useMemo(() => {
+    const input = { strategy: { ...strategy, verdict }, report, crossMarket: cross, trials, simulated: context.simulated };
+    return { badges: diagnosticBadges(input), verdict: strategyVerdict(input) };
+  }, [strategy, verdict, report, cross, trials, context.simulated]);
 
   const pine = useMemo(
     () =>
@@ -259,223 +346,338 @@ export default function StrategyModal({
 
   const ambiguousShare = strategy.search.trades > 0 ? strategy.search.ambiguousTrades / strategy.search.trades : 0;
   const benchSegment = benchmark.holdout ?? benchmark.validation;
+  const mc = report?.monteCarlo ?? null;
+  const mcSummary = mc ?? strategy.monteCarlo ?? null;
+  const crossSymbols = crossInput
+    .split(/[,\s]+/)
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter(Boolean);
 
   return (
-    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-labelledby="strategy-modal-title">
-      <div className="animate-fade absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick={onClose} aria-hidden="true" />
-
-      <div className="animate-drawer absolute inset-y-0 right-0 flex w-full max-w-[820px] flex-col border-l border-line-strong bg-panel shadow-2xl">
-        {/* Header */}
-        <header className="flex items-start justify-between gap-4 px-5 py-4">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 id="strategy-modal-title" className="num text-lg font-semibold text-ink">
-                Strategy {strategy.id}
-              </h2>
-              {rank !== null ? <Pill tone="accent">Rank #{rank}</Pill> : <Pill>No longer in Top 25</Pill>}
-              <Pill tone="bench">{hypothesis ? hypothesis.label : ARCHETYPE_LABEL[genome.archetype]}</Pill>
-              <Pill tone={genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exit.mode}</Pill>
-              <Pill>{genome.shortEntry ? 'Long/Short' : 'Long-Only'}</Pill>
-              <Pill tone={strategy.params > FREE_PARAMETERS ? 'warn' : 'neutral'}>{strategy.params} params</Pill>
-              {verdict !== null && <VerdictPill verdict={verdict} />}
-            </div>
-            <p className="num mt-1 truncate text-xs text-ink-3">
-              {context.venue} · {context.interval} candles · {fmtDate(context.windowStart)} → {fmtDate(context.windowEnd)} · found at
-              iteration {fmtInt(strategy.foundAt)}
-            </p>
+    <Panel className="overflow-hidden">
+      {/* Header */}
+      <header className="border-b border-line px-5 py-4">
+        <StepHeader step={4} title={`Strategy workbench · ${strategy.id}`} hint="Everything about the selected strategy – from the verdict to the TradingView script.">
+          <div className="flex flex-wrap items-center gap-2">
+            {rank !== null ? <Pill tone="accent">Rank #{rank}</Pill> : <Pill>No longer in Top 25</Pill>}
+            {pinned ? (
+              <button
+                type="button"
+                onClick={onFollowBest}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-line px-2 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+                title="Stop inspecting the clicked strategy and follow the current #1"
+              >
+                <Pin size={12} /> Follow #1
+              </button>
+            ) : (
+              <Pill tone="accent">Following #1</Pill>
+            )}
           </div>
-          <button
-            ref={closeRef}
-            type="button"
-            onClick={onClose}
-            aria-label="Close strategy breakdown"
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover hover:text-ink"
-          >
-            <X size={16} />
-          </button>
-        </header>
+        </StepHeader>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Pill tone="bench">{hypothesis ? hypothesis.label : ARCHETYPE_LABEL[genome.archetype]}</Pill>
+          <Pill>{shortRuleLabel(genome)}</Pill>
+          <Pill tone={genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exit.mode}</Pill>
+          {genome.exit.breakeven && <Pill tone="accent">Breakeven lock</Pill>}
+          {genome.exit.mode === 'dynamic' && genome.exit.trailing && <Pill tone="accent">Trailing ATR stop</Pill>}
+          <Pill tone={strategy.params > FREE_PARAMETERS ? 'warn' : 'neutral'}>{strategy.params} params</Pill>
+          {verdict !== null && <VerdictPill verdict={verdict} />}
+          <span className="num ml-1 truncate text-xs text-ink-3">
+            {context.venue} · {context.interval} candles · {fmtDate(context.windowStart)} → {fmtDate(context.windowEnd)} · found at
+            iteration {fmtInt(strategy.foundAt)}
+          </span>
+        </div>
+      </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <NextEntryForecast genome={genome} settings={context.settings} snapshot={snapshot} onRefresh={onRefreshSnapshot} />
-
-          {/* Headline numbers: selection-bias-aware and risk-adjusted first; raw return last and labelled in-sample. */}
-          <div className="grid grid-cols-2 gap-2 px-5 pb-2 sm:grid-cols-3">
-            <StatTile
-              label="Overfit risk"
-              value={`${risk.score} · ${risk.level}`}
-              tone={risk.level === 'low' ? 'text-up' : risk.level === 'moderate' ? 'text-warn' : 'text-down'}
-            />
-            <StatTile
-              label="Deflated Sharpe"
-              value={fmtPct(strategy.dsr * 100, false, 0)}
-              tone={strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink'}
-            />
-            <StatTile label="Haircut Sharpe" value={strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)} />
-            <StatTile label="Validation Sharpe" value={fmtNum(strategy.validation.sharpe)} />
-            <StatTile label="Max drawdown" value={fmtPct(strategy.search.maxDrawdown)} />
-            <StatTile label="Trades (validation)" value={`${fmtInt(strategy.search.trades)} (${fmtInt(strategy.validation.trades)})`} />
-          </div>
-          <p className="px-5 pb-5 text-[11px] text-ink-3">
-            The deflated and haircut Sharpe account for all {fmtInt(context.priorTrials.count + testedCount)} strategies tried on this data
-            window across every run. The other figures cover train + validation – the 80% of history the search optimised on, so they are
-            biased upwards: in-sample ROI {fmtPct(strategy.search.roi, true)}, {fmtPct(strategy.alpha, true)} vs. Buy &amp; Hold.
-          </p>
-
-          <Section title="Overfitting risk" hint="0 = low · 100 = high">
-            <div className="flex flex-wrap items-baseline gap-3">
-              <span className="num text-3xl font-semibold text-ink">{risk.score}</span>
-              <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level} risk</Pill>
-              <span className="text-xs text-ink-3">
-                {risk.level === 'low'
-                  ? 'The evidence that this is more than a lucky fit is comparatively strong.'
-                  : risk.level === 'moderate'
-                    ? 'Some of the evidence points to a fit of past noise.'
-                    : 'Most of the evidence points to a fit of past noise – treat it as unproven.'}
-              </span>
-            </div>
-            <ul className="mt-3 space-y-1.5">
-              {risk.components.map((component) => (
-                <li key={component.key} className="grid grid-cols-[150px_minmax(0,1fr)_44px] items-center gap-3 text-xs">
-                  <span className="text-ink-2" title={`${component.weight} of 100 points`}>
-                    {component.label} <span className="text-ink-3">· {component.weight}</span>
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
-                      <span className="block h-full rounded-full bg-ink-3" style={{ width: `${component.risk * 100}%` }} />
-                    </span>
-                    <span className="mt-0.5 block truncate text-[11px] text-ink-3">{component.detail}</span>
-                  </span>
-                  <span className="num text-right font-semibold text-ink">{Math.round(component.weight * component.risk)}</span>
-                </li>
-              ))}
-            </ul>
-          </Section>
-
-          {context.simulated && (
-            <div className="mx-5 mb-5 flex gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
-              <Info size={14} className="mt-0.5 shrink-0" />
-              <span>
-                This run used simulated fallback candles, not real market data. Treat every number here as an illustration and re-run on
-                live data before drawing conclusions.
-              </span>
+      {/* Verdict and checks */}
+      <div className="grid grid-cols-1 gap-4 px-5 py-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+        <div className={cx('rounded-xl border p-4', VERDICT_STYLE[diagnostics.verdict.tone])} aria-live="polite">
+          <div className="text-[11px] font-medium uppercase tracking-wider text-ink-3">Strategy verdict</div>
+          <h3 className="mt-0.5 text-base font-semibold text-ink">{diagnostics.verdict.headline}</h3>
+          <p className="mt-1 text-sm text-ink-2">{diagnostics.verdict.summary}</p>
+          {diagnostics.verdict.strengths.length > 0 && (
+            <div className="mt-3">
+              <div className="text-xs font-semibold text-up">Why it looks strong</div>
+              <ul className="mt-1 space-y-1">
+                {diagnostics.verdict.strengths.map((line) => (
+                  <li key={line} className="flex gap-2 text-sm text-ink-2">
+                    <CircleCheck size={14} className="mt-0.5 shrink-0 text-up" />
+                    <span>{line}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
-
-          <Section title="The idea" hint={hypothesis ? `Hypothesis: ${hypothesis.label}` : ARCHETYPE_LABEL[genome.archetype]}>
-            {hypothesis && (
-              <p className="mb-2 text-sm leading-relaxed text-ink">
-                <span className="font-semibold">{hypothesis.label}.</span> {hypothesis.rationale}
-              </p>
-            )}
-            <p className="text-sm leading-relaxed text-ink-2">{describeArchetype(genome)}</p>
-            {hypothesis && <p className="mt-2 text-xs text-ink-3">One primitive per idea: it stands in for {hypothesis.replaces}</p>}
-          </Section>
-
-          <Section
-            title="Indicators & exact parameters"
-            hint={`${strategy.params} tunable values (cap ${MAX_PARAMETERS}, penalty above ${FREE_PARAMETERS})`}
-          >
-            <div className="mb-3 flex flex-wrap gap-1">
-              {indicatorBadges(genome).map((badge) => (
-                <Pill key={badge}>{badge}</Pill>
-              ))}
+          {diagnostics.verdict.risks.length > 0 && (
+            <div className="mt-3">
+              <div className="text-xs font-semibold text-warn">What to watch out for</div>
+              <ul className="mt-1 space-y-1">
+                {diagnostics.verdict.risks.slice(0, 6).map((line) => (
+                  <li key={line} className="flex gap-2 text-sm text-ink-2">
+                    <TriangleAlert size={14} className="mt-0.5 shrink-0 text-warn" />
+                    <span>{line}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
-            <div className="overflow-hidden rounded-lg border border-line">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-line bg-raised/50 text-left text-[11px] uppercase tracking-wider text-ink-3">
-                    <th scope="col" className="px-3 py-2 font-medium">Indicator</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Parameters</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Used for</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {indicators.map((usage) => (
-                    <tr key={`${usage.name}|${usage.params}`} className="border-b border-line/70 last:border-b-0">
-                      <td className="px-3 py-2 font-medium text-ink">{usage.name}</td>
-                      <td className="num px-3 py-2 text-ink-2">{usage.params}</td>
-                      <td className="px-3 py-2 text-ink-3">{usage.roles.join(', ')}</td>
-                    </tr>
+          )}
+        </div>
+        <div>
+          <div className="mb-2 flex items-baseline justify-between gap-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-2">Robustness checks</h3>
+            <span className="text-[11px] text-ink-3">Hover a badge for what it means</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {diagnostics.badges.map((badge) => (
+              <Badge key={badge.key} badge={badge} />
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-ink-3">
+            {fmtInt(trials)} strategies have been tried on this data window (all runs). Figures cover train + validation – the 80% of
+            history the search optimised on – unless marked holdout. In-sample ROI {fmtPct(strategy.search.roi, true)},{' '}
+            {fmtPct(strategy.alpha, true)} vs. Buy &amp; Hold.
+          </p>
+        </div>
+      </div>
+
+      {context.simulated && (
+        <div className="mx-5 mb-4 flex gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
+          <Info size={14} className="mt-0.5 shrink-0" />
+          <span>
+            This run used simulated fallback candles, not real market data. Treat every number here as an illustration and re-run on live
+            data before drawing conclusions.
+          </span>
+        </div>
+      )}
+
+      {/* Equity curve and the forecast */}
+      <div className="grid grid-cols-1 gap-4 border-t border-line px-5 py-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)]">
+        <div className="min-w-0">
+          <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-2">Equity curve vs. Buy &amp; Hold</h3>
+            <span className="num text-[11px] text-ink-3">
+              {context.label} · {context.interval} · starting capital {fmtUsd(context.settings.initialCapital)}
+            </span>
+          </div>
+          <div className="h-[300px]">
+            <EquityChart
+              axis={axis}
+              benchmark={benchmark.equity}
+              strategy={strategy.equity}
+              strategyName={`Strategy ${strategy.id}${rank !== null ? ` · #${rank}` : ''}`}
+              revealed={benchmark.holdout != null}
+              initialCapital={context.settings.initialCapital}
+              interval={context.interval}
+              placeholder="Waiting for the first strategy…"
+            />
+          </div>
+          <div className="mt-3 overflow-x-auto rounded-lg border border-line">
+            <table className="num w-full text-xs">
+              <thead>
+                <tr className="border-b border-line bg-raised/50 text-[10.5px] uppercase tracking-wider text-ink-3">
+                  <th scope="col" className="px-3 py-1.5 text-left font-medium">Train + validation</th>
+                  {VS_ROWS.map((row) => (
+                    <th key={row.label} scope="col" className="whitespace-nowrap px-2 py-1.5 text-right font-medium">
+                      {row.label}
+                    </th>
                   ))}
-                </tbody>
-              </table>
-            </div>
-          </Section>
+                </tr>
+              </thead>
+              <tbody>
+                <tr className="border-b border-line/60">
+                  <th scope="row" className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink-2">
+                    <span className="inline-flex items-center gap-1.5">
+                      <LineKey color={STRATEGY_COLOR} /> Strategy
+                    </span>
+                  </th>
+                  {VS_ROWS.map((row) => (
+                    <td key={row.label} className="px-2 py-1.5 text-right font-medium text-ink">
+                      {row.format(strategy.search)}
+                    </td>
+                  ))}
+                </tr>
+                <tr>
+                  <th scope="row" className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink-2">
+                    <span className="inline-flex items-center gap-1.5">
+                      <LineKey color={BENCHMARK_COLOR} /> Buy &amp; Hold
+                    </span>
+                  </th>
+                  {VS_ROWS.map((row) => (
+                    <td key={row.label} className="px-2 py-1.5 text-right text-ink-3">
+                      {row.benchmark === false ? '–' : row.format(benchmark.search)}
+                    </td>
+                  ))}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <NextEntryForecast className="m-0" genome={genome} settings={context.settings} snapshot={snapshot} onRefresh={onRefreshSnapshot} />
+      </div>
 
-          <Section title="Entry rules">
-            <div className="space-y-4">
-              <div>
-                <div className="mb-1.5 text-xs font-semibold text-up">Long entry</div>
-                <RuleList rule={longEntry} tone="up" />
+      {/* Stress curve and stability map */}
+      <div className="grid grid-cols-1 border-t border-line xl:grid-cols-2 xl:divide-x xl:divide-line">
+        <Section className="border-t-0" title="Monte Carlo stress test" hint="Replays · 10% of trades skipped · shuffled order · 2× cost shocks">
+          {mcSummary ? (
+            <>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <StatTile
+                  label="P(profit)"
+                  value={fmtPct(mcSummary.probProfit * 100, false, 0)}
+                  tone={mcSummary.passed ? 'text-up' : mcSummary.probProfit >= 0.6 ? 'text-warn' : 'text-down'}
+                />
+                <StatTile label="95% worst DD" value={fmtPct(mcSummary.drawdownP95, false, 1)} tone={mcSummary.drawdownP95 < 50 ? 'text-ink' : 'text-down'} />
+                <StatTile label="Median return" value={fmtPct(mcSummary.medianReturn, true, 0)} tone={toneClass(mcSummary.medianReturn)} />
+                <StatTile label="5th pct return" value={fmtPct(mcSummary.p5Return, true, 0)} tone={toneClass(mcSummary.p5Return)} />
               </div>
-              <div>
-                <div className="mb-1.5 text-xs font-semibold text-down">Short entry (mirror of the long rules)</div>
-                {shortEntry ? (
-                  <RuleList rule={shortEntry} tone="down" />
+              <div className="mt-3">
+                {mc ? (
+                  <MonteCarloChart report={mc} />
                 ) : (
-                  <p className="text-sm text-ink-3">None – this strategy was optimised in Long-Only mode and never sells short.</p>
+                  <p className="flex items-center gap-2 text-sm text-ink-3">
+                    <Loader2 size={15} className="animate-spin" /> Drawing the stress curve…
+                  </p>
                 )}
               </div>
-            </div>
-          </Section>
+              <p className="mt-2 text-xs text-ink-3">
+                {mcSummary.simulations} replays of its {mcSummary.trades} search-period trades
+                {context.settings.poolAssets ? ` (pooled over the ${context.universe.length} assets)` : ''}, each fill shocked by on average
+                twice its modelled cost. The backtest&apos;s own drawdown on the same
+                trades was {fmtPct(mcSummary.baseDrawdown, false, 1)}
+                {mcSummary.drawdownP95 > 1.5 * mcSummary.baseDrawdown
+                  ? ' – the stressed worst case is much deeper, so the backtest saw a lucky order of trades.'
+                  : '.'}{' '}
+                Pass: at least 80% of replays profitable and the 95th-percentile drawdown under 50%.
+              </p>
+            </>
+          ) : (
+            <p className="text-sm text-ink-3">No trades to replay.</p>
+          )}
+        </Section>
+        <Section className="border-t xl:border-t-0" title="Parameter stability" hint="Train + validation · primary asset">
+          {report?.stability ? (
+            <StabilityHeatmap grid={report.stability} />
+          ) : report ? (
+            <p className="text-sm text-ink-3">This strategy has no tunable parameter to map.</p>
+          ) : (
+            <p className="flex items-center gap-2 text-sm text-ink-3">
+              <Loader2 size={15} className="animate-spin" /> {analysisPending ? 'Mapping the parameter neighbourhood…' : 'Waiting for the analysis…'}
+            </p>
+          )}
+        </Section>
+      </div>
 
-          <Section title="Exit & risk management rules" hint={`SL/TP mode: ${exit.mode}`}>
-            <p className="text-sm text-ink-2">{exit.headline}</p>
-            <dl className="mt-3 space-y-2.5">
-              {exit.bullets.map((bullet) => (
-                <div key={bullet.title} className="flex gap-2.5">
-                  <span aria-hidden="true" className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-accent-strong" />
-                  <div className="min-w-0 text-sm">
-                    <dt className="inline font-semibold text-ink">{bullet.title}. </dt>
-                    <dd className="inline text-ink-2">{bullet.text}</dd>
-                  </div>
-                </div>
-              ))}
-            </dl>
-            {exit.longSignalExit && (
-              <div className="mt-4 space-y-4 rounded-lg border border-line bg-raised/40 p-3">
-                <RuleList rule={exit.longSignalExit} tone="neutral" />
-                {exit.shortSignalExit && <RuleList rule={exit.shortSignalExit} tone="neutral" />}
+      {/* Cross-market check and holdout */}
+      <div className="grid grid-cols-1 border-t border-line xl:grid-cols-2 xl:divide-x xl:divide-line">
+        <Section className="border-t-0" title="Cross-market check" hint="Frozen rules · unseen markets · holdout dates excluded">
+          <p className="text-sm text-ink-2">
+            Test these exact rules, untouched, on related markets the search never saw – for example SOL and BNB for a strategy found on
+            BTC and ETH. A structural edge carries over; a fit to one chart&apos;s noise does not. Only candles before{' '}
+            {axis ? fmtDate(axis.time[axis.holdoutPos]) : 'the holdout'} are used, so the holdout stays sealed.
+          </p>
+          <form
+            className="mt-3 flex flex-wrap items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (crossSymbols.length > 0) onRunCrossMarket(crossSymbols);
+            }}
+          >
+            <Globe size={15} className="text-ink-3" />
+            <input
+              type="text"
+              value={crossInput}
+              onChange={(event) => setCrossInput(event.target.value.toUpperCase())}
+              aria-label="Unseen tickers for the cross-market check"
+              spellCheck={false}
+              placeholder="SOL-USD, BNB-USD, …"
+              className="num h-9 min-w-[200px] flex-1 rounded-lg border border-line bg-base px-2.5 text-sm text-ink outline-none focus:border-accent"
+            />
+            <button
+              type="submit"
+              disabled={crossMarket?.status === 'loading' || crossSymbols.length === 0}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-3 text-sm font-semibold text-accent-strong transition-colors hover:bg-accent/20 disabled:opacity-60"
+            >
+              {crossMarket?.status === 'loading' ? <Loader2 size={14} className="animate-spin" /> : <Globe size={14} />}
+              Run check
+            </button>
+          </form>
+          {crossMarket?.status === 'error' && <p className="mt-2 text-xs text-down">{crossMarket.error}</p>}
+          {cross && (
+            <div className="mt-3">
+              <div className="mb-2 flex items-center gap-2 text-sm">
+                {cross.passed ? <CircleCheck size={15} className="text-up" /> : <CircleX size={15} className="text-down" />}
+                <span className="text-ink-2">
+                  {cross.tested === 0
+                    ? 'No unseen asset had enough history to test.'
+                    : `Profitable on ${Math.round(cross.share * cross.tested)} of ${cross.tested} unseen markets, median Sharpe ${fmtNum(cross.medianSharpe)}${
+                        cross.passed ? ' – the edge generalises.' : ' – two thirds profitable and a positive median are needed.'
+                      }`}
+                </span>
               </div>
-            )}
-          </Section>
-
-          <Section title="Train vs. validation vs. holdout" hint="First 60% · next 20% · last 20% of candles">
-            <div className="overflow-x-auto rounded-lg border border-line">
-              <table className="num w-full text-sm">
-                <thead>
-                  <tr className="border-b border-line bg-raised/50 text-[11px] uppercase tracking-wider text-ink-3">
-                    <th scope="col" className="px-3 py-2 text-left font-medium">Metric</th>
-                    <th scope="col" className="px-3 py-2 text-right font-medium">Train</th>
-                    <th scope="col" className="px-3 py-2 text-right font-medium">Validation</th>
-                    <th scope="col" className="px-3 py-2 text-right font-medium">Holdout</th>
-                    <th scope="col" className="whitespace-nowrap px-3 py-2 text-right font-medium">
-                      B&amp;H {benchmark.holdout ? 'holdout' : 'validation'}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {METRIC_ROWS.map((row) => (
-                    <tr key={row.label} className="border-b border-line/70 last:border-b-0">
-                      <th scope="row" title={row.title} className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink-2">
-                        {row.label}
-                      </th>
-                      <td className={cx('px-3 py-1.5 text-right', row.tone?.(strategy.train) ?? 'text-ink')}>{row.format(strategy.train)}</td>
-                      <td className={cx('px-3 py-1.5 text-right', row.tone?.(strategy.validation) ?? 'text-ink')}>
-                        {row.format(strategy.validation)}
-                      </td>
-                      <td className={cx('px-3 py-1.5 text-right font-semibold', strategy.holdout ? (row.tone?.(strategy.holdout) ?? 'text-ink') : 'font-normal text-ink-3')}>
-                        {strategy.holdout ? row.format(strategy.holdout) : 'sealed'}
-                      </td>
-                      <td className="px-3 py-1.5 text-right text-ink-3">{row.bench ? row.format(benchSegment) : '–'}</td>
+              <div className="overflow-x-auto rounded-lg border border-line">
+                <table className="num w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-line bg-raised/50 text-[11px] uppercase tracking-wider text-ink-3">
+                      <th scope="col" className="px-3 py-2 text-left font-medium">Market</th>
+                      <th scope="col" className="px-3 py-2 text-right font-medium">ROI</th>
+                      <th scope="col" className="px-3 py-2 text-right font-medium">B&amp;H ROI</th>
+                      <th scope="col" className="px-3 py-2 text-right font-medium">Sharpe</th>
+                      <th scope="col" className="px-3 py-2 text-right font-medium">Max DD</th>
+                      <th scope="col" className="px-3 py-2 text-right font-medium">Trades</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {cross.rows.map((row) => (
+                      <tr key={row.symbol} className="border-b border-line/70 last:border-b-0">
+                        <th scope="row" className="px-3 py-1.5 text-left font-normal text-ink">
+                          {row.symbol}
+                          {!row.unseen && <span className="ml-1.5 text-[11px] text-ink-3">(in the run – not counted)</span>}
+                        </th>
+                        {row.note ? (
+                          <td colSpan={5} className="px-3 py-1.5 text-right text-xs text-ink-3">
+                            {row.note}
+                          </td>
+                        ) : (
+                          <>
+                            <td className={cx('px-3 py-1.5 text-right', toneClass(row.roi))}>{fmtPct(row.roi, true)}</td>
+                            <td className="px-3 py-1.5 text-right text-ink-3">{fmtPct(row.holdRoi, true)}</td>
+                            <td className="px-3 py-1.5 text-right text-ink-2">{fmtNum(row.sharpe)}</td>
+                            <td className="px-3 py-1.5 text-right text-ink-2">{fmtPct(row.maxDrawdown)}</td>
+                            <td className="px-3 py-1.5 text-right text-ink-2">{fmtInt(row.trades)}</td>
+                          </>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
-
-            {!revealed && (
-              <div className="mt-3 rounded-lg border border-line px-3 py-2.5 text-xs leading-relaxed text-ink-2">
+          )}
+        </Section>
+        <Section className="border-t xl:border-t-0" title="Locked holdout reveal" hint="The last 20% of history · one strategy per run">
+          {revealed && strategy.holdout ? (
+            <div className="space-y-2 text-sm text-ink-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Lock size={14} className="text-accent-strong" />
+                <span className="font-semibold text-ink">Revealed for {strategy.id}.</span>
+                {verdict !== null && <VerdictPill verdict={verdict} />}
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <StatTile label="Holdout ROI" value={fmtPct(strategy.holdout.roi, true)} tone={toneClass(strategy.holdout.roi)} />
+                <StatTile label="Holdout Sharpe" value={fmtNum(strategy.holdout.sharpe)} />
+                <StatTile label="B&H Sharpe" value={fmtNum(benchmark.holdout?.sharpe ?? null)} />
+                <StatTile label="Holdout trades" value={fmtInt(strategy.sample?.holdoutTrades ?? strategy.holdout.trades)} />
+              </div>
+              {holdoutCi && (
+                <p className="text-xs text-ink-3">
+                  95% confidence interval of the holdout Sharpe: {fmtNum(holdoutCi[0], 2)} to {fmtNum(holdoutCi[1], 2)}
+                  {holdoutCi[0] <= 0 ? ' – it includes zero, so the holdout alone does not prove an edge.' : '.'}
+                </p>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="rounded-lg border border-line px-3 py-2.5 text-xs leading-relaxed text-ink-2">
                 {!finished ? (
                   <p className="flex items-start gap-2">
                     <Info size={14} className="mt-0.5 shrink-0 text-ink-3" />
@@ -526,7 +728,160 @@ export default function StrategyModal({
                   </div>
                 )}
               </div>
+            </>
+          )}
+        </Section>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 xl:divide-x xl:divide-line">
+          <Section title="Overfitting risk" hint="0 = low · 100 = high">
+            <div className="flex flex-wrap items-baseline gap-3">
+              <span className="num text-3xl font-semibold text-ink">{risk.score}</span>
+              <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level} risk</Pill>
+              <span className="text-xs text-ink-3">
+                {risk.level === 'low'
+                  ? 'The evidence that this is more than a lucky fit is comparatively strong.'
+                  : risk.level === 'moderate'
+                    ? 'Some of the evidence points to a fit of past noise.'
+                    : 'Most of the evidence points to a fit of past noise – treat it as unproven.'}
+              </span>
+            </div>
+            <ul className="mt-3 space-y-1.5">
+              {risk.components.map((component) => (
+                <li key={component.key} className="grid grid-cols-[150px_minmax(0,1fr)_44px] items-center gap-3 text-xs">
+                  <span className="text-ink-2" title={`${component.weight} of 100 points`}>
+                    {component.label} <span className="text-ink-3">· {component.weight}</span>
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
+                      <span className="block h-full rounded-full bg-ink-3" style={{ width: `${component.risk * 100}%` }} />
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-ink-3">{component.detail}</span>
+                  </span>
+                  <span className="num text-right font-semibold text-ink">{Math.round(component.weight * component.risk)}</span>
+                </li>
+              ))}
+            </ul>
+          </Section>
+
+          <Section title="The idea" hint={hypothesis ? `Hypothesis: ${hypothesis.label}` : ARCHETYPE_LABEL[genome.archetype]}>
+            {hypothesis && (
+              <p className="mb-2 text-sm leading-relaxed text-ink">
+                <span className="font-semibold">{hypothesis.label}.</span> {hypothesis.rationale}
+              </p>
             )}
+            <p className="text-sm leading-relaxed text-ink-2">{describeArchetype(genome)}</p>
+            {hypothesis && <p className="mt-2 text-xs text-ink-3">One primitive per idea: it stands in for {hypothesis.replaces}</p>}
+          </Section>
+
+          <Section
+            title="Indicators & exact parameters"
+            hint={`${strategy.params} tunable values (cap ${MAX_PARAMETERS}, penalty above ${FREE_PARAMETERS})`}
+          >
+            <div className="mb-3 flex flex-wrap gap-1">
+              {indicatorBadges(genome).map((badge) => (
+                <Pill key={badge}>{badge}</Pill>
+              ))}
+            </div>
+            <div className="overflow-hidden rounded-lg border border-line">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line bg-raised/50 text-left text-[11px] uppercase tracking-wider text-ink-3">
+                    <th scope="col" className="px-3 py-2 font-medium">Indicator</th>
+                    <th scope="col" className="px-3 py-2 font-medium">Parameters</th>
+                    <th scope="col" className="px-3 py-2 font-medium">Used for</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {indicators.map((usage) => (
+                    <tr key={`${usage.name}|${usage.params}`} className="border-b border-line/70 last:border-b-0">
+                      <td className="px-3 py-2 font-medium text-ink">{usage.name}</td>
+                      <td className="num px-3 py-2 text-ink-2">{usage.params}</td>
+                      <td className="px-3 py-2 text-ink-3">{usage.roles.join(', ')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Section>
+
+          <Section title="Entry rules">
+            <div className="space-y-4">
+              <div>
+                <div className="mb-1.5 text-xs font-semibold text-up">Long entry</div>
+                <RuleList rule={longEntry} tone="up" />
+              </div>
+              <div>
+                <div className="mb-1.5 text-xs font-semibold text-down">
+                  Short entry
+                  {genome.shortEntry !== null &&
+                    ` (${genome.shortRegime ? 'mirrored trigger, only inside its own bear-regime filter' : 'mirror of the long rules'})`}
+                </div>
+                {shortEntry ? (
+                  <RuleList rule={shortEntry} tone="down" />
+                ) : (
+                  <p className="text-sm text-ink-3">None – Long-Only: this strategy never sells short.</p>
+                )}
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Exit & risk management rules" hint={`SL/TP mode: ${exit.mode}`}>
+            <p className="text-sm text-ink-2">{exit.headline}</p>
+            <dl className="mt-3 space-y-2.5">
+              {exit.bullets.map((bullet) => (
+                <div key={bullet.title} className="flex gap-2.5">
+                  <span aria-hidden="true" className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-accent-strong" />
+                  <div className="min-w-0 text-sm">
+                    <dt className="inline font-semibold text-ink">{bullet.title}. </dt>
+                    <dd className="inline text-ink-2">{bullet.text}</dd>
+                  </div>
+                </div>
+              ))}
+            </dl>
+            {exit.longSignalExit && (
+              <div className="mt-4 space-y-4 rounded-lg border border-line bg-raised/40 p-3">
+                <RuleList rule={exit.longSignalExit} tone="neutral" />
+                {exit.shortSignalExit && <RuleList rule={exit.shortSignalExit} tone="neutral" />}
+              </div>
+            )}
+          </Section>
+
+      </div>
+
+          <Section title="Train vs. validation vs. holdout" hint="First 60% · next 20% · last 20% of candles">
+            <div className="overflow-x-auto rounded-lg border border-line">
+              <table className="num w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line bg-raised/50 text-[11px] uppercase tracking-wider text-ink-3">
+                    <th scope="col" className="px-3 py-2 text-left font-medium">Metric</th>
+                    <th scope="col" className="px-3 py-2 text-right font-medium">Train</th>
+                    <th scope="col" className="px-3 py-2 text-right font-medium">Validation</th>
+                    <th scope="col" className="px-3 py-2 text-right font-medium">Holdout</th>
+                    <th scope="col" className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                      B&amp;H {benchmark.holdout ? 'holdout' : 'validation'}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {METRIC_ROWS.map((row) => (
+                    <tr key={row.label} className="border-b border-line/70 last:border-b-0">
+                      <th scope="row" title={row.title} className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink-2">
+                        {row.label}
+                      </th>
+                      <td className={cx('px-3 py-1.5 text-right', row.tone?.(strategy.train) ?? 'text-ink')}>{row.format(strategy.train)}</td>
+                      <td className={cx('px-3 py-1.5 text-right', row.tone?.(strategy.validation) ?? 'text-ink')}>
+                        {row.format(strategy.validation)}
+                      </td>
+                      <td className={cx('px-3 py-1.5 text-right font-semibold', strategy.holdout ? (row.tone?.(strategy.holdout) ?? 'text-ink') : 'font-normal text-ink-3')}>
+                        {strategy.holdout ? row.format(strategy.holdout) : 'sealed'}
+                      </td>
+                      <td className="px-3 py-1.5 text-right text-ink-3">{row.bench ? row.format(benchSegment) : '–'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
 
             {ambiguousShare > 0.1 && (
               <div className="mt-3 flex gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
@@ -566,18 +921,6 @@ export default function StrategyModal({
                 ) : null}
               </div>
             </div>
-          </Section>
-
-          <Section title="Parameter stability" hint="Train + validation · primary asset">
-            {report?.stability ? (
-              <StabilityHeatmap grid={report.stability} />
-            ) : report ? (
-              <p className="text-sm text-ink-3">This strategy has no tunable parameter to map.</p>
-            ) : (
-              <p className="flex items-center gap-2 text-sm text-ink-3">
-                <Loader2 size={15} className="animate-spin" /> Mapping the parameter neighbourhood…
-              </p>
-            )}
           </Section>
 
           <Section title="Robustness" hint="Tested on train + validation; the holdout is not used">
@@ -715,12 +1058,13 @@ export default function StrategyModal({
             </Section>
           )}
 
-          <Section title="Export to TradingView" hint="Pine Script v5 strategy">
+          <Section title="Export to TradingView" hint="Pine Script v5 strategy · runs on every TradingView plan">
             <p className="text-sm text-ink-2">
-              Copy the script, open the Pine Editor on a <span className="num font-medium text-ink">{context.interval}</span> chart of{' '}
+              Copy or download the script, open the Pine Editor on a <span className="num font-medium text-ink">{context.interval}</span> chart of{' '}
               <span className="num font-medium text-ink">{context.isBasket ? 'the basket (see the script header)' : context.label}</span>,
-              paste it and press <em>Add to chart</em>. The script reproduces these exact rules, exits, sizing, costs and next-bar-open
-              execution. It switches on Bar Magnifier, which needs a TradingView Premium plan.
+              paste it and press <em>Add to chart</em>. It reproduces these exact rules – entries for every direction mode, the trailing stop
+              and breakeven lock, sizing, costs and next-bar-open execution – with <code className="num text-xs">use_bar_magnifier=false</code>,
+              so it runs on every TradingView plan.
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
@@ -733,6 +1077,13 @@ export default function StrategyModal({
               >
                 {copyState === 'copied' ? <Check size={15} /> : <Copy size={15} />}
                 {copyState === 'copied' ? 'Copied to clipboard' : 'Copy Pine Script v5'}
+              </button>
+              <button
+                type="button"
+                onClick={() => download(`StrategyFinder-${strategy.id}-${context.interval}.pine`, pine)}
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-line px-3 text-sm text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+              >
+                <Download size={15} /> Download .pine
               </button>
               <button
                 type="button"
@@ -758,10 +1109,8 @@ export default function StrategyModal({
           </Section>
 
           <p className="border-t border-line px-5 py-4 text-[11px] leading-relaxed text-ink-3">
-            Backtests are hypothetical and ignore liquidity, borrow costs and taxes. Nothing here is financial advice.
+            Backtests are hypothetical and ignore liquidity, borrow availability and taxes. Nothing here is financial advice.
           </p>
-        </div>
-      </div>
-    </div>
+    </Panel>
   );
 }
