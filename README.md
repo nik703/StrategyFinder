@@ -304,6 +304,31 @@ money (or had a non-positive Sharpe) on the holdout. **Robust** only when ALL of
 holdout trades; every test above passes; the holdout period was never revealed before; live (not simulated)
 data. **Fragile** otherwise; the drawer lists every unmet condition.
 
+### Next Entry Forecast
+
+The top of the strategy breakdown shows where the strategy stands on the latest closed candle
+(`src/engine/nextEntrySolver.ts`):
+
+- **Trigger price.** A synthetic next candle (open = last close, close = P) is appended to the last
+  2,000 candles and run through the backtester's own indicator cache and rule evaluators. A 241-point
+  grid scan across ±10 × ATR(14) (capped at ±30%) brackets the closes that fire each entry rule, and
+  48 bisection steps find the exact close. The card shows that close, the move it needs, the estimated
+  fill at the following open (plus slippage), and the stop loss and take profit at that fill.
+- **Pending entries.** If the rule already fired on the last candle, the entry is pending for the next
+  open. If a position is open, the card shows its live stop, target, time stop and the close that
+  would trigger a signal exit or reversal (the stop is the backtester's own trailing stop).
+- **Blockers.** A filter no single candle can satisfy (for example a low ADX, or a volume spike, with
+  the next candle assumed to trade at average volume) is reported next to the price the rest of the
+  rule needs, e.g. `$148.20 (Blocked: ADX(7) 12.1 < 15)`.
+- **Readiness.** Each side scores 0–100% from the share of conditions met, how far each indicator is
+  from its threshold (in ATRs for prices and averages, in points for oscillators), and the distance
+  to the trigger. The scores give a verdict from Strong Long to Strong Short, or In Position.
+- **Refresh Latest Price** re-fetches candles through the normal data pipeline without re-optimising.
+  Baskets and Robust-universe runs get a table of every asset, closest to an entry first.
+
+The forecast is a mechanical reading of the rules, not a prediction: it says what close would fire
+the strategy, not whether price will get there.
+
 ## Read this before trusting a result
 
 - **Expect small numbers and few "Robust" verdicts.** With 2% risk per trade and a deflated Sharpe hurdle,

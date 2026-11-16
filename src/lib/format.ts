@@ -21,6 +21,20 @@ export function fmtUsd(value: number | null | undefined, signed = false): string
   return `${sign(value, signed)}${formatter.format(value)}`;
 }
 
+/**
+ * A market price with as many decimals as its size needs:
+ * $96,412.50 · $185.42 · $12.3456 · $0.6234 · $0.00001235.
+ */
+export function fmtPrice(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return DASH;
+  const abs = Math.abs(value);
+  let decimals = 2;
+  if (abs > 0 && abs < 100) decimals = 4;
+  if (abs > 0 && abs < 1) decimals = Math.min(10, 3 - Math.floor(Math.log10(abs)));
+  const text = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: decimals }).format(abs);
+  return `${value < 0 ? '-' : ''}$${text}`;
+}
+
 /** $12.5K / $1.2M – for axis ticks. */
 export function fmtUsdCompact(value: number): string {
   if (!Number.isFinite(value)) return DASH;

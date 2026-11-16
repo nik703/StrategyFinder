@@ -233,6 +233,12 @@ export class BacktestWorkspace {
   tradeCount = 0;
   /** Number of bars simulated by the last run. */
   bars = 0;
+  /**
+   * The position still open at the final close of the last run, captured before the
+   * end-of-data liquidation (a bookkeeping step, not a real exit). Null when flat.
+   * `stop` and `target` are the levels that apply to the NEXT candle (trailing stops included).
+   */
+  openPosition: { dir: 1 | -1; entryBar: number; entryPrice: number; stop: number; target: number } | null = null;
   /** In-market flag per bar (1 when a position is open at the close). */
   readonly inMarket: Uint8Array;
 
@@ -265,6 +271,19 @@ export class BacktestWorkspace {
  */
 /** ATR lookback used to scale slippage with volatility. */
 export const SLIPPAGE_ATR_PERIOD = 14;
+
+/**
+ * Adverse slippage (as a fraction) of a fill on the candle after `closedIndex`: the larger of the
+ * fixed rate and `slippageAtrMult` × ATR% of that last closed candle – the rule `runBacktest`
+ * applies to every fill (its `slipAt`). Exposed so forecasts quote fills the same way.
+ */
+export function fillSlippage(settings: BacktestSettings, ind: IndicatorCache, closedIndex: number): number {
+  const slip = settings.slippagePct / 100;
+  const mult = settings.slippageAtrMult ?? 0;
+  if (!(mult > 0)) return slip;
+  const scaled = (mult * ind.atrPercent(SLIPPAGE_ATR_PERIOD)[Math.max(0, closedIndex)]) / 100;
+  return scaled > slip ? scaled : slip;
+}
 
 export function runBacktest(
   ind: IndicatorCache,
@@ -508,6 +527,7 @@ export function runBacktest(
   }
 
   /* ---- 4. Liquidate whatever is still open at the final close ------------ */
+  ws.openPosition = pos !== 0 && n > 0 ? { dir: pos === 1 ? 1 : -1, entryBar, entryPrice, stop, target } : null;
   if (pos !== 0 && n > 0) {
     const last = n - 1;
     // Market order on the final close: candle `last` has closed, so its own ATR is known.

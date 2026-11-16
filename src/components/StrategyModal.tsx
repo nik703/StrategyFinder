@@ -25,7 +25,9 @@ import type { RunContext } from '../lib/config';
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from '../lib/format';
 import { sharpeConfidenceInterval } from '../lib/stats';
 import type { BenchmarkResult, PerformanceMetrics, RobustnessReport, StrategyResult, Verdict } from '../types/trading';
+import type { MarketSnapshot } from '../lib/marketSnapshot';
 import { VerdictPill } from './Leaderboard';
+import NextEntryForecast from './NextEntryForecast';
 import { cx, Pill } from './ui';
 
 interface StrategyModalProps {
@@ -49,6 +51,10 @@ interface StrategyModalProps {
   lockPending: boolean;
   /** Lock this strategy and reveal its holdout. */
   onLock: () => void;
+  /** Latest candles for the Next Entry Forecast (null until available). */
+  snapshot: MarketSnapshot | null;
+  /** Fetch fresh candles for the forecast. */
+  onRefreshSnapshot: () => Promise<void>;
   onClose: () => void;
 }
 
@@ -179,6 +185,8 @@ export default function StrategyModal({
   lockedId,
   lockPending,
   onLock,
+  snapshot,
+  onRefreshSnapshot,
   onClose,
 }: StrategyModalProps): JSX.Element {
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -288,6 +296,8 @@ export default function StrategyModal({
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
+          <NextEntryForecast genome={genome} settings={context.settings} snapshot={snapshot} onRefresh={onRefreshSnapshot} />
+
           {/* Headline numbers: selection-bias-aware and risk-adjusted first; raw return last and labelled in-sample. */}
           <div className="grid grid-cols-2 gap-2 px-5 pb-2 sm:grid-cols-3">
             <StatTile

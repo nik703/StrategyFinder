@@ -33,6 +33,7 @@ import {
 import { fmtDate, fmtInt, fmtNum, fmtPct, fmtUsd, toneClass } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
 import { budgetStatus, estimateSearchWindow, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, windowBudget, type TrialWindow } from './lib/trialLedger';
+import { buildSnapshot, fetchSnapshot, type MarketSnapshot } from './lib/marketSnapshot';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
@@ -146,6 +147,8 @@ export default function App(): JSX.Element {
   /** The one strategy of this run whose holdout has been revealed. */
   const [lockedId, setLockedId] = useState<string | null>(null);
   const [lockPending, setLockPending] = useState(false);
+  /** Latest candles for the Next Entry Forecast (the run's own data until refreshed). */
+  const [snapshot, setSnapshot] = useState<MarketSnapshot | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   /** Evaluator workers that score candidate strategies in parallel for the optimiser. */
@@ -312,6 +315,7 @@ export default function App(): JSX.Element {
     setBenchmark(null);
     setAxis(null);
     setContext(null);
+    setSnapshot(null);
     setPinned(null);
     setModalOpen(false);
     setAnalyses({});
@@ -379,6 +383,10 @@ export default function App(): JSX.Element {
       };
       contextRef.current = runContext;
       setContext(runContext);
+      // The run's own candles seed the Next Entry Forecast until the user refreshes them.
+      setSnapshot(
+        buildSnapshot(loaded.series, runContext, { simulated: loaded.usedFallback, fallbackReason: loaded.fallbackReason }),
+      );
 
       const worker = new Worker(new URL('./workers/optimizer.worker.ts', import.meta.url), { type: 'module' });
       workerRef.current = worker;
@@ -504,6 +512,15 @@ export default function App(): JSX.Element {
   }, []);
 
   const closeModal = useCallback(() => setModalOpen(false), []);
+
+  /** "Refresh Latest Price": fetch the newest candles for the run's assets without re-optimising. */
+  const refreshSnapshot = useCallback(async () => {
+    const runContext = contextRef.current;
+    if (!runContext) return;
+    const runId = runIdRef.current;
+    const fresh = await fetchSnapshot(runContext);
+    if (runId === runIdRef.current) setSnapshot(fresh);
+  }, []);
 
   const displayed = pinned ?? leaderboard[0] ?? null;
   const rankOf = useCallback(
@@ -830,6 +847,8 @@ export default function App(): JSX.Element {
           lockedId={lockedId}
           lockPending={lockPending}
           onLock={() => lockStrategy(displayed)}
+          snapshot={snapshot}
+          onRefreshSnapshot={refreshSnapshot}
           onClose={closeModal}
         />
       )}
