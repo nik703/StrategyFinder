@@ -137,9 +137,9 @@ are deliberately **parsimonious** – simple rules trade more often and leave le
 
 | Hypothesis | Entry triggers (events) | The one optional filter |
 |---|---|---|
-| **Trend following** – time-series momentum | EMA crossover · Donchian breakout (close above the prior N-candle high) · MACD signal cross | ADX above a level, or (breakout trigger only) close > slow EMA / slow EMA rising |
-| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA · slow EMA rising · volume above average |
-| **Buy the dip in an uptrend** – short-term overreaction | RSI crosses back above an oversold level · close crosses back above the lower band | **required**: close > slow EMA or slow EMA rising |
+| **Trend following** – time-series momentum | EMA or SMA crossover · close crosses above an EMA or SMA · Donchian breakout (close above the prior N-candle high) · MACD signal cross | ADX above a level, or (breakout trigger only) close > slow EMA/SMA / slow EMA/SMA rising |
+| **Volatility breakout** – a close beyond the range starts a move | Donchian breakout · close crosses above the upper Bollinger band | close > slow EMA/SMA · slow EMA/SMA rising · volume above average |
+| **Buy the dip in an uptrend** – short-term overreaction | RSI crosses back above an oversold level · close crosses back above the lower Bollinger band | **required**: close > slow EMA/SMA or slow EMA/SMA rising |
 | **Range reversion** – trendless prices revert to a mean | RSI crosses back above oversold · close back above the lower band | ADX below a level |
 
 - Mutations stay inside the hypothesis: they tune a number, swap or redraw the entry trigger, add / drop /
@@ -148,9 +148,20 @@ are deliberately **parsimonious** – simple rules trade more often and leave le
 - In Long/Short mode the short rules are the exact mirror of the long rules. An actionable opposite-side
   entry **reverses** an open position at the next open – also on the open a time stop fires (the time stop
   only blocks re-entering the same side) – in the backtester and in the Pine export alike.
-- **Round-number grids only.** Lookbacks from the geometric grid {5, 7, 10, 14, 20, 28, 40, 56, 80, 112,
-  160, 200} (about √2 per step, no near-duplicates); oscillator levels in steps of 5; band multipliers in
-  steps of 0.5.
+- **EMA / SMA lengths: every integer by default.** Each moving average can be an EMA or an SMA (a
+  crossover uses the same type for both). With **EMA / SMA lengths → Every integer** (the default) the
+  search fine-tunes each length one candle at a time, e.g. EMA(23) × EMA(87). That covers crossovers,
+  close-vs-average rules, average slopes and the Bollinger period (its middle line is an SMA).
+  - New lengths are drawn log-uniformly.
+  - Mutations mix ±1–3 candle refinements with 10–35% jumps, and sometimes switch EMA ↔ SMA.
+  - The plateau check and the stability map still look one **×√2 step** away (EMA 50 → 35 / 71), the
+    same relative distance as the coarse grid. A ±1-candle neighbour (EMA 50 vs 51) would always look
+    stable and let a fine-tuned spike through.
+  - Every extra length tried is one more trial, so the deflated Sharpe hurdle rises accordingly.
+  - **Coarse grid** restricts lengths to {5, 7, 10, 14, 20, 28, 40, 56, 80, 112, 160, 200}: fewer
+    combinations, less room to overfit.
+- **Other numbers stay on round grids:** remaining lookbacks on the geometric grid above (about √2 per
+  step), oscillator levels in steps of 5, band multipliers in steps of 0.5.
 - **Static stops and targets scale with the timeframe:** 0.5–3.5% stop and 1–10% target on 15m–1h
   candles, 1–6% / 2–15% on 4h, 1.5–10% / 3–20% on daily. A 10% stop on a 15m chart is never hit, so capital
   sits in trades nothing closes. ATR-based exits, which scale on their own, are favoured (70% of random

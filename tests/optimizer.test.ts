@@ -591,6 +591,38 @@ describe('optimizer worker', () => {
     }
   }, 300_000);
 
+  it('fine-tunes EMA / SMA lengths over every integer when asked to', async () => {
+    const settings: BacktestSettings = { ...settingsFor('long-only'), maPeriods: 'integer' };
+    const messages = await runOptimizer([dataset('SOL-USD', '30m', '1y')], settings, {
+      seed: 21,
+      hypothesis: 'TREND_FOLLOWING',
+      maxEvaluations: 800,
+    });
+    const done = messages[messages.length - 1] as Of<'done'>;
+    expect(done.type).toBe('done');
+    const listed = [...ofType(messages, 'leaderboard').flatMap((m) => m.strategies), ...done.strategies];
+    expect(listed.length).toBeGreaterThan(0);
+    const lengths: number[] = [];
+    const types = new Set<string>();
+    for (const s of listed) {
+      for (const c of s.genome.longEntry.conditions) {
+        if (c.ind === 'MA_CROSS') {
+          lengths.push(c.fastPeriod, c.slowPeriod);
+          types.add(c.fastType);
+        }
+        if (c.ind === 'PRICE_MA' || c.ind === 'MA_SLOPE') {
+          lengths.push(c.period);
+          types.add(c.maType);
+        }
+      }
+    }
+    for (const n of lengths) expect(Number.isInteger(n)).toBe(true);
+    // The search lists lengths the coarse grid could never reach (e.g. 23 or 87).
+    const grid = [5, 7, 10, 14, 20, 28, 40, 56, 80, 112, 160, 200];
+    expect(lengths.filter((n) => !grid.includes(n)).length).toBeGreaterThan(0);
+    expect(types.size).toBeGreaterThan(0);
+  }, 300_000);
+
   it('reports an error instead of crashing on unusable data', async () => {
     const tiny = dataset('SPY', '1d', '1y');
     const cut: OHLCV = {

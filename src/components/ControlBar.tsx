@@ -36,6 +36,7 @@ import {
   type Hypothesis,
   type Interval,
   type TradeMode,
+  type MaPeriodSearch,
 } from '../types/trading';
 import { HYPOTHESES } from '../engine/genome';
 import { cx, FieldLabel, NumberField, Panel, Segmented } from './ui';
@@ -71,6 +72,18 @@ function rangeOptions(interval: Interval): { value: HistoryRange; label: string;
     };
   });
 }
+const MA_PERIOD_OPTIONS: { value: MaPeriodSearch; label: string; title: string }[] = [
+  {
+    value: 'integer',
+    label: 'Every integer',
+    title: 'The search fine-tunes each EMA / SMA length (and the Bollinger period) one candle at a time, e.g. EMA 23 or SMA 87',
+  },
+  {
+    value: 'grid',
+    label: 'Coarse grid',
+    title: 'Only 5, 7, 10, 14, 20, 28, 40, 56, 80, 112, 160, 200 – fewer combinations, less room to overfit',
+  },
+];
 const HYPOTHESIS_OPTIONS: { value: Hypothesis; label: string; title: string }[] = HYPOTHESIS_IDS.map((id) => ({
   value: id,
   label: HYPOTHESES[id].label,
@@ -621,6 +634,16 @@ export default function ControlBar({
             options={HYPOTHESIS_OPTIONS}
             value={config.hypothesis}
             onChange={(hypothesis) => onChange({ hypothesis })}
+            disabled={busy}
+          />
+        </div>
+        <div>
+          <FieldLabel>EMA / SMA lengths</FieldLabel>
+          <Segmented
+            ariaLabel="EMA / SMA length search"
+            options={MA_PERIOD_OPTIONS}
+            value={config.maPeriods}
+            onChange={(maPeriods) => onChange({ maPeriods })}
             disabled={busy}
           />
         </div>

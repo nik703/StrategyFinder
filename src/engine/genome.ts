@@ -34,6 +34,8 @@ import type {
   DynamicExit,
   ExitGene,
   Hypothesis,
+  MaPeriodSearch,
+  MaType,
   RuleGroup,
   StrategyGenome,
   TradeMode,
@@ -178,6 +180,12 @@ export interface GenomeLimits {
   hasVolume: boolean;
   /** Candle length in ms – sets the static stop / target grids (default: daily). */
   barMs?: number;
+  /**
+   * How EMA / SMA lengths (and the Bollinger basis, an SMA) are searched:
+   *   'integer' every whole number in range – the search fine-tunes the exact length
+   *   'grid'    the coarse geometric LOOKBACK_GRID (default)
+   */
+  maPeriods?: MaPeriodSearch;
 }
 
 export const DEFAULT_LIMITS: GenomeLimits = { maxLookback: 200, hasVolume: true, barMs: 86_400_000 };
@@ -186,6 +194,22 @@ function lookbacks(min: number, max: number, limits: GenomeLimits): number[] {
   const cap = Math.min(max, Math.max(SHORT_LOOKBACK, limits.maxLookback));
   return LOOKBACK_GRID.filter((v) => v >= min && v <= cap);
 }
+
+/**
+ * Lengths of EMA / SMA based indicators (moving averages, their crosses and slopes, and the
+ * Bollinger basis): every integer in range when `limits.maPeriods` is 'integer', otherwise the
+ * coarse geometric grid. Same bounds either way.
+ */
+function maLookbacks(min: number, max: number, limits: GenomeLimits): number[] {
+  if (limits.maPeriods !== 'integer') return lookbacks(min, max, limits);
+  const cap = Math.min(max, Math.max(SHORT_LOOKBACK, limits.maxLookback));
+  const out: number[] = [];
+  for (let v = min; v <= cap; v++) out.push(v);
+  return out;
+}
+
+/** True when moving-average lengths are searched over every integer. */
+const fineMa = (limits: GenomeLimits): boolean => limits.maPeriods === 'integer';
 
 /** Nearest value of `grid` to `value`. */
 export function snap(value: number, grid: readonly number[]): number {
@@ -319,7 +343,8 @@ function slotOf(archetype: Archetype, index: number, c: Condition): Slot {
   return isFilter(c) ? 'filter' : 'regime';
 }
 
-type Spec = readonly [key: string, grid: readonly number[]];
+/** A tunable number: its field, its grid, and whether it is a fine (every-integer) axis. */
+type Spec = readonly [key: string, grid: readonly number[], fine?: boolean];
 
 /** Lookback window allowed for trend-style indicators in a given slot. */
 function trendWindow(slot: Slot, min: number): readonly [number, number] {
@@ -347,18 +372,19 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
     }
     case 'PRICE_MA': {
       const [min, max] = trendWindow(slot, 5);
-      return [['period', lookbacks(min, max, limits)]];
+      return [['period', maLookbacks(min, max, limits), fineMa(limits)]];
     }
     case 'MA_CROSS': {
       const [min, max] = trendWindow(slot, 10);
       return [
-        ['fastPeriod', lookbacks(5, 50, limits)],
-        ['slowPeriod', lookbacks(min, max, limits)],
+        ['fastPeriod', maLookbacks(5, 50, limits), fineMa(limits)],
+        ['slowPeriod', maLookbacks(min, max, limits), fineMa(limits)],
       ];
     }
     case 'BB': {
+      // The band's middle line is an SMA, so its length is searched like the other averages.
       const specs: Spec[] = [
-        ['period', lookbacks(10, 50, limits)],
+        ['period', maLookbacks(10, 50, limits), fineMa(limits)],
         ['mult', GRIDS.bbMult],
       ];
       if (c.variant === 'pctb') specs.push(['level', c.level < 0.5 ? GRIDS.percentBLow : GRIDS.percentBHigh]);
@@ -393,7 +419,7 @@ function conditionSpecs(c: Condition, slot: Slot, limits: GenomeLimits): Spec[] 
     case 'DONCHIAN':
       return [['period', lookbacks(10, 112, limits)]];
     case 'MA_SLOPE':
-      return [['period', lookbacks(MIN_SLOPE_LOOKBACK, 200, limits)]];
+      return [['period', maLookbacks(MIN_SLOPE_LOOKBACK, 200, limits), fineMa(limits)]];
   }
 }
 
@@ -444,7 +470,7 @@ function normalizeCondition(input: Condition, slot: Slot, limits: GenomeLimits):
     c.fast = below.length > 0 ? below[below.length - 1] : 5;
   }
   if (c.ind === 'MA_CROSS' && c.fastPeriod >= c.slowPeriod) {
-    const below = lookbacks(5, 50, limits).filter((v) => v < c.slowPeriod);
+    const below = maLookbacks(5, 50, limits).filter((v) => v < c.slowPeriod);
     c.fastPeriod = below.length > 0 ? below[below.length - 1] : 5;
   }
   return c;
@@ -520,11 +546,19 @@ const hasGrid = (min: number, max: number, limits: GenomeLimits): boolean => loo
 
 const PRIMITIVES = {
   // ---- Entry triggers: discrete events ----------------------------------------------------------
-  EMA_CROSS: {
-    id: 'EMA_CROSS',
+  MA_CROSS: {
+    id: 'MA_CROSS',
     slot: 'trigger',
+    // EMA or SMA crossover; both averages are the same type so the rule stays one idea.
     template: () => ({ ind: 'MA_CROSS', fastType: 'EMA', fastPeriod: 20, slowType: 'EMA', slowPeriod: 56, op: 'cross_above' }),
-    matches: (c) => c.ind === 'MA_CROSS' && c.fastType === 'EMA' && c.slowType === 'EMA' && c.op === 'cross_above',
+    matches: (c) => c.ind === 'MA_CROSS' && c.fastType === c.slowType && c.op === 'cross_above',
+  },
+  PRICE_MA_CROSS: {
+    id: 'PRICE_MA_CROSS',
+    slot: 'trigger',
+    // The close crossing above an EMA or SMA.
+    template: () => ({ ind: 'PRICE_MA', maType: 'EMA', period: 50, op: 'cross_above' }),
+    matches: (c) => c.ind === 'PRICE_MA' && c.op === 'cross_above',
   },
   DONCHIAN_BREAKOUT: {
     id: 'DONCHIAN_BREAKOUT',
@@ -557,17 +591,17 @@ const PRIMITIVES = {
     matches: (c) => c.ind === 'BB' && c.variant === 'lower' && c.op === 'cross_above',
   },
   // ---- Regime filters: slow states ---------------------------------------------------------------
-  ABOVE_SLOW_EMA: {
-    id: 'ABOVE_SLOW_EMA',
+  ABOVE_SLOW_MA: {
+    id: 'ABOVE_SLOW_MA',
     slot: 'regime',
     template: (limits) => (hasGrid(SLOW_LOOKBACK, 200, limits) ? { ind: 'PRICE_MA', maType: 'EMA', period: 200, op: 'gt' } : null),
-    matches: (c) => c.ind === 'PRICE_MA' && c.maType === 'EMA' && c.op === 'gt' && c.period >= SLOW_LOOKBACK,
+    matches: (c) => c.ind === 'PRICE_MA' && c.op === 'gt' && c.period >= SLOW_LOOKBACK,
   },
-  SLOW_EMA_RISING: {
-    id: 'SLOW_EMA_RISING',
+  SLOW_MA_RISING: {
+    id: 'SLOW_MA_RISING',
     slot: 'regime',
     template: (limits) => (hasGrid(MIN_SLOPE_LOOKBACK, 200, limits) ? { ind: 'MA_SLOPE', maType: 'EMA', period: 112, op: 'gt' } : null),
-    matches: (c) => c.ind === 'MA_SLOPE' && c.maType === 'EMA' && c.op === 'gt' && c.period >= MIN_SLOPE_LOOKBACK,
+    matches: (c) => c.ind === 'MA_SLOPE' && c.op === 'gt' && c.period >= MIN_SLOPE_LOOKBACK,
   },
   // ---- Confirmation filters: fast states ---------------------------------------------------------
   ADX_TRENDING: {
@@ -600,9 +634,9 @@ interface HypothesisSlots {
 
 /** The primitives each hypothesis may put in each entry slot. */
 const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
-  TREND_FOLLOWING: { triggers: ['EMA_CROSS', 'DONCHIAN_BREAKOUT', 'MACD_CROSS'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['ADX_TRENDING'] },
-  VOL_BREAKOUT: { triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: ['VOLUME_SURGE'] },
-  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_EMA', 'SLOW_EMA_RISING'], confirms: [] },
+  TREND_FOLLOWING: { triggers: ['MA_CROSS', 'PRICE_MA_CROSS', 'DONCHIAN_BREAKOUT', 'MACD_CROSS'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: ['ADX_TRENDING'] },
+  VOL_BREAKOUT: { triggers: ['DONCHIAN_BREAKOUT', 'BB_BREAKOUT'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: ['VOLUME_SURGE'] },
+  DIP_IN_UPTREND: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: ['ABOVE_SLOW_MA', 'SLOW_MA_RISING'], confirms: [] },
   RANGE_REVERSION: { triggers: ['RSI_REJECTION', 'BB_REJECTION'], regimes: [], confirms: ['ADX_RANGING'] },
 };
 
@@ -610,12 +644,13 @@ const SLOTS: Readonly<Record<Hypothesis, HypothesisSlots>> = {
  * The market hypotheses a run can test. Each is a distinct, economically motivated idea; its
  * slots list the event triggers that express it and the state filters that say when it applies:
  *
- *   TREND_FOLLOWING  EMA cross · Donchian breakout · MACD cross  | one of: close > slow EMA · slow EMA rising · ADX > level
- *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | one of: close > slow EMA · slow EMA rising · volume surge
- *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA or slow EMA rising
+ *   TREND_FOLLOWING  EMA/SMA cross · close crosses above an EMA/SMA · Donchian breakout · MACD cross
+ *                    | one of: close > slow EMA/SMA · slow EMA/SMA rising · ADX > level
+ *   VOL_BREAKOUT     Donchian breakout · upper Bollinger break   | one of: close > slow EMA/SMA · slow EMA/SMA rising · volume surge
+ *   DIP_IN_UPTREND   RSI back above oversold · back inside lower band | REQUIRED: close > slow EMA/SMA or slow EMA/SMA rising
  *   RANGE_REVERSION  RSI back above oversold · back inside lower band | optional: ADX < level
  *
- *   The filter is always from another indicator family than the trigger, so an EMA-cross or MACD
+ *   The filter is always from another indicator family than the trigger, so a moving-average or MACD
  *   trigger can only be filtered by ADX.
  */
 export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
@@ -626,8 +661,9 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     archetype: 'TREND',
     rationale:
       'Time-series momentum: markets that have been rising tend to keep rising for a while, because information spreads slowly and money chases performance.',
-    trigger: 'An EMA crossover, a Donchian-channel breakout or a MACD signal cross (one event per setup).',
-    filter: 'Optional, one only: ADX above a level, or – with a breakout trigger – close above a slow EMA or a rising slow EMA.',
+    trigger:
+      'An EMA or SMA crossover, the close crossing above an EMA or SMA, a Donchian-channel breakout or a MACD signal cross (one event per setup).',
+    filter: 'Optional, one only: ADX above a level, or – with a breakout trigger – close above a slow EMA/SMA or a rising slow EMA/SMA.',
     filterRequired: false,
     replaces: 'Supertrend, +DI/−DI and price-vs-MA states, which all measure the same trend.',
   },
@@ -639,7 +675,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     rationale:
       'A close beyond the recent range or volatility envelope starts a move the old range no longer contains; heavy volume shows real participation behind it.',
     trigger: 'Close breaks above the prior Donchian high or the upper Bollinger band.',
-    filter: 'Optional, one only: close above a slow EMA, a rising slow EMA, or volume above its average.',
+    filter: 'Optional, one only: close above a slow EMA/SMA, a rising slow EMA/SMA, or volume above its average.',
     filterRequired: false,
     replaces: 'Band-width and ATR "squeeze" filters, which describe the same volatility state.',
   },
@@ -651,7 +687,7 @@ export const HYPOTHESES: Readonly<Record<Hypothesis, HypothesisInfo>> = {
     rationale:
       'Short-term overreaction: sharp pullbacks inside a long-term uptrend tend to be partly reversed, as buyers are paid to absorb forced selling.',
     trigger: 'Pullback rejection: RSI crosses back above an oversold level, or the close crosses back above the lower Bollinger band.',
-    filter: 'Required, and the only one: close above a slow EMA or a rising slow EMA.',
+    filter: 'Required, and the only one: close above a slow EMA/SMA or a rising slow EMA/SMA.',
     filterRequired: true,
     replaces: 'Stochastic, CCI and %B, which all measure "short-horizon oversold".',
   },
@@ -750,13 +786,38 @@ export function inferHypothesis(g: StrategyGenome): Hypothesis {
   return slowUptrend ? 'DIP_IN_UPTREND' : 'RANGE_REVERSION';
 }
 
-/** Draw every tunable parameter of `c` uniformly from its grid. */
+/** A whole number drawn log-uniformly from [lo, hi] (as many short lengths as long ones, like the geometric grid). */
+function logUniformInt(rng: Rng, lo: number, hi: number): number {
+  if (hi <= lo) return lo;
+  const v = Math.round(Math.exp(Math.log(lo) + rng() * (Math.log(hi) - Math.log(lo))));
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/** Draw every tunable parameter of `c` from its grid (fine integer axes log-uniformly). */
 function randomizeParams(rng: Rng, c: Condition, slot: Slot, limits: GenomeLimits): Condition {
   const fields = c as unknown as Fields;
-  for (const [key, grid] of conditionSpecs(c, slot, limits)) {
-    if (grid.length > 0) fields[key] = pick(rng, grid);
+  for (const [key, grid, fine] of conditionSpecs(c, slot, limits)) {
+    if (grid.length === 0) continue;
+    fields[key] = fine ? logUniformInt(rng, grid[0], grid[grid.length - 1]) : pick(rng, grid);
   }
   return normalizeCondition(c, slot, limits);
+}
+
+const MA_TYPES: readonly MaType[] = ['EMA', 'SMA'];
+
+/** True for conditions built on an EMA / SMA whose type the search may switch. */
+function hasMaType(c: Condition): c is Extract<Condition, { ind: 'PRICE_MA' | 'MA_CROSS' | 'MA_SLOPE' }> {
+  return c.ind === 'PRICE_MA' || c.ind === 'MA_CROSS' || c.ind === 'MA_SLOPE';
+}
+
+/** Set the moving-average type of `c` (both averages of a crossover together). */
+function setMaType(c: Condition, type: MaType): void {
+  if (c.ind === 'MA_CROSS') {
+    c.fastType = type;
+    c.slowType = type;
+  } else if (c.ind === 'PRICE_MA' || c.ind === 'MA_SLOPE') {
+    c.maType = type;
+  }
 }
 
 /** A random instance of primitive `id` with its numbers drawn from the grids, or null when the data cannot support it. */
@@ -767,6 +828,8 @@ function drawPrimitive(rng: Rng, id: PrimitiveId, archetype: Archetype, limits: 
   const slot: Slot = primitive.slot === 'trigger' ? (archetype === 'TREND' ? 'trend-trigger' : 'reversion-trigger') : primitive.slot === 'regime' ? 'regime' : 'filter';
   for (let attempt = 0; attempt < 8; attempt++) {
     const c = randomizeParams(rng, { ...template } as Condition, slot, limits);
+    // EMA or SMA, 50 / 50.
+    if (hasMaType(c)) setMaType(c, pick(rng, MA_TYPES));
     if (primitive.matches(c, limits)) return c;
   }
   return normalizeCondition(template, slot, limits);
@@ -928,6 +991,8 @@ interface Handle {
   /** Human-readable name, e.g. "RSI level" or "Stop × ATR". */
   label: string;
   grid: readonly number[];
+  /** Every-integer axis (EMA / SMA lengths in 'integer' mode). */
+  fine: boolean;
   get: () => number;
   set: (value: number) => void;
 }
@@ -937,29 +1002,36 @@ function parameterHandles(g: StrategyGenome, limits: GenomeLimits): Handle[] {
   const handles: Handle[] = [];
   g.longEntry.conditions.forEach((c, index) => {
     const fields = c as unknown as Fields;
-    for (const [key, grid] of conditionSpecs(c, slotOf(g.archetype, index, c), limits)) {
+    for (const [key, grid, fine] of conditionSpecs(c, slotOf(g.archetype, index, c), limits)) {
       if (grid.length === 0) continue;
-      handles.push({ label: parameterLabel(c, key, index), grid, get: () => fields[key] as number, set: (v) => (fields[key] = v) });
+      handles.push({
+        label: parameterLabel(c, key, index),
+        grid,
+        fine: fine === true,
+        get: () => fields[key] as number,
+        set: (v) => (fields[key] = v),
+      });
     }
   });
   const exit = g.exit;
   if (exit.mode === 'static') {
     const grids = staticGrids(limits);
-    handles.push({ label: 'Stop loss %', grid: grids.stopLossPct, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
-    handles.push({ label: 'Take profit %', grid: grids.takeProfitPct, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
+    handles.push({ label: 'Stop loss %', grid: grids.stopLossPct, fine: false, get: () => exit.stopLossPct, set: (v) => (exit.stopLossPct = v) });
+    handles.push({ label: 'Take profit %', grid: grids.takeProfitPct, fine: false, get: () => exit.takeProfitPct, set: (v) => (exit.takeProfitPct = v) });
   } else {
-    handles.push({ label: 'Stop × ATR', grid: GRIDS.stopAtrMult, get: () => exit.stopAtrMult, set: (v) => (exit.stopAtrMult = v) });
+    handles.push({ label: 'Stop × ATR', grid: GRIDS.stopAtrMult, fine: false, get: () => exit.stopAtrMult, set: (v) => (exit.stopAtrMult = v) });
     if (exit.takeProfitAtrMult !== null) {
       handles.push({
         label: 'Target × ATR',
         grid: GRIDS.takeProfitAtrMult,
+        fine: false,
         get: () => exit.takeProfitAtrMult as number,
         set: (v) => (exit.takeProfitAtrMult = v),
       });
     }
   }
   if (g.maxBarsInTrade !== null) {
-    handles.push({ label: 'Time stop (candles)', grid: TIME_STOP_GRID, get: () => g.maxBarsInTrade as number, set: (v) => (g.maxBarsInTrade = v) });
+    handles.push({ label: 'Time stop (candles)', grid: TIME_STOP_GRID, fine: false, get: () => g.maxBarsInTrade as number, set: (v) => (g.maxBarsInTrade = v) });
   }
   return handles;
 }
@@ -999,13 +1071,49 @@ function parameterLabel(c: Condition, key: string, index: number): string {
 /** One tunable parameter of a genome: its name, its grid and its current value. */
 export interface ParameterAxis {
   label: string;
+  /**
+   * The values to inspect around the current one. For a fine (every-integer) axis this is a
+   * ladder of ×√2 steps through the current length – the same relative spacing as the coarse
+   * grid – so stability maps and plateau checks look equally far away in both modes.
+   */
   grid: readonly number[];
   value: number;
+  /** True when the search tunes this parameter over every integer. */
+  fine: boolean;
+}
+
+/** Relative step that counts as "one step" on a fine axis: the spacing of the geometric grid. */
+export const FINE_STEP = Math.SQRT2;
+
+/** The ×√2 ladder through `value`, within the bounds of an integer grid. */
+export function fineLadder(value: number, grid: readonly number[], radius = 6): number[] {
+  const lo = grid[0];
+  const hi = grid[grid.length - 1];
+  const ladder = new Set<number>([value]);
+  for (let k = 1; k <= radius; k++) {
+    const up = Math.round(value * FINE_STEP ** k);
+    const down = Math.round(value / FINE_STEP ** k);
+    if (up <= hi) ladder.add(up);
+    if (down >= lo) ladder.add(down);
+  }
+  return [...ladder].sort((a, b) => a - b);
+}
+
+/** One ×√2 step up (`dir` = 1) or down (−1) from `value` on a fine axis, or null outside its bounds. */
+function fineStep(value: number, grid: readonly number[], dir: 1 | -1): number | null {
+  const lo = grid[0];
+  const hi = grid[grid.length - 1];
+  let next = Math.round(dir === 1 ? value * FINE_STEP : value / FINE_STEP);
+  if (next === value) next = value + dir;
+  return next < lo || next > hi ? null : next;
 }
 
 /** Every tunable parameter of `g`, in a stable order (entry conditions, then exit, then time stop). */
 export function parameterAxes(g: StrategyGenome, limits: GenomeLimits): ParameterAxis[] {
-  return parameterHandles(cloneGenome(g), limits).map((h) => ({ label: h.label, grid: h.grid, value: snap(h.get(), h.grid) }));
+  return parameterHandles(cloneGenome(g), limits).map((h) => {
+    const value = snap(h.get(), h.grid);
+    return { label: h.label, grid: h.fine ? fineLadder(value, h.grid) : h.grid, value, fine: h.fine };
+  });
 }
 
 /**
@@ -1213,11 +1321,44 @@ const FILTER_ADD_RATE = 0.5;
 /** Attempts at a random mutation before falling back to a guaranteed-distinct neighbour. */
 const MUTATION_ATTEMPTS = 16;
 
-/** Move one parameter to a neighbouring grid value. */
+/**
+ * A new length for a fine (every-integer) axis: most of the time a small ±1–3 refinement,
+ * otherwise a relative jump of 10–35% so the search still crosses the range quickly.
+ */
+function fineMove(rng: Rng, value: number, grid: readonly number[]): number {
+  const lo = grid[0];
+  const hi = grid[grid.length - 1];
+  let next: number;
+  if (rng() < 0.6) {
+    const by = 1 + Math.floor(rng() * 3);
+    next = value + (rng() < 0.5 ? -by : by);
+  } else {
+    next = Math.round(value * Math.exp((rng() < 0.5 ? -1 : 1) * (0.1 + 0.25 * rng())));
+  }
+  next = Math.max(lo, Math.min(hi, next));
+  if (next === value) next = value < hi ? value + 1 : value - 1;
+  return next;
+}
+
+/** Share of tweaks that switch an EMA-based rule to SMA (or back) instead of moving a number. */
+const MA_TYPE_SWITCH_RATE = 0.15;
+
+/** Move one parameter to a neighbouring grid value (or, on a fine axis, a nearby integer). */
 function tweak(rng: Rng, g: StrategyGenome, limits: GenomeLimits): void {
+  const averages = g.longEntry.conditions.filter(hasMaType);
+  if (averages.length > 0 && rng() < MA_TYPE_SWITCH_RATE) {
+    const c = pick(rng, averages);
+    const current = c.ind === 'MA_CROSS' ? c.fastType : c.maType;
+    setMaType(c, current === 'EMA' ? 'SMA' : 'EMA');
+    return;
+  }
   const handles = parameterHandles(g, limits).filter((h) => h.grid.length > 1);
   if (handles.length === 0) return;
   const handle = pick(rng, handles);
+  if (handle.fine) {
+    handle.set(fineMove(rng, snap(handle.get(), handle.grid), handle.grid));
+    return;
+  }
   const at = handle.grid.indexOf(snap(handle.get(), handle.grid));
   const stride = rng() < 0.85 ? 1 : 2;
   let next = at + (rng() < 0.5 ? -stride : stride);
@@ -1372,7 +1513,13 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
       const current = snap(handle.get(), handle.grid);
       const at = handle.grid.indexOf(current);
       let next: number;
-      if (kind === 'step') {
+      if (kind === 'step' && handle.fine) {
+        // One "step" on an every-integer axis is the geometric grid's spacing (×√2), not ±1:
+        // EMA(50) vs EMA(51) would always look stable and let a fine-tuned spike through.
+        const neighbour = fineStep(current, handle.grid, factor < 1 ? -1 : 1);
+        if (neighbour === null) continue;
+        next = neighbour;
+      } else if (kind === 'step') {
         const neighbour = at + (factor < 1 ? -1 : 1);
         if (neighbour < 0 || neighbour >= handle.grid.length) continue;
         next = handle.grid[neighbour];

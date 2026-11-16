@@ -293,7 +293,15 @@ export interface BacktestSettings {
   slippageAtrMult?: number;
   /** Borrow / financing cost charged on the notional of SHORT positions only, in percent per bar. Absent = 0. */
   borrowPctPerBar?: number;
+  /**
+   * How the search tunes EMA / SMA lengths (and the Bollinger basis): 'integer' tries every whole
+   * number in range, 'grid' only the coarse geometric grid. Absent = 'grid'.
+   */
+  maPeriods?: MaPeriodSearch;
 }
+
+/** 'integer': fine-tune every EMA / SMA length; 'grid': the coarse geometric grid (5, 7, 10, 14, 20, 28 …). */
+export type MaPeriodSearch = 'integer' | 'grid';
 
 export interface PerformanceMetrics {
   /** Net profit in account currency after fees and slippage. */

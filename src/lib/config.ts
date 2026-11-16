@@ -20,6 +20,7 @@ import type {
   HistoryRange,
   Interval,
   TradeMode,
+  MaPeriodSearch,
 } from '../types/trading';
 
 export const PRESET_TICKERS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'SPY', 'NVDA', 'AAPL'] as const;
@@ -72,6 +73,8 @@ export interface RunConfig {
   robustUniverse: boolean;
   /** Comma-separated tickers of the universe. */
   universe: string;
+  /** Fine-tune EMA / SMA lengths over every integer, or only the coarse grid. */
+  maPeriods: MaPeriodSearch;
 }
 
 export const MAX_UNIVERSE_ASSETS = 8;
@@ -117,6 +120,8 @@ export const DEFAULT_CONFIG: RunConfig = {
   // On by default for crypto (the default ticker is BTC-USD).
   robustUniverse: true,
   universe: DEFAULT_CRYPTO_UNIVERSE.join(', '),
+  // Every EMA / SMA length is tried; the plateau check still looks a ×√2 step away (see genome.ts).
+  maPeriods: 'integer',
 };
 
 /** Parse a comma-separated ticker list into unique, upper-case symbols. */
@@ -231,6 +236,7 @@ export function settingsFrom(config: RunConfig): BacktestSettings {
     // Quoted per 8 hours (funding) and per year (borrow); the engine charges both per candle.
     fundingPctPerBar: financing === 'funding' ? config.fundingPct8h * (barMs / (8 * 3_600_000)) : 0,
     borrowPctPerBar: financing === 'borrow' ? config.borrowPctYear * (barMs / MS_PER_YEAR) : 0,
+    maPeriods: config.maPeriods,
   };
 }
 

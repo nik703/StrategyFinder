@@ -155,7 +155,7 @@ export function sampleCurve(equity: Float64Array, axis: ChartAxis, points: numbe
   return out;
 }
 
-export function deriveLimits(primary: Asset): GenomeLimits {
+export function deriveLimits(primary: Asset, settings?: Pick<BacktestSettings, 'maPeriods'>): GenomeLimits {
   const volume = primary.data.v;
   let withVolume = 0;
   for (let i = 0; i < volume.length; i++) if (volume[i] > 0) withVolume++;
@@ -164,6 +164,7 @@ export function deriveLimits(primary: Asset): GenomeLimits {
     maxLookback: Math.max(30, Math.min(200, Math.floor(primary.split.validationStart / 3))),
     hasVolume: withVolume > volume.length * 0.5,
     barMs: medianBarMs(primary.data.t),
+    maPeriods: settings?.maPeriods ?? 'grid',
   };
 }
 
@@ -431,7 +432,7 @@ export function createContext(datasets: NamedDataset[], settings: BacktestSettin
   return {
     assets,
     settings,
-    limits: deriveLimits(primary),
+    limits: deriveLimits(primary, settings),
     axis: buildAxis(primary.data.t, primary.split),
     hurdle: 0,
     knownTrades: new Set(),
