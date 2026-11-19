@@ -215,8 +215,6 @@ export type Condition =
 /** Candles over which an MA_SLOPE condition measures the slope. */
 export const SLOPE_LAG = 10;
 
-export type IndicatorFamily = Condition['ind'];
-
 /** One trigger plus an optional filter, always combined with AND. */
 export interface RuleGroup {
   logic: GroupLogic;
@@ -323,12 +321,6 @@ export const DEFAULT_SIZING: SizingSetting = { mode: 'risk', riskPct: 2, compoun
 
 export interface BacktestSettings {
   initialCapital: number;
-  /**
-   * Pooled multi-asset sample: every asset of the run is traded with the same rules and the
-   * minimum-trade gates apply to the trades summed over all of them (default: off – each asset
-   * must clear the gates on its own and the first asset is the one traded).
-   */
-  poolAssets?: boolean;
   /** Trading fee charged on every fill, in percent (0.1 = 0.1% per side). */
   feePct: number;
   /** Adverse slippage applied to every fill, in percent (0.05 = 0.05%). */
@@ -396,25 +388,6 @@ export interface PerformanceMetrics {
   ambiguousTrades: number;
 }
 
-/** Market regime slices of the search period, in this order. A bar can be in a trend slice AND the high-volatility slice. */
-export const REGIME_NAMES = ['Bull', 'Bear', 'High volatility'] as const;
-export type RegimeName = (typeof REGIME_NAMES)[number];
-
-/** How a strategy behaved on the search-period bars of one market regime. */
-export interface RegimeMetrics {
-  regime: RegimeName;
-  /** Search-period bars labelled with this regime. */
-  bars: number;
-  /** Share of the search period in this regime (0–1). */
-  coverage: number;
-  /** Trades opened on a bar of this regime. */
-  trades: number;
-  /** Net profit of those trades. */
-  netPnl: number;
-  /** Annualised Sharpe ratio of the per-bar returns on this regime's bars. */
-  sharpe: number;
-}
-
 /** Metrics of one strategy on one asset. */
 export interface AssetResult {
   symbol: string;
@@ -424,9 +397,7 @@ export interface AssetResult {
   validation: PerformanceMetrics;
   /** The search period cut into equal, sequential folds (oldest first). */
   folds?: PerformanceMetrics[];
-  /** Behaviour in the bull, bear and high-volatility slices of the search period (null when unavailable). */
-  regimes?: RegimeMetrics[] | null;
-  /** Null until the run has ended. */
+  /** Null until this strategy's holdout has been revealed. */
   holdout: PerformanceMetrics | null;
 }
 
@@ -523,19 +494,8 @@ export interface CrossMarketReport {
   cutoff: number;
 }
 
+/** On-demand robustness analysis of one strategy, on the search period only (the holdout is not touched). */
 export interface RobustnessReport {
-  sensitivity: {
-    /** Number of ±20% single-parameter variants that were re-tested. */
-    variants: number;
-    baseRoi: number;
-    medianRoi: number;
-    worstRoi: number;
-    baseFitness: number;
-    medianFitness: number;
-    worstFitness: number;
-    /** True when the worst variant loses more than half of the original ROI. */
-    fragile: boolean;
-  };
   topTrades: {
     netPnl: number;
     /** Net PnL after removing the best trades. */
@@ -544,15 +504,9 @@ export interface RobustnessReport {
     profitable: boolean;
   };
   /** Parameter-stability map (null when the strategy has no tunable parameter). */
-  stability?: StabilityGrid | null;
+  stability: StabilityGrid | null;
   /** Monte Carlo execution stress test with its equity-path bands (null without trades). */
-  monteCarlo?: MonteCarloReport | null;
-  /** Null when no other assets were available. */
-  crossAsset: {
-    rows: { symbol: string; roi: number; sharpe: number; trades: number; profitable: boolean }[];
-    /** Share of assets with a positive ROI (0–1). */
-    share: number;
-  } | null;
+  monteCarlo: MonteCarloReport | null;
 }
 
 /** The minimum-trade gates of a run's data (see `tradeGatesFor` in engine/backtester.ts). */
@@ -582,21 +536,14 @@ export interface StrategyResult {
   /** Unique within one optimisation run, e.g. "S-4821". */
   id: string;
   genome: StrategyGenome;
-  /** Composite fitness score used for ranking (higher is better), after the parameter-neighbourhood cap. */
+  /** Composite fitness used for ranking (higher is better), after the parameter-neighbourhood blend. */
   fitness: number;
-  /** Fitness of the exact parameter values, before the neighbourhood cap. */
+  /** Fitness of the exact parameter values, before the neighbourhood blend. */
   pointFitness?: number;
   /** Median fitness of the one-grid-step parameter neighbours (null without neighbours). */
   neighbourMedian?: number | null;
   /** Number of one-grid-step neighbours that were backtested. */
   neighbourCount?: number;
-  /**
-   * Haircut Sharpe of the validation segment: the annualised Sharpe that survives a Bonferroni
-   * correction for every trial on this data window (Harvey & Liu). 0 when nothing survives.
-   */
-  haircutSharpe?: number;
-  /** Share of the validation Sharpe removed by the haircut (0–1; 1 = entirely explained by multiple testing). */
-  haircut?: number;
   /** Number of tunable numeric parameters. */
   params: number;
   /** Deflated Sharpe Ratio of the validation segment: probability that the Sharpe is real given every trial so far. */
@@ -607,9 +554,7 @@ export interface StrategyResult {
   validation: PerformanceMetrics;
   /** Primary-asset folds of the search period (oldest first). */
   folds?: PerformanceMetrics[];
-  /** Primary-asset regime slices of the search period. */
-  regimes?: RegimeMetrics[] | null;
-  /** Null while the run is in progress – the holdout is only evaluated once the search has ended. */
+  /** Null until this strategy is locked and its holdout revealed (one strategy per run, after the search). */
   holdout: PerformanceMetrics | null;
   /** Search-period ROI minus Buy & Hold ROI, in percentage points. */
   alpha: number;
@@ -682,7 +627,7 @@ export const BUDGET_EXTENSION = 10_000;
  * re-seeds the rest of its parent population with fresh random genomes, instead of stopping.
  */
 export const FITNESS_PATIENCE = 1_500;
-/** Strategies kept in the hall of fame at every restart. */
+/** The elite: the top strategies of the leaderboard, kept at every diversity restart. */
 export const ELITE_SIZE = 5;
 /** Default number of robust strategies a run scans for ("Stop after N robust strategies"); 0 = the full budget. */
 export const DEFAULT_ROBUST_TARGET = 3;
@@ -699,10 +644,6 @@ export const TRAIN_FRACTION = 0.6;
 export const VALIDATION_FRACTION = 0.2;
 export const HOLDOUT_FRACTION = 0.2;
 
-/** Default "Robust universe": the same rules must work on all of these, untuned. */
-export const DEFAULT_CRYPTO_UNIVERSE: readonly string[] = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ADA-USD', 'DOGE-USD'];
-export const DEFAULT_STOCK_UNIVERSE: readonly string[] = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'MSFT', 'AMZN'];
-
 export interface NamedDataset {
   symbol: string;
   data: OHLCV;
@@ -716,12 +657,12 @@ export interface TrialStats {
 }
 
 export interface OptimizerStartPayload {
-  /** The primary asset first; more than one entry switches on Robust-universe scoring. */
+  /** The primary asset first; more than one entry is a pooled multi-asset run (the same rules on every asset). */
   datasets: NamedDataset[];
   settings: BacktestSettings;
   /** The market hypothesis every strategy of this run is built from. */
   hypothesis: Hypothesis;
-  /** Evaluations this run may spend (default 5,000, at most the window's remaining budget). */
+  /** Evaluations this run may spend (default `DEFAULT_RUN_EVALUATIONS`, at most the window's remaining budget). */
   maxEvaluations?: number;
   /**
    * Trials already spent on this data window by earlier runs (from the persistent trial ledger).
@@ -745,8 +686,8 @@ export type WorkerRequest =
   | { type: 'stop' }
   /** An evaluator worker died: finish the run on the optimiser thread. */
   | { type: 'pool-failed' }
-  /** Robustness analysis of one strategy. `universe` supplies extra assets for the cross-asset test. */
-  | { type: 'analyze'; strategyId: string; genome: StrategyGenome; universe?: NamedDataset[] }
+  /** Robustness analysis of one strategy (top-trade removal, stability map, Monte Carlo bands). */
+  | { type: 'analyze'; strategyId: string; genome: StrategyGenome }
   /**
    * Lock ONE strategy of the final leaderboard as the run's answer and reveal its holdout.
    * Allowed once per run, only after the search has ended. `priorReveals` is how often this holdout
@@ -767,13 +708,11 @@ export type WorkerRequest =
 export interface ProgressSnapshot {
   /** Candidates proposed, including duplicates that were not evaluated. */
   iteration: number;
-  /** Proposals since the top fitness last improved. */
-  stagnation: number;
   /** Unique strategies evaluated by this run – the trials it added. */
   evaluations: number;
   /** Trials on this data window across all runs, this one included. */
   windowTrials: number;
-  /** Evaluations since a candidate last improved the best fitness (early stop at `FITNESS_PATIENCE`). */
+  /** Evaluations since a candidate last improved the best fitness (a diversity restart at `FITNESS_PATIENCE`). */
   fitnessStall: number;
   /** Candidates dropped because their trade log repeated one already evaluated. */
   duplicates: number;
@@ -853,7 +792,8 @@ export type WorkerResponse =
   | { type: 'analysis'; strategyId: string; report: RobustnessReport; verdict: Verdict | null }
   /** The locked strategy with its holdout, robustness report and verdict, plus the Buy & Hold holdout. */
   | { type: 'locked'; strategy: StrategyResult; benchmark: BenchmarkResult }
-  | { type: 'cross-market'; strategyId: string; report: CrossMarketReport }
+  /** `locked`: the locked strategy judged again with the new evidence, when the check was run on it. */
+  | { type: 'cross-market'; strategyId: string; report: CrossMarketReport; locked?: StrategyResult }
   | { type: 'error'; message: string };
 
 export type EngineStatus = 'idle' | 'loading' | 'optimizing' | 'stopped' | 'converged' | 'error';

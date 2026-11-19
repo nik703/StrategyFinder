@@ -260,15 +260,20 @@ describe('optimizer worker', () => {
       expect(s.dsr).toBeLessThanOrEqual(1);
       expect(s.assets).toHaveLength(1);
     }
-    expect(done.bestFitness).toBeCloseTo(final[0].fitness, 9);
+    // Rank order: strategies passing every robustness gate first, then by fitness.
+    expect(done.bestFitness).toBeCloseTo(Math.max(...final.map((s) => s.fitness)), 9);
+    const passed = final.map((s) => (s.robust?.passed ? 1 : 0));
+    for (let k = 1; k < final.length; k++) {
+      expect(passed[k]).toBeLessThanOrEqual(passed[k - 1]);
+      if (passed[k] === passed[k - 1]) expect(final[k].fitness).toBeLessThanOrEqual(final[k - 1].fitness + 1e-12);
+    }
     expect(done.bestDsr).toBeCloseTo(Math.max(...final.map((s) => s.dsr)), 9);
     expect(done.hurdleSharpe).toBeGreaterThan(0);
 
-    // Stage 2 ranking: every listed strategy carries its fold and regime breakdown, and is ranked by
-    // its own fitness capped at the median of its one-grid-step neighbours (spikes sink, plateaus hold).
+    // Every listed strategy carries its fold breakdown, and is ranked by its own fitness blended
+    // with the median of its one-grid-step neighbours (spikes sink, plateaus hold).
     for (const s of final) {
       expect(s.folds).toHaveLength(FOLDS);
-      expect(s.regimes?.map((r) => r.regime)).toEqual(['Bull', 'Bear', 'High volatility']);
       expect(s.neighbourCount ?? 0).toBeGreaterThan(2);
       expect(s.pointFitness).toBeDefined();
       expect(s.fitness).toBeLessThanOrEqual((s.pointFitness as number) + 1e-12);
@@ -282,8 +287,6 @@ describe('optimizer worker', () => {
     const logs = new Set<string>();
     for (const s of final) {
       expect(s.genome.hypothesis).toBe('TREND_FOLLOWING');
-      expect(s.haircutSharpe).toBeDefined();
-      expect(s.haircut ?? -1).toBeGreaterThanOrEqual(0);
       runBacktest(btcInd, s.genome, settings, btcWs, btcSplit.holdoutStart);
       logs.add(tradeLogHash(btcWs, btcSplit.holdoutStart));
     }
@@ -308,9 +311,10 @@ describe('optimizer worker', () => {
     expect(['Robust', 'Fragile', 'Overfit']).toContain(top.verdict);
     expect(Array.isArray(top.verdictNotes)).toBe(true);
     expect((top.verdictNotes ?? []).length === 0).toBe(top.verdict === 'Robust');
-    expect(top.robustness?.sensitivity.variants).toBeGreaterThan(2);
     expect(top.robustness?.topTrades.removed).toBeLessThanOrEqual(5);
-    expect(top.robustness?.crossAsset).toBeNull(); // single-asset run
+    expect(top.robustness?.monteCarlo?.simulations).toBeGreaterThanOrEqual(200);
+    // A single-asset run shows no generalisation until the cross-market check passes.
+    if (top.verdict === 'Fragile') expect(top.verdictNotes?.join(' ')).toMatch(/cross-market check|Generalisation/);
     // A strategy that lost money on the holdout, or whose DSR says luck, is always Overfit.
     if ((top.holdout?.roi ?? 0) <= 0 || top.dsr < 0.5) expect(top.verdict).toBe('Overfit');
     // Robust needs a holdout Sharpe CI above zero that beats Buy & Hold.
@@ -451,11 +455,13 @@ describe('optimizer worker', () => {
     expect(done.robustTarget).toBe(0);
   }, 300_000);
 
-  it('scores a Robust universe on every asset and answers analyze requests', async () => {
+  it('trades every asset of a pool with the same rules and answers analyze requests', async () => {
     // 4h candles: two years of daily candles cannot supply the minimum number of trades on every asset.
     const universe = ['BTC-USD', 'ETH-USD', 'SOL-USD'].map((symbol) => dataset(symbol, '4h', '2y'));
     const settings = settingsFor('long-only');
     const messages = await runOptimizer(universe, settings, { seed: 21, maxEvaluations: 400 });
+    const ready = messages.find((m) => m.type === 'ready') as Of<'ready'>;
+    expect(ready.pooled).toBe(true); // several assets are always one pooled sample
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.strategies.length).toBeGreaterThan(0);
@@ -469,29 +475,29 @@ describe('optimizer worker', () => {
     }
     for (const s of done.strategies) {
       expect(s.assets).toHaveLength(3);
-      for (const asset of s.assets) {
-        expect(asset.holdout).toBeNull();
-        // Every asset clears the per-year trade gate.
-        expect(asset.search.trades).toBeGreaterThan(0);
-      }
+      // The trade gates apply to the trades pooled over the three assets.
+      expect(s.sample?.pooled).toBe(true);
+      expect(s.sample?.trades).toBe(s.assets.reduce((sum, asset) => sum + asset.search.trades, 0));
+      for (const asset of s.assets) expect(asset.holdout).toBeNull();
     }
 
-    // On-demand analysis, with two extra assets supplied for the cross-asset test.
+    // On-demand analysis: top-trade removal over the pooled trades, the stability map and the stress test.
     const target = done.strategies[0];
-    const extra = [dataset('XRP-USD', '4h', '2y'), dataset('DOGE-USD', '4h', '2y')];
-    const reply = request({ type: 'analyze', strategyId: target.id, genome: target.genome, universe: extra }) as Of<'analysis'>;
+    const reply = request({ type: 'analyze', strategyId: target.id, genome: target.genome }) as Of<'analysis'>;
     expect(reply.type).toBe('analysis');
     expect(reply.strategyId).toBe(target.id);
-    expect(reply.report.crossAsset?.rows.map((row) => row.symbol)).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD']);
-    expect(reply.report.sensitivity.baseRoi).toBeCloseTo(target.search.roi, 6);
+    const pooledPnl = target.assets.reduce((sum, asset) => sum + asset.search.netPnl, 0);
+    expect(reply.report.topTrades.netPnl).toBeCloseTo(pooledPnl, 4);
     expect(reply.report.topTrades.netPnlWithout).toBeLessThanOrEqual(reply.report.topTrades.netPnl);
+    expect(reply.report.monteCarlo?.trades).toBe(target.sample?.trades);
     expect(reply.verdict).toBeNull(); // not locked yet
 
     // Locking reveals every asset's holdout for that one strategy.
     const locked = lock(target.id) as Of<'locked'>;
     expect(locked.type).toBe('locked');
     for (const asset of locked.strategy.assets) expect(asset.holdout).not.toBeNull();
-    expect(locked.strategy.robustness?.crossAsset?.rows.map((row) => row.symbol)).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD']);
+    // A pool demonstrates generalisation itself: the verdict never asks for a cross-market check.
+    expect((locked.strategy.verdictNotes ?? []).join(' ')).not.toMatch(/Generalisation not shown/);
     const after = request({ type: 'analyze', strategyId: target.id, genome: target.genome }) as Of<'analysis'>;
     expect(['Robust', 'Fragile', 'Overfit']).toContain(after.verdict);
 
@@ -556,7 +562,7 @@ describe('optimizer worker', () => {
     expect(b.type).toBe('done');
     expect(a.strategies.length).toBeGreaterThan(0);
     expect(b.iteration).toBe(a.iteration);
-    expect(b.stagnation).toBe(a.stagnation);
+    expect(b.fitnessStall).toBe(a.fitnessStall);
     expect(b.strategies.map((s) => s.id)).toEqual(a.strategies.map((s) => s.id));
     expect(b.strategies.map((s) => s.fitness)).toEqual(a.strategies.map((s) => s.fitness));
     expect(b.strategies.map((s) => s.genome)).toEqual(a.strategies.map((s) => s.genome));
@@ -870,7 +876,7 @@ describe('acceptance: pure noise must not look like an edge', () => {
     // Four independent random walks traded with the same rules: the trades are pooled for the gates,
     // the score is the median over the assets, and nothing on the board may look like an edge.
     const walks = [0, 1, 2, 3].map((k) => randomWalk(AUDIT_BARS, 700 + k, AUDIT_SIGMA, AUDIT_DRIFT_PER_BAR));
-    const messages = await runOptimizer(walks, { ...SETTINGS, poolAssets: true }, { seed: 77, hypothesis: 'TREND_FOLLOWING' });
+    const messages = await runOptimizer(walks, SETTINGS, { seed: 77, hypothesis: 'TREND_FOLLOWING' });
     const ready = messages[0] as Of<'ready'>;
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(ready.pooled).toBe(true);

@@ -61,3 +61,11 @@ export function requestForecasts(jobs: ForecastJob[]): Promise<ForecastResult[]>
     getWorker().postMessage(request);
   });
 }
+
+/** Terminate the shared forecast worker (part of "Reset Runs & Clear Cache"); the next request starts a fresh one. */
+export function resetForecastWorker(): void {
+  for (const waiting of pending.values()) waiting.reject(new Error('Forecast cancelled by a reset.'));
+  pending.clear();
+  worker?.terminate();
+  worker = null;
+}

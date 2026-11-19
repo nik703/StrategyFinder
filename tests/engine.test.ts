@@ -7,10 +7,9 @@ import {
   edgeRate,
   foldScore,
   judgedFolds,
-  collapsedRegimes,
   emptyMetrics,
-  CATASTROPHIC_FOLD_DRAWDOWN,
-  CONSISTENCY_BONUS,
+  DRAWDOWN_GUARD,
+  FITNESS_WEIGHTS,
   expectancy,
   passesFoldGate,
   passesValidationGate,
@@ -18,13 +17,7 @@ import {
   ROBUST_MIN_VALIDATION_SHARPE,
   foldBounds,
   FOLDS,
-  isSingleRegime,
   plateauFitness,
-  quantile,
-  regimeMask,
-  REGIME_COLLAPSE_PENALTY,
-  REGIME_HIGH_VOL,
-  testableRegimes,
   tradeLogHash,
   type SearchMetrics,
   BacktestWorkspace,
@@ -84,16 +77,15 @@ import {
   mulberry32,
   mutateGenome,
   normalizeGenome,
-  parameterVariants,
   randomGenome,
   repairGenome,
   STATIC_PCT_GRID,
+  stepNeighbours,
   TIME_STOP_GRID,
 } from '../src/engine/genome';
 import { atr, bollinger, donchian, ema, IndicatorCache, rsi, sma, stochastic, supertrend } from '../src/engine/indicators';
 import { generatePineScript } from '../src/engine/pine';
-import { deflatedSharpe, expectedMaxSharpe, haircutSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
-import { overfittingRisk } from '../src/lib/risk';
+import { deflatedSharpe, expectedMaxSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
 import {
   clampRange,
   HOLDOUT_FRACTION,
@@ -107,7 +99,6 @@ import {
   type ConditionRole,
   type OHLCV,
   type PerformanceMetrics,
-  type RegimeMetrics,
   type StrategyGenome,
   type StrategyResult,
   type TradeMode,
@@ -643,28 +634,19 @@ describe('backtester', () => {
       const settings: BacktestSettings = { ...SETTINGS, tradeMode: mode, sizing };
       const ind = new IndicatorCache(data);
       const ws = new BacktestWorkspace(n);
-      const regimes = regimeMask(data.c, split, ppy);
       const fb = foldBounds(split);
       for (let i = 0; i < 400; i++) {
         const genome = randomGenome(rng, mode, DEFAULT_LIMITS, HYPOTHESIS_IDS[i % HYPOTHESIS_IDS.length]);
         // Search-period run (what the optimiser does) and a full run (what the holdout reveal does).
         for (const bars of [split.holdoutStart, n]) {
           runBacktest(ind, genome, settings, ws, bars);
-          const fused = searchMetrics(ws.equity, split, settings.initialCapital, ppy, ws, ws.equityLow, regimes);
+          const fused = searchMetrics(ws.equity, split, settings.initialCapital, ppy, ws, ws.equityLow);
           // Folds: the single pass must equal five separate segment passes.
           fb.slice(0, -1).forEach((from, f) => {
             const start = from === 0 ? settings.initialCapital : ws.equity[from - 1];
             const ref = segmentMetrics(ws.equity, from, fb[f + 1], start, ppy, ws);
             for (const key of keys) {
               if (!close(fused.folds[f][key], ref[key])) throw new Error(`${symbol} #${i} fold ${f}.${key}: fused ${fused.folds[f][key]} vs reference ${ref[key]}`);
-            }
-          });
-          // Regimes: a copy of the curve forces the bar-by-bar reference implementation.
-          const slow = searchMetrics(Float64Array.from(ws.equity), split, settings.initialCapital, ppy, ws, ws.equityLow, regimes);
-          fused.regimes?.forEach((r, j) => {
-            const ref = slow.regimes?.[j];
-            for (const key of ['bars', 'coverage', 'trades', 'netPnl', 'sharpe'] as const) {
-              if (!ref || !close(r[key], ref[key])) throw new Error(`${symbol} #${i} regime ${r.regime}.${key}: fused ${r[key]} vs reference ${ref?.[key]}`);
             }
           });
           const reference = {
@@ -686,33 +668,6 @@ describe('backtester', () => {
     }
     expect(withTrades).toBeGreaterThan(1500);
     expect(flat).toBeGreaterThan(5); // the never-traded shortcut is exercised too
-  });
-
-  it('labels bull, bear and high-volatility regimes causally, without looking at the holdout', () => {
-    const data = dataset('BTC-USD', '1d', '5y');
-    const n = data.c.length;
-    const split = splitFor(n);
-    const ppy = barsPerYear(data.t);
-    const r = regimeMask(data.c, split, ppy);
-    expect(r.searchBars).toBe(split.holdoutStart);
-    // Bull and bear partition the labelled bars; every slice is populated on five years of data.
-    for (let i = 0; i < split.holdoutStart; i++) expect((r.mask[i] & 3) !== 3).toBe(true);
-    expect(r.bars[0] + r.bars[1]).toBeGreaterThan(0.8 * split.holdoutStart);
-    expect(r.bars[0]).toBeGreaterThan(0.1 * split.holdoutStart);
-    expect(r.bars[1]).toBeGreaterThan(0.1 * split.holdoutStart);
-    // High volatility is the top third of the search period's own trailing volatility.
-    expect(r.bars[2] / split.holdoutStart).toBeGreaterThan(0.25);
-    expect(r.bars[2] / split.holdoutStart).toBeLessThan(0.4);
-    for (let i = split.holdoutStart; i < n; i++) expect(r.mask[i]).toBe(0);
-    // Wrecking every holdout price changes nothing in the search period.
-    const poisoned = Float64Array.from(data.c);
-    for (let i = split.holdoutStart; i < n; i++) poisoned[i] = poisoned[i] * (i % 2 === 0 ? 10 : 0.1);
-    expect(Array.from(regimeMask(poisoned, split, ppy).mask)).toEqual(Array.from(r.mask));
-    // Truncating the future cannot relabel the past trend (only the volatility threshold may move).
-    const cut = truncate(data, Math.floor(n * 0.9));
-    const rCut = regimeMask(cut.c, splitFor(cut.c.length), ppy);
-    for (let i = 0; i < rCut.searchBars; i++) expect(rCut.mask[i] & 3).toBe(r.mask[i] & 3);
-    expect(REGIME_HIGH_VOL).toBe(4);
   });
 
   it('evaluates signals only inside the simulated window and matches a plain AND of the conditions', () => {
@@ -765,20 +720,9 @@ describe('backtester', () => {
     expect(s.roi).toBeCloseTo((1.01 ** 100 - 1) * 100, 6);
   });
 
-  it('ranks by a fitness that disqualifies small samples and penalises complexity, poor payoff and deep drawdowns', () => {
+  it('ranks by one composite fitness: hard trade gates, the median over assets, and nothing that depends on luck', () => {
     const gates = { search: 60, validation: 15, perYear: 15, holdout: 15 };
-    const base = {
-      assetScores: [2],
-      trades: 150,
-      validationTrades: 40,
-      tradesPerYear: 40,
-      gates,
-      singleRegime: false,
-      profitableShare: 1,
-      params: 4,
-      rewardToRisk: 2,
-      validationWinRate: 50,
-    };
+    const base = { assetScores: [2], trades: 150, validationTrades: 40, tradesPerYear: 40, gates };
     const score = combineFitness(base);
     expect(score).toBe(2);
     // Hard gates: one trade short of any minimum disqualifies, however good the rest looks.
@@ -790,27 +734,25 @@ describe('backtester', () => {
     expect(combineFitness({ ...base, tradesPerYear: gates.perYear - 0.1 })).toBe(UNFIT);
     for (const trades of [3, 8, 14]) expect(combineFitness({ ...base, assetScores: [50], validationTrades: trades })).toBe(UNFIT);
     expect(combineFitness({ ...base, trades: 0 })).toBe(UNFIT);
-    // A strategy that makes all of its money in one market regime is disqualified.
-    expect(combineFitness({ ...base, assetScores: [50], singleRegime: true })).toBe(UNFIT);
-    expect(combineFitness({ ...base, params: 5 })).toBeCloseTo(score - 0.15, 9);
-    // Reward:risk below 1 needs a win rate 10 points above break-even (66.7% at 0.5:1).
-    expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 70 })).toBeCloseTo(score - 0.75, 9);
-    expect(combineFitness({ ...base, rewardToRisk: 0.5, validationWinRate: 80 })).toBe(score);
-    // Robust universe: the median counts, and fewer than 2/3 profitable assets costs a point.
-    expect(combineFitness({ ...base, assetScores: [5, 1, 2], profitableShare: 1 })).toBe(2);
-    expect(combineFitness({ ...base, assetScores: [5, 1, 2], profitableShare: 1 / 3 })).toBe(1);
+    // A pooled run: the median over the assets counts, so one lucky asset cannot carry the pool.
+    expect(combineFitness({ ...base, assetScores: [5, 1, 2] })).toBe(2);
+    expect(combineFitness({ ...base, assetScores: [9, -1, -2] })).toBe(-1);
 
     const data = dataset();
     const split = splitFor(data.c.length);
     const ppy = barsPerYear(data.t);
     const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, ppy);
-    const assetScore = assetBaseScore(m);
+    const assetScore = assetBaseScore(m, ppy);
     expect(Number.isFinite(assetScore)).toBe(true);
-    const deeper = { ...m, search: { ...m.search, maxDrawdown: m.search.maxDrawdown + 40 } };
-    expect(assetBaseScore(deeper)).toBeLessThan(assetScore);
-    // Stage 2: raw validation return over Buy & Hold no longer moves the score at all.
+    // The drawdown guard: every unit of search-period drawdown beyond 25% costs 4 points.
+    const guarded = (dd: number): SearchMetrics => ({ ...m, search: { ...m.search, maxDrawdown: dd } });
+    expect(FITNESS_WEIGHTS.drawdown).toBe(4);
+    expect(DRAWDOWN_GUARD).toBe(0.25);
+    expect(assetBaseScore(guarded(20), ppy) - assetBaseScore(guarded(45), ppy)).toBeCloseTo(4 * 0.2, 9);
+    expect(assetBaseScore(guarded(10), ppy)).toBeCloseTo(assetBaseScore(guarded(25), ppy), 12);
+    // Raw validation return over Buy & Hold does not move the score at all.
     const moreValidationRoi = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
-    expect(assetBaseScore(moreValidationRoi)).toBe(assetScore);
+    expect(assetBaseScore(moreValidationRoi, ppy)).toBe(assetScore);
   });
 
   it('defines the robustness gates a strategy must all pass to count towards the scan target', () => {
@@ -849,7 +791,7 @@ describe('backtester', () => {
     expect(h4.search).toBe(Math.ceil(h4.perYear * (splitFor(4380).holdoutStart / (365 * 6))));
   });
 
-  it('scores the median fold with a consistency bonus and a per-fold catastrophe penalty', () => {
+  it('scores the median fold of a Sortino / Calmar blend, so one lucky fold cannot carry a strategy', () => {
     const fold = (sharpe: number, trades = 8, maxDrawdown = 5): PerformanceMetrics => ({
       ...emptyMetrics(),
       sharpe,
@@ -859,39 +801,32 @@ describe('backtester', () => {
       exposure: trades > 0 ? 40 : 0,
       maxDrawdown,
     });
-    const asMetrics = (folds: PerformanceMetrics[]): SearchMetrics => ({
-      search: emptyMetrics(),
-      train: emptyMetrics(),
-      validation: emptyMetrics(),
-      folds,
-      regimes: null,
-    });
+    const asMetrics = (folds: PerformanceMetrics[]): SearchMetrics => ({ search: emptyMetrics(), train: emptyMetrics(), validation: emptyMetrics(), folds });
     const of = (sharpes: number[]): SearchMetrics => asMetrics(sharpes.map((x) => fold(x)));
+    const score = (m: SearchMetrics): number => assetBaseScore(m, 365);
     expect(FOLDS).toBe(5);
+    expect(FITNESS_WEIGHTS.riskAdjusted).toBe(1.5);
+    // Fold score: ½ Sortino / 1.5 + ½ Calmar (CAGR 0 here, so Calmar 0) – i.e. half the Sharpe in these folds.
+    expect(foldScore(fold(1))).toBeCloseTo(0.5, 12);
     // One spectacular fold and four losing ones vs five steady, modest folds.
-    const lucky = assetBaseScore(of([3, -0.5, -0.4, -0.6, -0.3]));
-    const steady = assetBaseScore(of([0.8, 0.7, 0.9, 0.6, 0.75]));
+    const lucky = score(of([3, -0.5, -0.4, -0.6, -0.3]));
+    const steady = score(of([0.8, 0.7, 0.9, 0.6, 0.75]));
     expect(steady).toBeGreaterThan(lucky);
     expect(lucky).toBeLessThan(0);
     // The fold order does not matter, only the distribution.
-    expect(assetBaseScore(of([-0.3, -0.6, -0.4, -0.5, 3]))).toBeCloseTo(lucky, 12);
-    // A trend follower that loses a little in two sideways folds keeps most of its score: the
-    // median, not the second-worst fold, is graded, and 3 of 5 profitable folds earn the bonus.
-    const trend = assetBaseScore(of([1.2, -0.2, 1.0, -0.1, 0.9]));
-    // Fold score: 35% Sortino / 1.5 + 25% Sharpe + 20% Calmar + 20% expectancy × frequency (both 0 here).
-    expect(trend).toBeCloseTo(1.5 * (0.35 * (1.35 / 1.5) + 0.25 * 0.9) + CONSISTENCY_BONUS, 9);
-    expect(assetBaseScore(of([1.2, -0.2, -0.3, -0.1, 0.9]))).toBeLessThan(trend - 2 * CONSISTENCY_BONUS);
-    // A catastrophic drawdown in any single fold costs at least 3 points.
-    const blowUp = asMetrics([fold(1.2), fold(-0.2), fold(1.0, 8, 100 * CATASTROPHIC_FOLD_DRAWDOWN + 10), fold(-0.1), fold(0.9)]);
-    expect(assetBaseScore(blowUp)).toBeLessThanOrEqual(trend - 3.6 + 1e-9);
+    expect(score(of([-0.3, -0.6, -0.4, -0.5, 3]))).toBeCloseTo(lucky, 12);
+    // A trend follower that loses a little in two sideways folds keeps its median fold.
+    const trend = score(of([1.2, -0.2, 1.0, -0.1, 0.9]));
+    expect(trend).toBeCloseTo(1.5 * 0.5 * 0.9, 9);
+    // Three losing folds of five pull the median below zero.
+    expect(score(of([1.2, -0.2, -0.3, -0.1, 0.9]))).toBeLessThan(0);
     // Flat folds (no position at all – a regime filter sitting out a bear year) are set aside once
     // the strategy was active in at least three folds ...
     const sitsOut = asMetrics([fold(0, 0), fold(0, 0), fold(1.0), fold(0.8), fold(-0.2)]);
-    expect(assetBaseScore(sitsOut)).toBeCloseTo(1.5 * (0.35 * (1.2 / 1.5) + 0.25 * 0.8) + CONSISTENCY_BONUS, 9);
+    expect(score(sitsOut)).toBeCloseTo(1.5 * 0.5 * 0.8, 9);
     // ... but not before: two active folds out of five are judged on all five.
     const barelyActive = asMetrics([fold(0, 0), fold(0, 0), fold(0, 0), fold(1.0), fold(0.8)]);
-    expect(assetBaseScore(barelyActive)).toBeCloseTo(0 - 1 * CONSISTENCY_BONUS, 9);
-    expect(quantile([1, 2], 0.5)).toBe(1.5);
+    expect(score(barelyActive)).toBeCloseTo(0, 9);
     // The fold boundaries cut the search period into five equal, sequential pieces.
     const bounds = foldBounds(splitFor(1000));
     expect(bounds).toEqual([0, 160, 320, 480, 640, 800]);
@@ -908,14 +843,18 @@ describe('backtester', () => {
     expect(edgeRate(edge, 365)).toBeCloseTo(0.35 * 20, 9);
     expect(edgeRate(edge, 0)).toBe(0); // unknown bar frequency
     expect(edgeRate(m({ trades: 0, bars: 365 }), 365)).toBe(0);
-    // More trades with the same per-trade edge score higher; a losing edge scores lower.
-    const often = m({ trades: 60, winRate: 45, payoffRatio: 2, bars: 365, sharpe: 1, sortino: 1.5, cagr: 20, maxDrawdown: 10 });
+    // Expectancy x frequency is scored over the whole search period: more trades with the same
+    // per-trade edge score higher, a losing edge lower; the folds are identical in all three.
+    const folds = Array.from({ length: 5 }, () => m({ sharpe: 1, sortino: 1.5, cagr: 20, maxDrawdown: 10, trades: 6, roi: 4, exposure: 30 }));
+    const withSearch = (search: PerformanceMetrics): SearchMetrics => ({ search, train: emptyMetrics(), validation: emptyMetrics(), folds });
+    const often = m({ trades: 60, winRate: 45, payoffRatio: 2, bars: 365 });
     const rarely = { ...often, trades: 10 };
     const losing = { ...often, winRate: 25 };
-    expect(foldScore(often, 365)).toBeGreaterThan(foldScore(rarely, 365));
-    expect(foldScore(losing, 365)).toBeLessThan(foldScore(rarely, 365));
-    // The fold gate now sets flat folds aside exactly like the fitness: a regime filter that sat out
-    // two folds and made money in two of the three it traded passes (it failed before the review).
+    expect(assetBaseScore(withSearch(often), 365)).toBeGreaterThan(assetBaseScore(withSearch(rarely), 365));
+    expect(assetBaseScore(withSearch(losing), 365)).toBeLessThan(assetBaseScore(withSearch(rarely), 365));
+    expect(assetBaseScore(withSearch(often), 365) - assetBaseScore(withSearch(rarely), 365)).toBeCloseTo(FITNESS_WEIGHTS.edge * (0.35 * 50) / 10, 9);
+    // The fold gate sets flat folds aside exactly like the fitness: a regime filter that sat out two
+    // folds and made money in two of the three it traded passes.
     const fold = (roi: number, trades = 8, maxDrawdown = 5): PerformanceMetrics => m({ roi, trades, exposure: trades > 0 ? 30 : 0, maxDrawdown });
     const sitsOut = [fold(0, 0), fold(0, 0), fold(4), fold(-1), fold(3)];
     expect(passesFoldGate(sitsOut)).toBe(true);
@@ -924,30 +863,6 @@ describe('backtester', () => {
     expect(passesFoldGate([fold(0, 0), fold(0, 0), fold(0, 0), fold(4), fold(3)])).toBe(false);
     // One losing active fold of three is fine; two are not.
     expect(passesFoldGate([fold(0, 0), fold(0, 0), fold(-2), fold(-1), fold(3)])).toBe(false);
-  });
-
-  it('penalises regime collapse and disqualifies one-regime strategies', () => {
-    const slice = (regime: RegimeMetrics['regime'], sharpe: number, trades = 30, coverage = 0.4): RegimeMetrics => ({
-      regime, bars: 400, coverage, trades, netPnl: sharpe * 100, sharpe,
-    });
-    const steadyFolds = [0.8, 0.7, 0.9, 0.6, 0.75].map((sharpe) => ({ ...emptyMetrics(), sharpe, sortino: sharpe * 1.5, roi: sharpe, trades: 5 }));
-    const withRegimes = (regimes: RegimeMetrics[]): SearchMetrics => ({
-      search: emptyMetrics(), train: emptyMetrics(), validation: emptyMetrics(), folds: steadyFolds, regimes,
-    });
-    const healthy = [slice('Bull', 1.2), slice('Bear', 0.3), slice('High volatility', 0.5)];
-    const bearCollapse = [slice('Bull', 1.2), slice('Bear', -1.4), slice('High volatility', 0.5)];
-    expect(collapsedRegimes(healthy)).toHaveLength(0);
-    expect(collapsedRegimes(bearCollapse).map((r) => r.regime)).toEqual(['Bear']);
-    expect(assetBaseScore(withRegimes(bearCollapse))).toBeCloseTo(assetBaseScore(withRegimes(healthy)) - REGIME_COLLAPSE_PENALTY, 12);
-    // Profitable in the bull slice only, collapsing everywhere else: a bet on one regime.
-    expect(isSingleRegime([slice('Bull', 2), slice('Bear', -1.4), slice('High volatility', -0.9)])).toBe(true);
-    expect(isSingleRegime(bearCollapse)).toBe(false); // two regimes made money
-    expect(isSingleRegime([slice('Bull', 2), slice('Bear', -0.2), slice('High volatility', -0.9)])).toBe(false); // bear only mildly negative
-    // Slices with too little coverage or too few trades are not judged at all.
-    const untestable = [slice('Bull', 2), slice('Bear', -3, 4), slice('High volatility', -3, 30, 0.05)];
-    expect(testableRegimes(untestable)).toHaveLength(1);
-    expect(isSingleRegime(untestable)).toBe(false);
-    expect(collapsedRegimes(untestable)).toHaveLength(0);
   });
 
   it('blends a strategy with the median of its one-step neighbours, so spikes rank below plateaus', () => {
@@ -1446,9 +1361,9 @@ describe('genome', () => {
     expect(hypothesisUnsupported('DIP_IN_UPTREND', limits)).not.toBeNull();
   });
 
-  it('enumerates ±20% single-parameter neighbours on the grids', () => {
+  it('enumerates one-step single-parameter neighbours on the grids', () => {
     const base = normalizeGenome(DIP, 'long-only', DEFAULT_LIMITS);
-    const variants = parameterVariants(DIP, 'long-only', DEFAULT_LIMITS);
+    const variants = stepNeighbours(DIP, 'long-only', DEFAULT_LIMITS);
     // RSI period, RSI level, stop %, target % → two neighbours each; the 100-bar regime filter can only move up.
     expect(variants.length).toBeGreaterThanOrEqual(8);
     const signatures = new Set(variants.map(genomeSignature));
@@ -1463,7 +1378,7 @@ describe('genome', () => {
       expect(a.length).toBe(b.length);
       expect(a.filter((value, index) => value !== b[index]).length).toBe(1);
     }
-    // RSI(14): −20% = 11.2 → 10, +20% = 16.8 → snaps back to 14, so the next grid step (20) is used.
+    // RSI(14) on the lookback grid: one step down is 10, one step up is 20.
     const periods = variants.map((v) => (v.longEntry.conditions[0] as { period: number }).period);
     expect(periods).toContain(10);
     expect(periods).toContain(20);
@@ -1499,6 +1414,7 @@ describe('descriptions and Pine export', () => {
 
   const ctx = (settings: BacktestSettings) => ({
     label: 'XRP-USD',
+    assets: ['XRP-USD'],
     interval: '1d' as const,
     settings,
     components: [{ symbol: 'XRP-USD', weight: 1 }],
@@ -1564,7 +1480,7 @@ describe('descriptions and Pine export', () => {
           expect(script.includes('longStop := math.max(longStop, longPeak - stopAtrMult * atrValue)')).toBe(genome.exit.mode === 'dynamic' && genome.exit.trailing);
           // Never more than the account can buy.
           expect(script).toContain('maxQty = math.max(strategy.equity, 0) / (close * (1 + costPct / 100))');
-          expect(script).toMatch(sizing.mode === 'full' ? /orderQty = maxQty/ : /math\.min\(riskCapital \* riskPct \/ 100 \/ stopDistance, maxQty\)/);
+          expect(script).toMatch(sizing.mode === 'full' ? /orderQty = maxQty/ : /math\.min\(riskCapital \* riskPct \/ 100 \/ \(stopDistance \* \(1 \+ feePct \/ 100\)\), maxQty\)/);
           expect(script.includes('timedOut')).toBe(genome.maxBarsInTrade !== null);
           expect(script).not.toMatch(/(Entry|Signal) = .* or /); // rules are AND-only now
           // ASCII only, balanced brackets, no leaked JS values.
@@ -1627,7 +1543,13 @@ describe('descriptions and Pine export', () => {
     expect(locked).toContain('    if longPeak >= strategy.position_avg_price + longRisk // +1R reached: breakeven lock\n        longStop := math.max(longStop, strategy.position_avg_price)');
     expect(trailScript).toContain('maxBarsInTrade = input.int(20, "Time stop (bars in trade)"');
     expect(trailScript).toContain('timedOut = strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBarsInTrade - 1');
-    expect(trailScript).toContain('if timedOut\n    strategy.close_all(comment="Time stop")');
+    // The time stop never cancels a same-open reversal: the reversal entry closes the position itself.
+    expect(trailScript).toContain(
+      'if timedOut and not (strategy.position_size > 0 and goShort) and not (strategy.position_size < 0 and goLong)\n    strategy.close_all(comment="Time stop")',
+    );
+    // Risk sizing budgets the entry fee inside the size, as the backtester does.
+    expect(trailScript).toContain('orderQty = na(stopDistance) or stopDistance <= 0 ? 0.0 : math.min(riskCapital * riskPct / 100 / (stopDistance * (1 + feePct / 100)), maxQty)');
+    expect(trailScript).toContain('if useWindow and time >= windowEnd and strategy.position_size != 0');
     // A time stop blocks re-entering the same side only; the opposite side may still reverse.
     expect(trailScript).toContain('and not (timedOut and strategy.position_size > 0)');
     expect(trailScript).toContain('and not (timedOut and strategy.position_size < 0)');
@@ -1863,42 +1785,7 @@ describe('stage 1: execution friction and basket hygiene', () => {
 
 /* -------------------------------------------------------------------------- */
 
-describe('stage 3: multiple testing, deduplication and risk', () => {
-  const metrics = (sharpeAnnual: number, years: number, ppy = 365): PerformanceMetrics => ({
-    ...emptyMetrics(),
-    bars: Math.round(years * ppy),
-    sharpeRaw: sharpeAnnual / Math.sqrt(ppy),
-    sharpe: sharpeAnnual,
-    skew: 0,
-    kurtosis: 3,
-  });
-
-  it('haircuts the Sharpe ratio for the number of trials (Harvey & Liu, Bonferroni)', () => {
-    const m = metrics(2, 1);
-    const one = haircutSharpe(m, 1, 365);
-    const many = haircutSharpe(m, 10_000, 365);
-    // A single trial keeps nearly all of it; ten thousand trials take a lot more away.
-    expect(one.haircut).toBeLessThan(0.15);
-    expect(many.haircut).toBeGreaterThan(one.haircut);
-    expect(many.sharpe).toBeLessThan(one.sharpe);
-    // Bonferroni: the adjusted p-value is N × p, capped at 1.
-    expect(many.adjustedP).toBeCloseTo(Math.min(1, many.pValue * 10_000), 12);
-    // Monotone in the number of trials.
-    let previous = Infinity;
-    for (const n of [1, 10, 100, 1000, 10_000]) {
-      const h = haircutSharpe(m, n, 365).sharpe;
-      expect(h).toBeLessThanOrEqual(previous + 1e-12);
-      previous = h;
-    }
-    // A Sharpe fully explained by luck keeps nothing; a negative one is not "improved" by the haircut.
-    expect(haircutSharpe(metrics(0.5, 1), 5000, 365)).toMatchObject({ sharpe: 0, haircut: 1 });
-    expect(haircutSharpe(metrics(-1, 2), 10, 365).haircut).toBe(1);
-    // Far in the tail (huge t-statistic) nothing measurable is removed and nothing overflows.
-    const huge = haircutSharpe(metrics(20, 10), 10_000, 365);
-    expect(Number.isFinite(huge.sharpe)).toBe(true);
-    expect(huge.sharpe).toBeGreaterThan(15);
-  });
-
+describe('multiple testing and deduplication', () => {
   it('seeds and merges trial statistics exactly as if every trial had been pushed', () => {
     const rng = mulberry32(3);
     const values = Array.from({ length: 500 }, () => gaussian(rng) * 0.7 + 0.1);
@@ -1940,37 +1827,5 @@ describe('stage 3: multiple testing, deduplication and risk', () => {
     // Higher fees change only the PnL – still a different trade log.
     runBacktest(ind, TREND, { ...SETTINGS, feePct: 0.3 }, ws);
     expect(tradeLogHash(ws, n)).not.toBe(a);
-  });
-
-  it('scores overfitting risk from the evidence, 0 (low) to 100 (high)', () => {
-    const data = dataset();
-    const split = splitFor(data.c.length);
-    const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, barsPerYear(data.t));
-    const base: StrategyResult = {
-      id: 'S-1', genome: TREND, fitness: 1, params: 4, dsr: 0.97, ...m, holdout: null, alpha: 0,
-      equity: new Float32Array(0), foundAt: 1, assets: [], robustness: null, verdict: null,
-      pointFitness: 1, neighbourMedian: 1, neighbourCount: 6, haircutSharpe: 1.4, haircut: 0.1,
-      folds: Array.from({ length: 5 }, () => ({ ...emptyMetrics(), roi: 3 })), regimes: [],
-      search: { ...m.search, trades: 400 },
-    };
-    const good = overfittingRisk(base);
-    expect(good.components.reduce((sum, c) => sum + c.weight, 0)).toBe(100);
-    expect(good.level).toBe('low');
-    const bad = overfittingRisk({
-      ...base, dsr: 0.02, haircut: 1, pointFitness: 3, neighbourMedian: 0.2,
-      folds: Array.from({ length: 5 }, (_, k) => ({ ...emptyMetrics(), roi: k === 0 ? 40 : -2 })),
-      search: { ...base.search, trades: 110 },
-      sample: { trades: 110, validationTrades: 30, holdoutTrades: null, gates: { search: 100, validation: 25, perYear: 25, holdout: 25 }, pooled: false },
-    });
-    expect(bad.level).toBe('high');
-    expect(bad.score).toBeGreaterThan(80);
-    expect(bad.score).toBeLessThanOrEqual(100);
-    // "Most likely luck" (DSR under 50%) is high risk even when the weighted sum is modest.
-    const lucky = overfittingRisk({ ...base, dsr: 0.3 });
-    expect(lucky.score).toBeLessThan(65);
-    expect(lucky.level).toBe('high');
-    // Each component moves the score in the right direction on its own.
-    expect(overfittingRisk({ ...base, dsr: 0.1 }).score).toBeGreaterThan(good.score);
-    expect(overfittingRisk({ ...base, neighbourMedian: -1 }).score).toBeGreaterThan(good.score);
   });
 });

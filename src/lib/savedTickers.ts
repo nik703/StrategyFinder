@@ -11,6 +11,8 @@ import { TICKER_PATTERN } from '../data/basket';
 import { PRESET_TICKERS } from './config';
 
 const STORAGE_KEY = 'strategyfinder.savedTickers.v1';
+/** The saved-ticker list is a preference, not run data: "Reset Runs & Clear Cache" keeps it. */
+export const SAVED_TICKERS_KEY = STORAGE_KEY;
 /** Oldest entries are dropped beyond this many. */
 export const MAX_SAVED_TICKERS = 12;
 

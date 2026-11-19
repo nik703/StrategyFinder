@@ -2,16 +2,9 @@
 
 import { normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import type { HoldoutWindow } from './holdoutLog';
+import { PRESETS } from './presets';
 import type { TrialWindow } from './trialLedger';
-import {
-  DEFAULT_CRYPTO_UNIVERSE,
-  DEFAULT_ROBUST_TARGET,
-  DEFAULT_RUN_EVALUATIONS,
-  DEFAULT_STOCK_UNIVERSE,
-  INTERVAL_MS,
-  allowsShorts,
-  type CandleSeries,
-} from '../types/trading';
+import { INTERVAL_MS, allowsShorts, type CandleSeries } from '../types/trading';
 import type {
   Hypothesis,
   TrialStats,
@@ -37,7 +30,8 @@ export interface RunConfig {
   /**
    * single – one ticker; basket – a synthetic weighted composite traded as one series;
    * pool – several tickers traded separately with the SAME rules, their trades pooled for the
-   * sample-size gates (one strategy that must work across the pool, not on one price path).
+   * sample-size gates and the score the median over the assets (one strategy that must work across
+   * the pool, not on one price path).
    */
   assetMode: 'single' | 'basket' | 'pool';
   /** Comma-separated tickers of a pooled multi-asset run. */
@@ -70,23 +64,16 @@ export interface RunConfig {
   fundingPct8h: number;
   /** Borrow fee charged on short stock / ETF positions, in percent per year (Long/Short mode only). */
   borrowPctYear: number;
-  /** Score every strategy on a whole universe of assets instead of one. */
-  robustUniverse: boolean;
-  /** Comma-separated tickers of the universe. */
-  universe: string;
   /** Fine-tune EMA / SMA lengths over every integer, or only the coarse grid. */
   maPeriods: MaPeriodSearch;
 }
 
-export const MAX_UNIVERSE_ASSETS = 8;
-/** Default pooled sample: the four most liquid crypto majors. */
-export const DEFAULT_POOL = 'BTC-USD, ETH-USD, SOL-USD, BNB-USD';
+/** Most assets an asset pool may hold. */
+export const MAX_POOL_ASSETS = 8;
 /** Typical perpetual funding rate (≈ 11% a year). */
 export const DEFAULT_FUNDING_PCT_8H = 0.01;
 /** Retail borrow cost of shorting stocks and ETFs, in percent per year. */
 export const DEFAULT_BORROW_PCT_YEAR = 2;
-/** Default volatility-scaled slippage: 0.03 × ATR% (≈ 0.09% on daily BTC, ≈ 0.18% on daily DOGE). */
-export const DEFAULT_SLIPPAGE_ATR_MULT = 0.03;
 
 export const isCrypto = (symbol: string): boolean => /-(USD|USDT|USDC)$/.test(symbol.trim().toUpperCase());
 
@@ -101,9 +88,11 @@ export function crossMarketSuggestion(runSymbols: readonly string[]): string[] {
   return (crypto ? CROSS_MARKET_CRYPTO : CROSS_MARKET_STOCKS).filter((symbol) => !used.has(symbol)).slice(0, 3);
 }
 
-export const defaultUniverse = (symbol: string): string =>
-  (isCrypto(symbol) ? DEFAULT_CRYPTO_UNIVERSE : DEFAULT_STOCK_UNIVERSE).join(', ');
-
+/**
+ * The app opens on the first preset, "Crypto Multi-Asset Swing (4h)" (see `presets.ts`): a pooled
+ * BTC · ETH · SOL · BNB run on 4h candles, Long-Only, with realistic costs. The fields no preset
+ * sets (single ticker, basket, capital, financing) have their own defaults.
+ */
 export const DEFAULT_CONFIG: RunConfig = {
   assetMode: 'single',
   symbol: 'BTC-USD',
@@ -112,28 +101,26 @@ export const DEFAULT_CONFIG: RunConfig = {
     { id: 2, symbol: 'ETH-USD', weight: 30 },
     { id: 3, symbol: 'NVDA', weight: 20 },
   ],
-  pool: DEFAULT_POOL,
-  interval: '1d',
-  range: '5y',
+  pool: 'BTC-USD, ETH-USD, SOL-USD, BNB-USD',
+  interval: '4h',
+  range: '2y',
   capital: 10_000,
   // 0.1% matches crypto taker fees and is conservative for commission-free stock brokers.
   feePct: 0.1,
   slippagePct: 0.05,
-  slippageAtrMult: DEFAULT_SLIPPAGE_ATR_MULT,
+  slippageAtrMult: 0.03,
   tradeMode: 'long-only',
-  hypothesis: 'TREND_FOLLOWING',
-  maxEvaluations: DEFAULT_RUN_EVALUATIONS,
-  robustTarget: DEFAULT_ROBUST_TARGET,
+  hypothesis: 'VOL_BREAKOUT',
+  maxEvaluations: 25_000,
+  robustTarget: 3,
   sizingMode: 'fixed',
-  riskPct: 2,
+  riskPct: 1,
   // Financing is on by default; it only applies to Long/Short runs (Long-Only is treated as spot).
   fundingPct8h: DEFAULT_FUNDING_PCT_8H,
   borrowPctYear: DEFAULT_BORROW_PCT_YEAR,
-  // On by default for crypto (the default ticker is BTC-USD).
-  robustUniverse: true,
-  universe: DEFAULT_CRYPTO_UNIVERSE.join(', '),
   // Every EMA / SMA length is tried; the plateau check still looks a ×√2 step away (see genome.ts).
   maPeriods: 'integer',
+  ...PRESETS[0].patch,
 };
 
 /** Parse a comma-separated ticker list into unique, upper-case symbols. */
@@ -146,46 +133,31 @@ export function parseUniverse(text: string): string[] {
   return out;
 }
 
-/** Every symbol a run with this configuration scores strategies on (traded assets and universe). */
+/** Every symbol a run with this configuration trades: the pool, the single ticker or the basket legs. */
 export function runSymbols(config: RunConfig): string[] {
+  if (config.assetMode === 'pool') {
+    const pool = resolvePool(config);
+    return pool.ok ? pool.symbols : [];
+  }
   const assets = resolveAssets(config);
-  if (!assets.ok) return [];
-  const traded = assets.components.map((component) => component.symbol);
-  const universe = resolveUniverse(config, traded[0]);
-  return [...new Set([...traded, ...(universe.ok ? universe.symbols : [])])];
+  return assets.ok ? assets.components.map((component) => component.symbol) : [];
 }
 
-export type ResolvedUniverse = { ok: true; symbols: string[] } | { ok: false; error: string };
+type Resolved<T> = ({ ok: true } & T) | { ok: false; error: string };
 
-/**
- * Symbols a Robust-universe run is scored on: the primary asset first, then the
- * rest of the list. Returns an empty list when the mode is off (or a basket is traded).
- */
-export function resolveUniverse(config: RunConfig, primary: string): ResolvedUniverse {
-  if (config.assetMode === 'pool') {
-    const symbols = parseUniverse(config.pool);
-    const invalid = symbols.find((symbol) => !TICKER_PATTERN.test(symbol));
-    if (invalid) return { ok: false, error: `"${invalid}" in the asset pool is not a valid ticker.` };
-    if (symbols.length < 2) return { ok: false, error: 'An asset pool needs at least two tickers.' };
-    if (symbols.length > MAX_UNIVERSE_ASSETS) return { ok: false, error: `An asset pool can hold at most ${MAX_UNIVERSE_ASSETS} assets.` };
-    return { ok: true, symbols };
-  }
-  if (!config.robustUniverse || config.assetMode !== 'single') return { ok: true, symbols: [] };
-  const listed = parseUniverse(config.universe);
-  const invalid = listed.find((symbol) => !TICKER_PATTERN.test(symbol));
-  if (invalid) return { ok: false, error: `"${invalid}" in the Robust universe is not a valid ticker.` };
-  const symbols = [primary, ...listed.filter((symbol) => symbol !== primary)];
-  if (symbols.length < 2) return { ok: false, error: 'A Robust universe needs at least one asset besides the one being traded.' };
-  if (symbols.length > MAX_UNIVERSE_ASSETS) {
-    return { ok: false, error: `A Robust universe can hold at most ${MAX_UNIVERSE_ASSETS} assets.` };
-  }
+/** The tickers of an asset pool, validated (an empty list outside pool mode). */
+export function resolvePool(config: RunConfig): Resolved<{ symbols: string[] }> {
+  if (config.assetMode !== 'pool') return { ok: true, symbols: [] };
+  const symbols = parseUniverse(config.pool);
+  const invalid = symbols.find((symbol) => !TICKER_PATTERN.test(symbol));
+  if (invalid) return { ok: false, error: `"${invalid}" in the asset pool is not a valid ticker.` };
+  if (symbols.length < 2) return { ok: false, error: 'An asset pool needs at least two tickers.' };
+  if (symbols.length > MAX_POOL_ASSETS) return { ok: false, error: `An asset pool can hold at most ${MAX_POOL_ASSETS} assets.` };
   return { ok: true, symbols };
 }
 
-export type ResolvedAssets = { ok: true; components: BasketComponent[] } | { ok: false; error: string };
-
 /** Validate the asset selection and return normalised basket components. */
-export function resolveAssets(config: RunConfig): ResolvedAssets {
+export function resolveAssets(config: RunConfig): Resolved<{ components: BasketComponent[] }> {
   if (config.assetMode === 'pool') {
     // The first pool ticker is the chart's reference asset; every pool asset is traded.
     const first = parseUniverse(config.pool)[0];
@@ -206,7 +178,7 @@ export function resolveAssets(config: RunConfig): ResolvedAssets {
 }
 
 /** True when every traded instrument is a crypto pair (a crypto basket counts; a mixed basket does not). */
-export function tradesCrypto(config: RunConfig): boolean {
+function tradesCrypto(config: RunConfig): boolean {
   const symbols =
     config.assetMode === 'pool'
       ? parseUniverse(config.pool)
@@ -240,7 +212,6 @@ export function settingsFrom(config: RunConfig): BacktestSettings {
     slippagePct: config.slippagePct,
     slippageAtrMult: config.slippageAtrMult,
     tradeMode: config.tradeMode,
-    poolAssets: config.assetMode === 'pool',
     sizing: {
       mode: config.sizingMode === 'full' ? 'full' : 'risk',
       riskPct: config.riskPct,
@@ -269,7 +240,7 @@ export interface RunContext {
   trialWindow: TrialWindow;
   /** Trials spent on this window by earlier runs (from the trial ledger). */
   priorTrials: TrialStats & { runs: number };
-  /** Assets the run was scored on (the primary first); a single entry when the Robust universe is off. */
+  /** Assets the run traded and scored (the primary first); more than one = a pooled multi-asset run. */
   universe: string[];
   /** Instrument and venue actually traded, e.g. "XRPUSDT on Binance". */
   venue: string;
@@ -292,7 +263,7 @@ export interface RunContext {
   notes: string[];
 }
 
-export const SOURCE_LABEL: Record<DataSource, string> = {
+const SOURCE_LABEL: Record<DataSource, string> = {
   binance: 'Binance',
   yahoo: 'Yahoo Finance',
   synthetic: 'Simulated',

@@ -1,20 +1,21 @@
 /**
- * Step 1 of the guided workflow – Market & preset setup: one-click presets, the asset / basket /
- * pool picker, timeframe, history, direction mode, market hypothesis and the Start / Stop buttons.
- * Everything else (capital, costs, sizing, financing, search budget, the Robust universe) sits in
- * the Advanced Settings drawer with sensible defaults.
+ * Step 1 of the guided workflow – presets. One-click preset cards set the assets, timeframe,
+ * history, realistic costs, direction mode and market hypothesis; a one-line summary shows the
+ * active setup; every granular knob (market picker, timeframe, direction, hypothesis, costs,
+ * sizing, financing, search budget) sits in the collapsible Advanced Settings drawer. Runs are
+ * started from the top action bar.
  */
 
-import { ChevronDown, ChevronRight, Info, Loader2, Play, Plus, SlidersHorizontal, Square, X } from 'lucide-react';
-import { useId, useState } from 'react';
-import { formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
+import { ChevronDown, ChevronRight, Info, Plus, SlidersHorizontal, X } from 'lucide-react';
+import { useId, useState, type ReactNode } from 'react';
+import { describeAllocation, formatWeight, normalizeWeights, TICKER_PATTERN } from '../data/basket';
 import {
   DEFAULT_BORROW_PCT_YEAR,
   DEFAULT_FUNDING_PCT_8H,
   financingFor,
   isCrypto,
   MAX_BASKET_ASSETS,
-  MAX_UNIVERSE_ASSETS,
+  MAX_POOL_ASSETS,
   parseUniverse,
   PRESET_TICKERS,
   type BasketRow,
@@ -27,8 +28,9 @@ import {
   MAX_RANGE,
   MIN_RUN_EVALUATIONS,
   rangeAllowed,
-  BUDGET_EXTENSION,
   MAX_RUN_EVALUATIONS,
+  TRADE_MODE_LABEL,
+  TRADE_MODES,
   WINDOW_TRIAL_BUDGET,
   YAHOO_MAX_DAYS,
   type EngineStatus,
@@ -50,12 +52,6 @@ interface ControlBarProps {
   onSaveTickers: (symbols: string[]) => void;
   onRemoveTicker: (symbol: string) => void;
   status: EngineStatus;
-  onStart: () => void;
-  onStop: () => void;
-  /** Set when the trial budget of the selected data window is spent: Start is then disabled with this reason. */
-  budgetBlocked: string | null;
-  /** Grant the selected data window `BUDGET_EXTENSION` more trials. */
-  onExtendBudget: () => void;
 }
 
 /** Colours for the allocation bar (identity only – not a chart series). */
@@ -90,24 +86,17 @@ const HYPOTHESIS_OPTIONS: { value: Hypothesis; label: string; title: string }[] 
   label: HYPOTHESES[id].label,
   title: `${HYPOTHESES[id].rationale}\nTrigger: ${HYPOTHESES[id].trigger}\n${HYPOTHESES[id].filter}`,
 }));
-const MODE_OPTIONS: { value: TradeMode; label: string; title: string }[] = [
-  {
-    value: 'long-only',
-    label: 'Long-Only',
-    title: 'Never sells short – the default for equities and spot crypto, which drift upwards over time and charge for shorting.',
-  },
-  {
-    value: 'asymmetric',
-    label: 'Asymmetric L/S',
-    title:
-      'Shorts use the mirrored entry trigger, but only inside their own bear-market filter (close below a slow EMA/SMA, or a falling one), tuned independently of the long rules.',
-  },
-  {
-    value: 'long-short',
-    label: 'Mirrored L/S',
-    title: 'Shorts are the exact mirror image of the long rules, in every market regime.',
-  },
-];
+const MODE_TITLE: Record<TradeMode, string> = {
+  'long-only': 'Never sells short – the default for equities and spot crypto, which drift upwards over time and charge for shorting.',
+  asymmetric:
+    'Shorts use the mirrored entry trigger, but only inside their own bear-market filter (close below a slow EMA/SMA, or a falling one), tuned independently of the long rules.',
+  'long-short': 'Shorts are the exact mirror image of the long rules, in every market regime.',
+};
+const MODE_OPTIONS: { value: TradeMode; label: string; title: string }[] = TRADE_MODES.map((value) => ({
+  value,
+  label: TRADE_MODE_LABEL[value],
+  title: MODE_TITLE[value],
+}));
 const MODE_NOTE: Record<TradeMode, string> = {
   'long-only': 'Long-Only: buys only, treated as spot (no funding or borrow).',
   asymmetric: 'Asymmetric L/S: shorts need their own bear-regime filter, so they sit out bull markets; shorts pay funding / borrow.',
@@ -335,18 +324,37 @@ function NumberFieldInline({
   );
 }
 
-export default function ControlBar({
-  config,
-  onChange,
-  savedTickers,
-  onSaveTickers,
-  onRemoveTicker,
-  status,
-  onStart,
-  onStop,
-  budgetBlocked,
-  onExtendBudget,
-}: ControlBarProps): JSX.Element {
+/** One titled group of settings inside the Advanced Settings drawer. */
+function Group({ title, children }: { title: string; children: ReactNode }): JSX.Element {
+  return (
+    <fieldset className="border-t border-line pt-3 first:border-t-0 first:pt-0">
+      <legend className="float-left mb-2 w-full text-[11px] font-semibold uppercase tracking-wider text-ink-2">{title}</legend>
+      <div className="clear-both flex flex-wrap items-end gap-x-4 gap-y-3">{children}</div>
+    </fieldset>
+  );
+}
+
+/** The active setup in one line: what will be traded, how, and what the run looks for. */
+function setupSummary(config: RunConfig): string[] {
+  const assets =
+    config.assetMode === 'pool'
+      ? `Pool ${parseUniverse(config.pool).map((symbol) => symbol.replace(/-USD$/, '')).join(' · ')}`
+      : config.assetMode === 'single'
+        ? config.symbol
+        : `Basket ${describeAllocation(normalizeWeights(config.basket.filter((row) => row.symbol.trim() !== '')))}`;
+  const sizing = config.sizingMode === 'full' ? '100% of equity' : `${config.riskPct}% risk / trade`;
+  return [
+    assets,
+    `${config.interval} · ${config.range}`,
+    TRADE_MODE_LABEL[config.tradeMode],
+    HYPOTHESES[config.hypothesis].label,
+    `${config.feePct}% fee + ${config.slippagePct}% / ${config.slippageAtrMult}×ATR slippage`,
+    sizing,
+    `${config.maxEvaluations.toLocaleString('en-US')} evals · stop after ${config.robustTarget > 0 ? `${config.robustTarget} robust` : 'the full budget'}`,
+  ];
+}
+
+export default function ControlBar({ config, onChange, savedTickers, onSaveTickers, onRemoveTicker, status }: ControlBarProps): JSX.Element {
   const listId = useId();
   const busy = status === 'loading' || status === 'optimizing';
   const isPreset = (PRESET_TICKERS as readonly string[]).includes(config.symbol);
@@ -358,22 +366,16 @@ export default function ControlBar({
     config.assetMode === 'pool'
       ? parseUniverse(config.pool).some((symbol) => !isCrypto(symbol))
       : config.assetMode === 'single'
-      ? !isCrypto(config.symbol)
-      : config.basket.some((row) => row.symbol.trim() !== '' && !isCrypto(row.symbol));
+        ? !isCrypto(config.symbol)
+        : config.basket.some((row) => row.symbol.trim() !== '' && !isCrypto(row.symbol));
   const commit = (ticker: string): void => onSaveTickers([ticker]);
-  const universeOn = config.robustUniverse && config.assetMode === 'single';
   const poolList = parseUniverse(config.pool);
   const poolInvalid =
     config.assetMode === 'pool' &&
-    (poolList.length < 2 || poolList.length > MAX_UNIVERSE_ASSETS || poolList.some((symbol) => !TICKER_PATTERN.test(symbol)));
-  const universeList = parseUniverse(config.universe);
-  const universeInvalid =
-    universeOn && (universeList.some((symbol) => !TICKER_PATTERN.test(symbol)) || universeList.length > MAX_UNIVERSE_ASSETS);
+    (poolList.length < 2 || poolList.length > MAX_POOL_ASSETS || poolList.some((symbol) => !TICKER_PATTERN.test(symbol)));
 
   const [advanced, setAdvanced] = useState(false);
   const hypothesis = HYPOTHESES[config.hypothesis];
-  const sizingText =
-    config.sizingMode === 'full' ? '100% of equity' : `${config.riskPct}% risk ${config.sizingMode === 'compound' ? '(compounding)' : '(fixed)'}`;
 
   return (
     <Panel className="p-4">
@@ -383,434 +385,301 @@ export default function ControlBar({
         ))}
       </datalist>
 
-      <StepHeader step={1} title="Market & preset" hint="Start from a preset or pick your own market – every setting stays editable." />
+      <StepHeader
+        step={1}
+        title="Presets"
+        hint="One click sets the assets, timeframe, costs, direction and stop / target ranges. Press 1-Click Run in the top bar to scan."
+      />
       <div className="mt-3">
         <PresetCards config={config} onApply={(preset) => onChange(preset.patch)} disabled={busy} />
       </div>
 
-      {/* What to trade */}
-      <div className="mt-4 flex flex-col gap-3 border-t border-line pt-4 lg:flex-row lg:items-start">
-        <div className="shrink-0">
-          <FieldLabel>Asset</FieldLabel>
-          <Segmented
-            ariaLabel="Asset selection mode"
-            options={ASSET_MODE_OPTIONS}
-            value={config.assetMode}
-            onChange={(assetMode) => onChange({ assetMode })}
-            disabled={busy}
-          />
-        </div>
-        <div className="min-w-0 flex-1">
-          <FieldLabel>{config.assetMode === 'single' ? 'Ticker' : config.assetMode === 'pool' ? 'Pooled assets' : 'Basket allocation'}</FieldLabel>
-          {config.assetMode === 'pool' ? (
-            <div>
-              <input
-                type="text"
-                value={config.pool}
-                disabled={busy}
-                aria-label="Pooled asset tickers"
-                aria-invalid={poolInvalid}
-                spellCheck={false}
-                onChange={(event) => onChange({ pool: event.target.value.toUpperCase() })}
-                className={cx(
-                  'num h-9 w-full max-w-[520px] rounded-lg border bg-base px-3 text-sm text-ink outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60',
-                  poolInvalid ? 'border-down/70' : 'border-line',
-                )}
-              />
-              <p className="mt-1.5 text-xs text-ink-3">
-                Every asset is traded separately with the same rules. Trades are pooled across the assets for the sample-size
-                gates, and the score is the median over the assets – one strategy that must work on all of them, not a fit to one
-                price path. 2–{MAX_UNIVERSE_ASSETS} tickers.
-              </p>
-            </div>
-          ) : config.assetMode === 'single' ? (
-            <div className="flex flex-wrap items-center gap-1.5">
-              {PRESET_TICKERS.map((ticker) => {
-                const active = config.symbol === ticker;
-                return (
-                  <button
-                    key={ticker}
-                    type="button"
-                    disabled={busy}
-                    aria-pressed={active}
-                    onClick={() => onChange({ symbol: ticker })}
-                    className={cx(
-                      'num h-9 rounded-lg border px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
-                      active
-                        ? 'border-accent bg-accent/15 text-ink'
-                        : 'border-line bg-base text-ink-2 hover:border-line-strong hover:text-ink',
-                    )}
-                  >
-                    {ticker}
-                  </button>
-                );
-              })}
-              {savedTickers.map((ticker) => {
-                const active = config.symbol === ticker;
-                return (
-                  <span
-                    key={ticker}
-                    className={cx(
-                      'inline-flex h-9 items-center rounded-lg border text-sm font-medium transition-colors',
-                      active ? 'border-accent bg-accent/15 text-ink' : 'border-line bg-base text-ink-2 hover:border-line-strong',
-                      busy && 'opacity-60',
-                    )}
-                  >
-                    <button
-                      type="button"
-                      disabled={busy}
-                      aria-pressed={active}
-                      onClick={() => onChange({ symbol: ticker })}
-                      title="Saved ticker"
-                      className="num h-full rounded-l-lg pl-3 pr-1.5 hover:text-ink disabled:cursor-not-allowed"
-                    >
-                      {ticker}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => onRemoveTicker(ticker)}
-                      aria-label={`Forget saved ticker ${ticker}`}
-                      title="Forget this ticker"
-                      className="grid h-full place-items-center rounded-r-lg pl-0.5 pr-2 text-ink-3 hover:text-ink disabled:cursor-not-allowed"
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
-                );
-              })}
-              <TickerInput
-                value={hasChip ? '' : config.symbol}
-                onChange={(symbol) => onChange({ symbol: symbol || 'BTC-USD' })}
-                onCommit={commit}
-                disabled={busy}
-                listId={listId}
-                ariaLabel="Custom ticker"
-                placeholder="Custom…"
-                className={cx('w-[120px]', !hasChip && 'border-accent')}
-              />
-            </div>
-          ) : (
-            <BasketBuilder
-              rows={config.basket}
-              onChange={(basket) => onChange({ basket })}
-              disabled={busy}
-              listId={listId}
-              onCommit={commit}
-            />
-          )}
-        </div>
-      </div>
-
-      {/* How to test it */}
-      <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
-        <div>
-          <FieldLabel>Timeframe</FieldLabel>
-          <Segmented
-            ariaLabel="Candle timeframe"
-            options={INTERVAL_OPTIONS}
-            value={config.interval}
-            onChange={(interval) => onChange({ interval })}
-            disabled={busy}
-          />
-        </div>
-        <div>
-          <FieldLabel>History</FieldLabel>
-          <Segmented
-            ariaLabel="History range"
-            options={rangeOptions(config.interval)}
-            value={config.range}
-            onChange={(range) => onChange({ range })}
-            disabled={busy}
-          />
-        </div>
-        <div>
-          <FieldLabel>Direction</FieldLabel>
-          <Segmented
-            ariaLabel="Trade direction mode"
-            options={MODE_OPTIONS}
-            value={config.tradeMode}
-            onChange={(tradeMode) => onChange({ tradeMode })}
-            disabled={busy}
-          />
-        </div>
-
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onStart}
-            disabled={busy || budgetBlocked !== null}
-            title={budgetBlocked ?? undefined}
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-white transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {status === 'loading' ? (
-              <Loader2 size={15} className="animate-spin" />
-            ) : (
-              <Play size={15} fill="currentColor" />
-            )}
-            {status === 'loading' ? 'Loading data…' : status === 'optimizing' ? 'Scanning…' : 'Start Discovery'}
-          </button>
-          <button
-            type="button"
-            onClick={onStop}
-            disabled={!busy}
-            className="inline-flex h-9 items-center gap-2 rounded-lg border border-down/50 bg-down/10 px-4 text-sm font-semibold text-down transition-colors hover:bg-down/20 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-ink-3"
-          >
-            <Square size={13} fill="currentColor" />
-            Stop
-          </button>
-        </div>
-        {subHour && tradesStocks && (
-          <p className="flex basis-full items-center gap-1.5 text-xs text-ink-3">
-            <Info size={13} className="shrink-0" />
-            Yahoo Finance only serves {config.interval} stock candles for the last {YAHOO_MAX_DAYS[config.interval] + 1} days, so stock
-            runs on this timeframe are short. Crypto loads the full {config.range} from Binance.
-          </p>
-        )}
-      </div>
-
-      {/* What the run looks for */}
-      <div className="mt-4 flex flex-wrap items-start gap-x-4 gap-y-2 border-t border-line pt-4">
-        <div>
-          <FieldLabel>Market hypothesis</FieldLabel>
-          <Segmented
-            ariaLabel="Market hypothesis"
-            options={HYPOTHESIS_OPTIONS}
-            value={config.hypothesis}
-            onChange={(hypothesis) => onChange({ hypothesis })}
-            disabled={busy}
-          />
-        </div>
-        <p className="min-w-[260px] flex-1 pt-5 text-xs leading-relaxed text-ink-3">
-          <span className="font-semibold text-ink-2">{hypothesis.label}.</span> {hypothesis.rationale}{' '}
-          <span className="text-ink-2">Entry trigger:</span> {hypothesis.trigger} <span className="text-ink-2">Filter:</span> {hypothesis.filter}{' '}
-          <span className="text-ink-2">{MODE_NOTE[config.tradeMode]}</span>
-        </p>
-      </div>
-      {budgetBlocked !== null && !busy && (
-        <div role="alert" className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          <span className="flex min-w-0 flex-1 items-start gap-1.5">
-            <Info size={13} className="mt-0.5 shrink-0" />
-            <span>
-              {budgetBlocked} Extending keeps every earlier trial in the count: the luck hurdle keeps rising and multiple-testing
-              significance degrades further.
-            </span>
-          </span>
-          <button
-            type="button"
-            onClick={onExtendBudget}
-            className="inline-flex h-8 shrink-0 items-center rounded-md border border-warn/60 px-3 font-semibold text-warn transition-colors hover:bg-warn/15"
-          >
-            Extend Budget (+{BUDGET_EXTENSION.toLocaleString('en-US')} trials)
-          </button>
-        </div>
-      )}
-
-      {/* Advanced settings */}
+      {/* Active setup + Advanced settings drawer */}
       <div className="mt-4 border-t border-line pt-3">
         <button
           type="button"
           onClick={() => setAdvanced((open) => !open)}
           aria-expanded={advanced}
+          aria-controls={`${listId}-advanced`}
           className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-lg px-1 py-1 text-left transition-colors hover:bg-hover/50"
         >
           <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-2">
             {advanced ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             <SlidersHorizontal size={13} /> Advanced settings
           </span>
-          <span className="num truncate text-xs text-ink-3">
-            ${config.capital.toLocaleString('en-US')} · {config.feePct}% fee · {config.slippagePct}% + {config.slippageAtrMult}×ATR slippage · {sizingText} ·{' '}
-            {config.maxEvaluations.toLocaleString('en-US')} evals · stop after {config.robustTarget > 0 ? `${config.robustTarget} robust` : 'full budget'} ·{' '}
-            {config.maPeriods === 'integer' ? 'every EMA/SMA length' : 'coarse grid'}
-          </span>
+          <span className="num min-w-0 flex-1 truncate text-xs text-ink-3">{setupSummary(config).join(' · ')}</span>
         </button>
+
         {advanced && (
-          <div className="mt-3 space-y-4">
-            <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
-        <NumberField
-          label="Starting capital"
-          prefix="$"
-          value={config.capital}
-          min={100}
-          max={1_000_000_000}
-          step={1000}
-          onChange={(capital) => onChange({ capital })}
-          disabled={busy}
-          className="w-[136px]"
-        />
-        <NumberField
-          label="Fee / side"
-          suffix="%"
-          value={config.feePct}
-          min={0}
-          max={5}
-          step={0.01}
-          onChange={(feePct) => onChange({ feePct })}
-          disabled={busy}
-          className="w-[92px]"
-        />
-        <NumberField
-          label="Slippage floor"
-          suffix="%"
-          value={config.slippagePct}
-          min={0}
-          max={5}
-          step={0.01}
-          onChange={(slippagePct) => onChange({ slippagePct })}
-          disabled={busy}
-          className="w-[100px]"
-        />
-        <div title="Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. 0 = fixed slippage only.">
-          <NumberField
-            label="Vol. slippage"
-            suffix="× ATR"
-            value={config.slippageAtrMult}
-            min={0}
-            max={1}
-            step={0.01}
-            onChange={(slippageAtrMult) => onChange({ slippageAtrMult })}
-            disabled={busy}
-            className="w-[112px]"
-          />
-        </div>
-        <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs by default (extendable).`}>
-          <NumberField
-            label="Evaluations / run"
-            value={config.maxEvaluations}
-            min={MIN_RUN_EVALUATIONS}
-            max={MAX_RUN_EVALUATIONS}
-            step={1000}
-            onChange={(maxEvaluations) => onChange({ maxEvaluations: Math.round(maxEvaluations) })}
-            disabled={busy}
-            className="w-[124px]"
-          />
-        </div>
-        <div title="Keep scanning – with diversity restarts when the search stalls – until this many strategies pass every robustness gate, or the budget runs out.">
-          <FieldLabel>Stop after N robust</FieldLabel>
-          <Segmented
-            ariaLabel="Stop after N robust strategies"
-            options={ROBUST_TARGET_OPTIONS}
-            value={String(config.robustTarget) as RobustTargetOption}
-            onChange={(value) => onChange({ robustTarget: Number(value) })}
-            disabled={busy}
-          />
-        </div>
-        <div>
-          <FieldLabel>EMA / SMA lengths</FieldLabel>
-          <Segmented
-            ariaLabel="EMA / SMA length search"
-            options={MA_PERIOD_OPTIONS}
-            value={config.maPeriods}
-            onChange={(maPeriods) => onChange({ maPeriods })}
-            disabled={busy}
-          />
-        </div>
-            </div>
-            <div className="flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-4">
-        <div>
-          <FieldLabel>Position sizing</FieldLabel>
-          <Segmented
-            ariaLabel="Position sizing"
-            options={SIZING_OPTIONS}
-            value={config.sizingMode}
-            onChange={(sizingMode) => onChange({ sizingMode })}
-            disabled={busy}
-          />
-        </div>
-        <NumberField
-          label="Risk / trade"
-          suffix="%"
-          value={config.riskPct}
-          min={0.1}
-          max={10}
-          step={0.25}
-          onChange={(riskPct) => onChange({ riskPct })}
-          disabled={busy || config.sizingMode === 'full'}
-          className="w-[100px]"
-        />
-        {financing === 'none' ? (
-          <div>
-            <FieldLabel>Financing</FieldLabel>
-            <p className="flex h-9 items-center text-xs text-ink-3" title="Long-Only runs are treated as spot positions">
-              Long-Only spot: none
-            </p>
-          </div>
-        ) : financing === 'funding' ? (
-          <div>
-            <FieldLabel>Perp funding (L/S crypto)</FieldLabel>
-            <div className="flex items-center gap-2">
-              <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
-                <input
-                  type="checkbox"
-                  checked={config.fundingPct8h > 0}
-                  disabled={busy}
-                  onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
-                  className="h-3.5 w-3.5 accent-[var(--color-accent)]"
-                />
-                Charge funding
-              </label>
-              {config.fundingPct8h > 0 && (
-                <NumberFieldInline
-                  ariaLabel="Funding rate per 8 hours"
-                  value={config.fundingPct8h}
-                  onChange={(fundingPct8h) => onChange({ fundingPct8h })}
+          <div id={`${listId}-advanced`} className="mt-3 space-y-4">
+            <Group title="Market">
+              <div className="shrink-0">
+                <FieldLabel>Asset</FieldLabel>
+                <Segmented
+                  ariaLabel="Asset selection mode"
+                  options={ASSET_MODE_OPTIONS}
+                  value={config.assetMode}
+                  onChange={(assetMode) => onChange({ assetMode })}
                   disabled={busy}
                 />
+              </div>
+              <div className="min-w-[280px] flex-1">
+                <FieldLabel>{config.assetMode === 'single' ? 'Ticker' : config.assetMode === 'pool' ? 'Pooled assets' : 'Basket allocation'}</FieldLabel>
+                {config.assetMode === 'pool' ? (
+                  <div>
+                    <input
+                      type="text"
+                      value={config.pool}
+                      disabled={busy}
+                      aria-label="Pooled asset tickers"
+                      aria-invalid={poolInvalid}
+                      spellCheck={false}
+                      onChange={(event) => onChange({ pool: event.target.value.toUpperCase() })}
+                      className={cx(
+                        'num h-9 w-full max-w-[520px] rounded-lg border bg-base px-3 text-sm text-ink outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60',
+                        poolInvalid ? 'border-down/70' : 'border-line',
+                      )}
+                    />
+                    <p className="mt-1.5 text-xs text-ink-3">
+                      Every asset is traded separately with the same rules. Trades are pooled for the sample-size gates and the score is
+                      the median over the assets – one strategy that must work on all of them. 2–{MAX_POOL_ASSETS} tickers.
+                    </p>
+                  </div>
+                ) : config.assetMode === 'single' ? (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {PRESET_TICKERS.map((ticker) => {
+                      const active = config.symbol === ticker;
+                      return (
+                        <button
+                          key={ticker}
+                          type="button"
+                          disabled={busy}
+                          aria-pressed={active}
+                          onClick={() => onChange({ symbol: ticker })}
+                          className={cx(
+                            'num h-9 rounded-lg border px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                            active ? 'border-accent bg-accent/15 text-ink' : 'border-line bg-base text-ink-2 hover:border-line-strong hover:text-ink',
+                          )}
+                        >
+                          {ticker}
+                        </button>
+                      );
+                    })}
+                    {savedTickers.map((ticker) => {
+                      const active = config.symbol === ticker;
+                      return (
+                        <span
+                          key={ticker}
+                          className={cx(
+                            'inline-flex h-9 items-center rounded-lg border text-sm font-medium transition-colors',
+                            active ? 'border-accent bg-accent/15 text-ink' : 'border-line bg-base text-ink-2 hover:border-line-strong',
+                            busy && 'opacity-60',
+                          )}
+                        >
+                          <button
+                            type="button"
+                            disabled={busy}
+                            aria-pressed={active}
+                            onClick={() => onChange({ symbol: ticker })}
+                            title="Saved ticker"
+                            className="num h-full rounded-l-lg pl-3 pr-1.5 hover:text-ink disabled:cursor-not-allowed"
+                          >
+                            {ticker}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => onRemoveTicker(ticker)}
+                            aria-label={`Forget saved ticker ${ticker}`}
+                            title="Forget this ticker"
+                            className="grid h-full place-items-center rounded-r-lg pl-0.5 pr-2 text-ink-3 hover:text-ink disabled:cursor-not-allowed"
+                          >
+                            <X size={12} />
+                          </button>
+                        </span>
+                      );
+                    })}
+                    <TickerInput
+                      value={hasChip ? '' : config.symbol}
+                      onChange={(symbol) => onChange({ symbol: symbol || 'BTC-USD' })}
+                      onCommit={commit}
+                      disabled={busy}
+                      listId={listId}
+                      ariaLabel="Custom ticker"
+                      placeholder="Custom…"
+                      className={cx('w-[120px]', !hasChip && 'border-accent')}
+                    />
+                  </div>
+                ) : (
+                  <BasketBuilder rows={config.basket} onChange={(basket) => onChange({ basket })} disabled={busy} listId={listId} onCommit={commit} />
+                )}
+              </div>
+              <div>
+                <FieldLabel>Timeframe</FieldLabel>
+                <Segmented ariaLabel="Candle timeframe" options={INTERVAL_OPTIONS} value={config.interval} onChange={(interval) => onChange({ interval })} disabled={busy} />
+              </div>
+              <div>
+                <FieldLabel>History</FieldLabel>
+                <Segmented ariaLabel="History range" options={rangeOptions(config.interval)} value={config.range} onChange={(range) => onChange({ range })} disabled={busy} />
+              </div>
+              <div>
+                <FieldLabel>Direction</FieldLabel>
+                <Segmented ariaLabel="Trade direction mode" options={MODE_OPTIONS} value={config.tradeMode} onChange={(tradeMode) => onChange({ tradeMode })} disabled={busy} />
+              </div>
+              {subHour && tradesStocks && (
+                <p className="flex basis-full items-center gap-1.5 text-xs text-ink-3">
+                  <Info size={13} className="shrink-0" />
+                  Yahoo Finance only serves {config.interval} stock candles for the last {YAHOO_MAX_DAYS[config.interval] + 1} days, so stock runs on
+                  this timeframe are short. Crypto loads the full {config.range} from Binance.
+                </p>
               )}
-            </div>
-          </div>
-        ) : (
-          <div title={`Borrow fee on short stock / ETF positions, per year (default ${DEFAULT_BORROW_PCT_YEAR}%).`}>
-            <NumberField
-              label="Short borrow / yr"
-              suffix="%"
-              value={config.borrowPctYear}
-              min={0}
-              max={100}
-              step={0.25}
-              onChange={(borrowPctYear) => onChange({ borrowPctYear })}
-              disabled={busy}
-              className="w-[120px]"
-            />
-          </div>
-        )}
-        <div className="min-w-[260px] flex-1">
-          <FieldLabel>Robust universe</FieldLabel>
-          <div className="flex items-center gap-2">
-            <label
-              className={cx(
-                'inline-flex h-9 shrink-0 cursor-pointer items-center gap-2 rounded-lg border bg-base px-2.5 text-sm',
-                universeOn ? 'border-accent text-ink' : 'border-line text-ink-2',
-                config.assetMode !== 'single' && 'cursor-not-allowed opacity-60',
-              )}
-              title="Score every strategy on all of these assets, untuned, and rank by the median. Not available for baskets."
-            >
-              <input
-                type="checkbox"
-                checked={universeOn}
-                disabled={busy || config.assetMode !== 'single'}
-                onChange={(event) => onChange({ robustUniverse: event.target.checked })}
-                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+            </Group>
+
+            <Group title="Market hypothesis">
+              <div>
+                <Segmented
+                  ariaLabel="Market hypothesis"
+                  options={HYPOTHESIS_OPTIONS}
+                  value={config.hypothesis}
+                  onChange={(hypothesis) => onChange({ hypothesis })}
+                  disabled={busy}
+                />
+              </div>
+              <p className="min-w-[260px] flex-1 text-xs leading-relaxed text-ink-3">
+                <span className="font-semibold text-ink-2">{hypothesis.label}.</span> {hypothesis.rationale}{' '}
+                <span className="text-ink-2">Entry trigger:</span> {hypothesis.trigger} <span className="text-ink-2">Filter:</span> {hypothesis.filter}{' '}
+                <span className="text-ink-2">{MODE_NOTE[config.tradeMode]}</span>
+              </p>
+            </Group>
+
+            <Group title="Costs & position sizing">
+              <NumberField
+                label="Starting capital"
+                prefix="$"
+                value={config.capital}
+                min={100}
+                max={1_000_000_000}
+                step={1000}
+                onChange={(capital) => onChange({ capital })}
+                disabled={busy}
+                className="w-[136px]"
               />
-              Same rules on every asset
-            </label>
-            <input
-              type="text"
-              value={config.universe}
-              disabled={busy || !universeOn}
-              aria-label="Robust universe tickers"
-              aria-invalid={universeInvalid}
-              spellCheck={false}
-              placeholder="BTC-USD, ETH-USD, …"
-              onChange={(event) => onChange({ universe: event.target.value.toUpperCase() })}
-              className={cx(
-                'num h-9 min-w-0 flex-1 rounded-lg border bg-base px-2.5 text-sm text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-accent disabled:cursor-not-allowed disabled:opacity-50',
-                universeInvalid ? 'border-down/70' : 'border-line',
+              <NumberField label="Fee / side" suffix="%" value={config.feePct} min={0} max={5} step={0.01} onChange={(feePct) => onChange({ feePct })} disabled={busy} className="w-[92px]" />
+              <NumberField
+                label="Slippage floor"
+                suffix="%"
+                value={config.slippagePct}
+                min={0}
+                max={5}
+                step={0.01}
+                onChange={(slippagePct) => onChange({ slippagePct })}
+                disabled={busy}
+                className="w-[100px]"
+              />
+              <div title="Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. 0 = fixed slippage only.">
+                <NumberField
+                  label="Vol. slippage"
+                  suffix="× ATR"
+                  value={config.slippageAtrMult}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={(slippageAtrMult) => onChange({ slippageAtrMult })}
+                  disabled={busy}
+                  className="w-[112px]"
+                />
+              </div>
+              <div>
+                <FieldLabel>Position sizing</FieldLabel>
+                <Segmented ariaLabel="Position sizing" options={SIZING_OPTIONS} value={config.sizingMode} onChange={(sizingMode) => onChange({ sizingMode })} disabled={busy} />
+              </div>
+              <NumberField
+                label="Risk / trade"
+                suffix="%"
+                value={config.riskPct}
+                min={0.1}
+                max={10}
+                step={0.25}
+                onChange={(riskPct) => onChange({ riskPct })}
+                disabled={busy || config.sizingMode === 'full'}
+                className="w-[100px]"
+              />
+              {financing === 'none' ? (
+                <div>
+                  <FieldLabel>Financing</FieldLabel>
+                  <p className="flex h-9 items-center text-xs text-ink-3" title="Long-Only runs are treated as spot positions">
+                    Long-Only spot: none
+                  </p>
+                </div>
+              ) : financing === 'funding' ? (
+                <div>
+                  <FieldLabel>Perp funding (L/S crypto)</FieldLabel>
+                  <div className="flex items-center gap-2">
+                    <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-line bg-base px-2.5 text-sm text-ink-2">
+                      <input
+                        type="checkbox"
+                        checked={config.fundingPct8h > 0}
+                        disabled={busy}
+                        onChange={(event) => onChange({ fundingPct8h: event.target.checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
+                        className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+                      />
+                      Charge funding
+                    </label>
+                    {config.fundingPct8h > 0 && (
+                      <NumberFieldInline
+                        ariaLabel="Funding rate per 8 hours"
+                        value={config.fundingPct8h}
+                        onChange={(fundingPct8h) => onChange({ fundingPct8h })}
+                        disabled={busy}
+                      />
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div title={`Borrow fee on short stock / ETF positions, per year (default ${DEFAULT_BORROW_PCT_YEAR}%).`}>
+                  <NumberField
+                    label="Short borrow / yr"
+                    suffix="%"
+                    value={config.borrowPctYear}
+                    min={0}
+                    max={100}
+                    step={0.25}
+                    onChange={(borrowPctYear) => onChange({ borrowPctYear })}
+                    disabled={busy}
+                    className="w-[120px]"
+                  />
+                </div>
               )}
-            />
-          </div>
-        </div>
-            </div>
+            </Group>
+
+            <Group title="Search">
+              <div title={`Strategies this run may evaluate. Every evaluation raises the luck hurdle; a data window allows ${WINDOW_TRIAL_BUDGET.toLocaleString('en-US')} across all runs by default (extendable).`}>
+                <NumberField
+                  label="Evaluations / run"
+                  value={config.maxEvaluations}
+                  min={MIN_RUN_EVALUATIONS}
+                  max={MAX_RUN_EVALUATIONS}
+                  step={1000}
+                  onChange={(maxEvaluations) => onChange({ maxEvaluations: Math.round(maxEvaluations) })}
+                  disabled={busy}
+                  className="w-[124px]"
+                />
+              </div>
+              <div title="Keep scanning – with diversity restarts when the search stalls – until this many strategies pass every robustness gate, or the budget runs out.">
+                <FieldLabel>Stop after N robust</FieldLabel>
+                <Segmented
+                  ariaLabel="Stop after N robust strategies"
+                  options={ROBUST_TARGET_OPTIONS}
+                  value={String(config.robustTarget) as RobustTargetOption}
+                  onChange={(value) => onChange({ robustTarget: Number(value) })}
+                  disabled={busy}
+                />
+              </div>
+              <div>
+                <FieldLabel>EMA / SMA lengths</FieldLabel>
+                <Segmented ariaLabel="EMA / SMA length search" options={MA_PERIOD_OPTIONS} value={config.maPeriods} onChange={(maPeriods) => onChange({ maPeriods })} disabled={busy} />
+              </div>
+            </Group>
           </div>
         )}
       </div>

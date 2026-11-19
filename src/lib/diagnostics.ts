@@ -149,7 +149,7 @@ function neighbourBadge(s: StrategyResult): DiagnosticBadge {
   };
 }
 
-function crossMarketBadge(cross: CrossMarketReport | null, report: RobustnessReport | null): DiagnosticBadge {
+function crossMarketBadge(cross: CrossMarketReport | null): DiagnosticBadge {
   const base = { key: 'crossMarket' as const, label: 'Works on other markets', metric: 'Cross-market check' };
   if (cross && cross.tested > 0) {
     const profitable = Math.round(cross.share * cross.tested);
@@ -160,18 +160,6 @@ function crossMarketBadge(cross: CrossMarketReport | null, report: RobustnessRep
       tooltip:
         `The exact rules, untouched, on ${cross.tested} related market${cross.tested === 1 ? '' : 's'} the search never saw (dates before the sealed holdout): ` +
         `profitable on ${profitable}, median Sharpe ${cross.medianSharpe.toFixed(2)}. Two thirds profitable and a positive median are needed.`,
-    };
-  }
-  if (report?.crossAsset) {
-    const rows = report.crossAsset.rows;
-    const profitable = rows.filter((row) => row.profitable).length;
-    return {
-      ...base,
-      value: `${profitable} of ${rows.length} in run`,
-      status: report.crossAsset.share >= 2 / 3 - 1e-9 ? 'warn' : 'fail',
-      tooltip:
-        `Profitable on ${profitable} of ${rows.length} assets of the run's own universe. Those assets shaped the search, so this is weaker evidence ` +
-        'than a check on unseen markets – run the cross-market check below.',
     };
   }
   return {
@@ -223,7 +211,7 @@ export function diagnosticBadges(input: DiagnosticsInput): DiagnosticBadge[] {
     foldBadge(s),
     monteCarloBadge(report?.monteCarlo ?? s.monteCarlo),
     neighbourBadge(s),
-    crossMarketBadge(crossMarket, report),
+    crossMarketBadge(crossMarket),
     holdoutBadge(s),
   ];
 }
@@ -261,8 +249,11 @@ export function strategyVerdict(input: DiagnosticsInput): StrategyVerdict {
   else risks.push(`Weak on other markets (${byKey.crossMarket.value}): the edge may be specific to this chart.`);
 
   if (report && !report.topTrades.profitable) risks.push(`Unprofitable without its ${report.topTrades.removed} best trades: a few outliers carry the result.`);
-  if (report?.sensitivity.fragile) risks.push('A ±20% change of one parameter costs more than half of the return.');
-  if (s.validation.trades < 25) risks.push(`Only ${s.validation.trades} trades in the validation period: a small sample.`);
+  // The sample the gates counted: the primary asset's, or the total over a pooled run's assets.
+  const validationTrades = s.sample?.validationTrades ?? s.validation.trades;
+  if (validationTrades < 25) {
+    risks.push(`Only ${validationTrades} trades in the validation period${s.sample?.pooled ? ' (pooled over the assets)' : ''}: a small sample.`);
+  }
   const ambiguous = s.search.trades > 0 ? s.search.ambiguousTrades / s.search.trades : 0;
   if (ambiguous > 0.1) risks.push(`${pct(ambiguous)} of trades hit the stop and the target in the same candle; the stop was assumed to fill first.`);
   if (input.simulated) risks.push('Simulated fallback data: re-run on live market data before drawing conclusions.');

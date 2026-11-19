@@ -2,7 +2,7 @@
  * Latest candles for the Next Entry Forecast.
  *
  * A snapshot holds the traded instrument (a single asset or the basket index)
- * plus, for baskets and Robust-universe runs, every individual asset, so the
+ * plus, for baskets and asset pools, every individual asset, so the
  * forecast can rank them. It is built from the run's own data when the run
  * starts and rebuilt from freshly fetched candles on "Refresh Latest Price".
  */
@@ -32,7 +32,7 @@ export interface MarketSnapshot {
 
 type SnapshotContext = Pick<RunContext, 'label' | 'components' | 'isBasket' | 'universe' | 'interval' | 'range'>;
 
-/** Every symbol the snapshot needs: basket components and universe assets. */
+/** Every symbol the snapshot needs: basket components and pool assets. */
 export function snapshotSymbols(ctx: SnapshotContext): string[] {
   const symbols = ctx.components.map((component) => component.symbol);
   for (const symbol of ctx.universe) if (symbol !== 'Basket' && !symbols.includes(symbol)) symbols.push(symbol);

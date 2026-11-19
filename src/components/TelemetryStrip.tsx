@@ -1,17 +1,17 @@
 /**
- * Live telemetry: engine status, evaluation counter, the trial-budget meter of
- * the data window (every run and session on overlapping data counts), the best
- * deflated Sharpe ratio against the luck hurdle, and the market-data source.
+ * Step 2 – the live discovery scanner: engine status, the best deflated Sharpe ratio against the
+ * luck hurdle, the market-data source, and the scan itself – robust strategies found against the
+ * target, the evaluation progress bar, the diversity-restart cycle and the pass / fail funnel of the
+ * robustness gates. (The trial-budget meter of the data window sits in the top action bar.)
  *
- * The headline is deliberately NOT a return figure: in-sample returns of the
- * best of thousands of tried strategies are inflated by selection, while the
- * deflated Sharpe accounts for how many were tried.
+ * The headline is deliberately NOT a return figure: in-sample returns of the best of thousands of
+ * tried strategies are inflated by selection, while the deflated Sharpe accounts for how many were
+ * tried.
  */
 
 import { CircleCheck, CircleDot, Database, Loader2, OctagonX, TriangleAlert } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { RunContext } from '../lib/config';
-import type { BudgetStatus } from '../lib/trialLedger';
 import { fmtDate, fmtDuration, fmtInt, fmtNum, fmtPct } from '../lib/format';
 import { FITNESS_PATIENCE, type EngineStatus, type ProgressSnapshot, type StopReason } from '../types/trading';
 import { cx, Panel, StepHeader } from './ui';
@@ -26,8 +26,8 @@ interface TelemetryStripProps {
   maxEvaluations: number;
   /** Why the last run ended (null while running or before the first run). */
   stopReason: StopReason | null;
-  /** Trial budget of the active data window; `estimated` before the data has been downloaded. */
-  budget: { status: BudgetStatus; estimated: boolean } | null;
+  /** Robust strategies the run scans for (0 = the full budget). */
+  robustTarget: number;
 }
 
 const STOP_LABEL: Record<StopReason, string> = {
@@ -36,13 +36,6 @@ const STOP_LABEL: Record<StopReason, string> = {
   budget: 'Run budget used',
   'window-budget': 'Window budget spent',
   exhausted: 'Search space exhausted',
-};
-
-const BUDGET_TEXT: Record<BudgetStatus['level'], { label: string; tone: string; bar: string }> = {
-  fresh: { label: 'Fresh data', tone: 'text-up', bar: 'bg-accent' },
-  degrading: { label: 'Significance degrading', tone: 'text-warn', bar: 'bg-warn' },
-  critical: { label: 'Nearly spent', tone: 'text-down', bar: 'bg-down' },
-  exhausted: { label: 'Spent – extend to continue', tone: 'text-down', bar: 'bg-down' },
 };
 
 const STATUS: Record<EngineStatus, { label: string; className: string; icon: ReactNode }> = {
@@ -104,8 +97,8 @@ interface FunnelStage {
 }
 
 /** Robust strategies found, evaluations, the restart cycle, and the pass / fail funnel of the robustness gates. */
-function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapshot; maxEvaluations: number }): JSX.Element {
-  const { robustFound, robustTarget, cycle, funnel, evaluations } = telemetry;
+function ScanProgress({ telemetry, maxEvaluations, robustTarget }: { telemetry: ProgressSnapshot; maxEvaluations: number; robustTarget: number }): JSX.Element {
+  const { robustFound, cycle, funnel, evaluations } = telemetry;
   const share = maxEvaluations > 0 ? Math.min(1, evaluations / maxEvaluations) : 0;
   const reached = robustTarget > 0 && robustFound >= robustTarget;
   const stages: FunnelStage[] = [
@@ -126,8 +119,9 @@ function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapsh
             <span className="text-sm font-normal text-ink-3"> / {robustTarget > 0 ? fmtInt(robustTarget) : 'full budget'}</span>
           </span>
         </div>
-        <div className="num text-xs text-ink-3">
+        <div className="num text-xs text-ink-3" title="Repeated genomes and repeated trade logs are skipped: they are not new trials.">
           <span className="font-semibold text-ink-2">{fmtInt(evaluations)}</span> / {fmtInt(maxEvaluations)} evaluations
+          {telemetry.duplicates > 0 ? ` · ${fmtInt(telemetry.duplicates)} duplicates skipped` : ''}
         </div>
         <div
           className="num inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-2 py-0.5 text-xs text-ink-2"
@@ -171,19 +165,10 @@ function ScanProgress({ telemetry, maxEvaluations }: { telemetry: ProgressSnapsh
   );
 }
 
-export default function TelemetryStrip({
-  status,
-  telemetry,
-  benchmarkSharpe,
-  context,
-  maxEvaluations,
-  stopReason,
-  budget,
-}: TelemetryStripProps): JSX.Element {
+export default function TelemetryStrip({ status, telemetry, benchmarkSharpe, context, maxEvaluations, stopReason, robustTarget }: TelemetryStripProps): JSX.Element {
   const badge = STATUS[status];
   const badgeLabel = (status === 'converged' || status === 'stopped') && stopReason !== null ? STOP_LABEL[stopReason] : badge.label;
   const hasRun = telemetry.iteration > 0;
-  const level = budget ? BUDGET_TEXT[budget.status.level] : null;
   const dsr = telemetry.bestDsr;
   const dsrTone = dsr === null ? 'text-ink-3' : dsr >= 0.95 ? 'text-up' : dsr >= 0.5 ? 'text-warn' : 'text-ink';
 
@@ -192,11 +177,11 @@ export default function TelemetryStrip({
       <div className="border-b border-line px-4 py-3">
         <StepHeader
           step={2}
-          title="Discovery scanner"
+          title="Live discovery scanner"
           hint="Searches the hypothesis until enough strategies pass every robustness gate – the holdout stays sealed throughout."
         />
       </div>
-    <div className="grid grid-cols-1 divide-y divide-line sm:grid-cols-2 sm:divide-y-0 xl:grid-cols-[1.05fr_0.8fr_1.5fr_1.45fr_1.4fr] xl:divide-x">
+      <div className="grid grid-cols-1 divide-y divide-line sm:grid-cols-[1fr_1.4fr] sm:divide-y-0 lg:grid-cols-[0.9fr_1.4fr_1.4fr] lg:divide-x">
       <Tile label="Engine status">
         <div
           role="status"
@@ -216,52 +201,6 @@ export default function TelemetryStrip({
             'Waiting for a run'
           )}
         </div>
-      </Tile>
-
-      <Tile label="Evaluations this run">
-        <div className="flex items-baseline gap-1.5 whitespace-nowrap">
-          <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(telemetry.evaluations)}</span>
-          <span className="num text-sm text-ink-3">/ {fmtInt(maxEvaluations)}</span>
-        </div>
-        <div className="num mt-1 text-xs leading-snug text-ink-3" title="Repeated genomes and repeated trade logs are skipped: they are not new trials.">
-          {fmtInt(telemetry.duplicates)} duplicates skipped · restart at stall {fmtInt(Math.min(telemetry.fitnessStall, FITNESS_PATIENCE))}/{fmtInt(FITNESS_PATIENCE)}
-        </div>
-      </Tile>
-
-      <Tile label="Trial budget · this data window">
-        {budget && level ? (
-          <>
-            <div className="flex items-baseline gap-1.5 whitespace-nowrap">
-              <span className="num text-2xl font-semibold leading-7 text-ink">{fmtInt(budget.status.used)}</span>
-              <span className="num text-sm text-ink-3">/ {fmtInt(budget.status.limit)}</span>
-              <span className={cx('ml-1 truncate text-xs font-semibold', level.tone)}>{level.label}</span>
-            </div>
-            <div
-              className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-accent/15"
-              role="progressbar"
-              aria-label="Trial budget used on this data window"
-              aria-valuemin={0}
-              aria-valuemax={budget.status.limit}
-              aria-valuenow={budget.status.used}
-            >
-              <div className={cx('h-full rounded-full transition-[width] duration-150 ease-linear', level.bar)} style={{ width: `${budget.status.share * 100}%` }} />
-            </div>
-            {budget.status.extensions > 0 && (
-              <div className="mt-1 text-xs font-semibold text-warn" role="note">
-                Extended {budget.status.extensions}× beyond the default budget – multiple-testing significance is degraded
-              </div>
-            )}
-            <div
-              className="num mt-1 truncate text-xs text-ink-3"
-              title="Annualised Sharpe the luckiest of that many skill-less strategies is expected to show over this search period by chance alone. Every trial on overlapping data – any run, any session – counts."
-            >
-              best-of-{fmtInt(budget.status.used)} by luck ≈ Sharpe {fmtNum(budget.status.luckSharpe)}
-              {budget.estimated ? ' · estimated window' : context ? ` · ${context.priorTrials.runs} earlier run${context.priorTrials.runs === 1 ? '' : 's'}` : ''}
-            </div>
-          </>
-        ) : (
-          <div className="mt-1 text-xs text-ink-3">Enter an asset to see its trial budget</div>
-        )}
       </Tile>
 
       <Tile label="Best deflated Sharpe">
@@ -291,7 +230,7 @@ export default function TelemetryStrip({
         </div>
       </Tile>
 
-      <Tile label="Market data" className="sm:col-span-2 xl:col-span-1">
+      <Tile label="Market data" className="sm:col-span-2 lg:col-span-1">
         {context ? (
           <>
             <div
@@ -315,7 +254,7 @@ export default function TelemetryStrip({
             </div>
             {context.universe.length > 1 && (
               <div className="num mt-0.5 truncate text-xs text-ink-3" title={context.universe.join(', ')}>
-                {context.settings.poolAssets ? 'Asset pool' : 'Robust universe'}: {context.universe.length} assets
+                Asset pool: {context.universe.length} assets, same rules on each
               </div>
             )}
           </>
@@ -329,8 +268,8 @@ export default function TelemetryStrip({
           </>
         )}
       </Tile>
-    </div>
-      <ScanProgress telemetry={telemetry} maxEvaluations={maxEvaluations} />
+      </div>
+      <ScanProgress telemetry={telemetry} maxEvaluations={maxEvaluations} robustTarget={robustTarget} />
     </Panel>
   );
 }

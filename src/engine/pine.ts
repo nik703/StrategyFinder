@@ -32,6 +32,8 @@ import { countParameters } from './genome';
 export interface PineContext {
   /** Dataset label, e.g. "BTC-USD" or "50% BTC-USD · 30% ETH-USD · 20% NVDA". */
   label: string;
+  /** Assets the run traded with these rules; more than one = a pooled multi-asset run. */
+  assets: readonly string[];
   interval: Interval;
   settings: BacktestSettings;
   components: readonly BasketComponent[];
@@ -370,11 +372,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     '//   - Small differences are expected: TradingView uses its own data feed and intrabar fill model.',
     '//   - Educational tool, not financial advice. Past performance does not guarantee future results.',
   );
-  if (settings.poolAssets) {
+  if (ctx.assets.length > 1) {
     push(
       '//',
       '//  Asset pool',
-      `//   This strategy was optimised on a pool of assets (${label.replace(/^Pool:\s*/, '')}), each traded`,
+      `//   This strategy was optimised on a pool of assets (${ascii(ctx.assets.join(', '))}), each traded`,
       '//   separately with these exact rules. Apply the script to each asset\'s chart; the trade-count',
       '//   gates were met by the pooled sample, so one chart alone shows fewer trades.',
     );
@@ -439,7 +441,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
       `maxBarsInTrade = input.int(${timeStop}, "Time stop (bars in trade)", minval=1, group="Risk management")`,
     );
   }
-  push(`costPct       = ${float(costPct)} // fee + slippage per side, in percent`, '');
+  push(
+    `feePct        = ${float(settings.feePct)} // trading fee per side, in percent`,
+    `costPct       = ${float(costPct)} // fee + slippage per side, in percent (charged as commission)`,
+    '',
+  );
 
   /* ---- Indicators and rules ---------------------------------------------- */
   push('// ---- Indicators --------------------------------------------------------------', ...decl.render(), '');
@@ -478,10 +484,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     push('orderQty = maxQty // 100% of equity per trade', '');
   } else {
     push(
-      '// Risk-based size: being stopped out costs riskPct of the risk capital.',
+      '// Risk-based size: being stopped out costs riskPct of the risk capital (the entry fee is',
+      '// budgeted inside the size, exactly as in StrategyFinder).',
       'riskCapital  = compound ? math.max(strategy.equity, 0) : strategy.initial_capital',
       exit.mode === 'static' ? 'stopDistance = close * stopLossPct / 100' : 'stopDistance = stopAtrMult * atrValue',
-      'orderQty = na(stopDistance) or stopDistance <= 0 ? 0.0 : math.min(riskCapital * riskPct / 100 / stopDistance, maxQty)',
+      'orderQty = na(stopDistance) or stopDistance <= 0 ? 0.0 : math.min(riskCapital * riskPct / 100 / (stopDistance * (1 + feePct / 100)), maxQty)',
       '',
     );
   }
@@ -592,12 +599,17 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   }
 
   if (timeStop !== null) {
-    push('if timedOut', '    strategy.close_all(comment="Time stop")', '');
+    // A reversal entry on the same open already closes the position: closing it again would cancel the reversal.
+    push(
+      `if timedOut${hasShorts ? ' and not (strategy.position_size > 0 and goShort) and not (strategy.position_size < 0 and goLong)' : ''}`,
+      '    strategy.close_all(comment="Time stop")',
+      '',
+    );
   }
 
   push(
-    '// Flatten once the test window has ended.',
-    'if useWindow and time > windowEnd and strategy.position_size != 0',
+    "// Flatten on the window's last candle (filled at the next open), as StrategyFinder liquidates at that close.",
+    'if useWindow and time >= windowEnd and strategy.position_size != 0',
     '    strategy.close_all(comment="Window end")',
   );
 

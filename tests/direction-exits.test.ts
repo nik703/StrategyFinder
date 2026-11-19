@@ -158,6 +158,7 @@ describe('direction modes', () => {
       { id: 'S-1', genome: g, dsr: 0, holdout: null, train: emptyMetrics(), validation: emptyMetrics(), search: emptyMetrics() } as never,
       {
         label: 'BTC-USD',
+        assets: ['BTC-USD'],
         interval: '1d',
         settings,
         components: [{ symbol: 'BTC-USD', weight: 1 }],

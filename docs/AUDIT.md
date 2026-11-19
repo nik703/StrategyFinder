@@ -292,6 +292,132 @@ What it shows:
 3. **Walk-forward re-optimisation** (rolling search / validation windows) to test the process, not one fit.
 
 
+## 2026-11-19 · Consolidation pass (after commit `2d0bcda`)
+
+Several rounds of patches had layered overlapping checks, scores and settings onto the engine and the UI.
+This pass keeps the verified core intact – causal indicators, next-open fills, stop-before-target
+resolution, volatility-scaled slippage, fees / funding / borrow, the one-shot locked holdout and the
+random-walk suite – and removes everything that duplicated it or pulled in another direction, so each
+question has one source of truth.
+
+### Cruft and conflicts removed
+
+| # | Where | What was there | What it is now |
+|---|---|---|---|
+| 1 | fitness | The deflated Sharpe sat **inside** the fitness (`3 × DSR + 0.25 z`, the largest term): the search hill-climbed the validation Sharpe it was later judged on, and every score moved whenever the luck hurdle moved, so the whole board was re-scored each round. | The DSR is a **gate only** (robust ≥ 50%, Robust verdict ≥ 95%). The fitness never depends on the trial count; only DSR and the robust flags are re-checked as the hurdle rises. |
+| 2 | fitness | Seven overlapping penalties: a consistency bonus / penalty (duplicating the median and the fold gate), a −3 cliff for one deep fold **and** a separate search-drawdown penalty, a regime-collapse penalty **and** a single-regime disqualification, a −1 cliff for < 2/3 profitable universe assets, −0.15 per parameter above 4 (duplicating the hard cap), and a reward:risk penalty (double-counting expectancy). Fold score mixed Sortino, Sharpe, Calmar and expectancy. | **One composite**: `1.5 × median-fold (½ Sortino/1.5 + ½ Calmar) + 1.0 × expectancy × trade frequency − 4 × drawdown beyond 25%`, median over the assets, hard trade gates, then the parameter-neighbourhood blend. Complexity is capped by the genome (5 numbers), not penalised. |
+| 3 | backtester | Bull / bear / high-volatility regime labelling (`regimeMask`, regime accumulators in the hottest loop, `RegimeMetrics`) existed only for the penalties in #2 and the risk score in #7. It also disqualified Long-Only trend strategies for losing in bear slices – the regime their own filter is meant to sit out. | Removed. Temporal consistency is the five-fold median and the fold gate. |
+| 4 | robustness | Three definitions of "nearby settings": ±20% variants (report + verdict), one-step neighbours (ranking + gate), the heatmap grid. | One: the one-step neighbourhood (×√2 on every-integer MA axes) for ranking, gate and heatmap. `parameterVariants('pct20')` removed. |
+| 5 | robustness | Two cross-asset tests: `crossAsset` on the run's own universe (assets that shaped the search) plus extra assets the UI downloaded on every analysis, and the cross-market check on unseen markets. | The holdout-safe **cross-market check** only. The verdict needs generalisation – a pooled run, or a passed cross-market check – and is re-judged when the check runs after the lock. |
+| 6 | statistics | Two multiple-testing corrections side by side (haircut Sharpe and deflated Sharpe). | The deflated Sharpe only. |
+| 7 | UI / lib | Two overfitting summaries: `risk.ts` (a 0–100 score column and a workbench section) and the diagnostics badges + verdict. | Diagnostics only; `risk.ts` deleted. |
+| 8 | config / engine | Two multi-asset modes with different semantics: *Robust universe* (trade one asset, score a universe, gate the primary's trades, primary DSR, robust checks on the primary only) and *Asset pool* (trade all, pooled gates, median DSR). | **One pooled mode**: several assets are always one pooled sample. `robustUniverse`, `universe`, `poolAssets` and the universe defaults are gone. |
+| 9 | search | Diversity restart kept a growing hall of fame and used "board entries found this cycle + the last 5 hall-of-fame genomes" as parents. Fresh genomes rarely reach the global top 25, so after a restart the parent list stayed below the seed size and the search fell back to pure random sampling. | At a restart the **top 5 of the board are the elite**; the re-seeded part of the population is the cycle's best scored candidates, board or not, so fresh genomes are mutated and crossed, not just sampled. Same 1,500-evaluation patience; a stall never ends a run. |
+| 10 | worker | Duplicate counters (`stagnation` / `improvedFitness` next to `fitnessStall` / `improvedMeaningfully`) and an unclamped neighbour median reported next to the clamped one the blend used. | One stall counter; one `neighbourhoodMedian` helper. |
+| 11 | dead code | Partial-scoring pruning (`fitnessCeiling`, the `floor` of `scoreAssets`) unreachable since every candidate is fully scored; `quantile`, `deflatedTerm`, `hypothesisPrimitives`, `MAX_EXIT_CONDITIONS`, `FREE_PARAMETERS`, `IndicatorFamily`; stale comments ("runs until … fails to improve", "early stop at `FITNESS_PATIENCE`", "Stage 2"). | Removed. |
+| 12 | UI | Start / Stop inside the setup panel, a trial-budget tile and an evaluations tile in the scanner, Overfit-risk and Haircut columns, a Robustness section and a selection-bias box repeating the badges, a misleading "0 / full budget" target before the first run. | A sticky **top action bar** (1-Click Run, Stop, trial-budget meter, Reset Runs & Clear Cache); presets + a one-line setup summary with every knob in the Advanced Settings drawer; Sortino promoted to a key column; leaderboard ordered robust-first; the holdout card carries the verdict checklist. |
+
+### TypeScript ↔ Pine ↔ Next Entry parity
+
+Checked condition by condition and exit by exit against `runBacktest`:
+
+- **Fixed:** Pine's risk sizing ignored the entry fee (`riskCapital × risk% / stopDistance`); the
+  backtester budgets it inside the size → `/ (stopDistance × (1 + fee%))`.
+- **Fixed:** a time stop on the same open as a reversal entry – `strategy.close_all` would have cancelled
+  the reversal the backtester takes → guarded.
+- **Fixed:** the window flatten fired one candle late (`time > windowEnd`) → `>=`, so Pine closes at the
+  open after the last candle, matching the backtester's liquidation at that close.
+- **Matching:** next-open fills; entry conflicts (opposite entry or own exit cancels); initial levels from
+  the signal candle's ATR or % of the fill; the trailing stop (best price − k × ATR after each close, never
+  loosened); the breakeven lock (+1R on the peak since entry, stop → entry from the next candle); the time
+  stop and its same-side re-entry block; all three direction modes; `use_bar_magnifier=false`. Not
+  expressible in Pine and stated in the script header: volatility-scaled slippage, funding and borrow.
+- **Next Entry Forecast:** reuses the backtester's evaluators; it now also quotes whether the stop will
+  trail (and by how many ATRs) and the breakeven level of a planned entry, and the tests prove the quoted
+  fill, initial stop and breakeven level equal the trade `runBacktest` opens.
+
+### Parsimony, measured (4,000 random genomes per row)
+
+| Mode | Hypothesis | Single trigger | Tunable numbers |
+|---|---|---|---|
+| Long-Only | Trend following | 58% | 2: 4% · 3: 26% · 4: 43% · 5: 26% |
+| Long-Only | Volatility breakout | 61% | 2: 5% · 3: 25% · 4: 43% · 5: 27% |
+| Long-Only | Trend pullback | 0% (a pullback trigger always pairs with its slow trend filter) | 3: 8% · 4: 37% · 5: 56% |
+| Long-Only | Range reversion | 60% | 3: 15% · 4: 49% · 5: 35% |
+| Asymmetric L/S | any | same split | the same + 1 for the short regime filter |
+
+### Verification
+
+- `tsc --noEmit` (app and tests) and `vite build`: clean.
+- Vitest: every suite passes (the opt-in live benchmark is skipped by default). New tests cover the reset
+  (ledger, extensions, holdout log, stale keys, saved tickers kept, broken / minimal storage), the
+  hurdle-free fitness and gate-only DSR, pooled sampling, the parsimony mix, next-entry exit levels and
+  their backtester parity, the Pine guards and the restart population.
+- Browser (Playwright, live Binance data through the dev middleware): 1-Click Run with the default preset
+  → live scan → Stop → the ledger and budget meter show the trials → Lock & reveal records the holdout →
+  Reset (Cancel keeps everything; confirm wipes it) → no `strategyfinder.*` run keys left, meter at
+  0 / 50,000, leaderboard and workbench empty, engine idle → a second run starts and stops cleanly. No
+  console errors.
+
+### Live benchmark (Binance candles, 2026-11-19)
+
+`LIVE_BENCHMARK=1 LIVE_BENCHMARK_POOLS=4h,1d npx vitest run tests/live-benchmark.test.ts` – the default
+preset's 4h pool (BTC · ETH · SOL · BNB, 2 years) and the Trend Breakout daily pool (BTC · ETH · SOL · XRP,
+5 years), every hypothesis at 25,000 evaluations, each run followed by its random-walk control (driftless
+walks with the pool's timestamps and volatility, same settings). "Board" counts the listed strategies with
+a positive validation expectancy (net profit per validation trade of the primary asset).
+
+| Pool | Hypothesis | Mode | Evals | Cycles | Robust | Best DSR | Board: val. expectancy > 0 | Params (median / max) | Top strategy | MC P(profit) / DD95 | Locked #1: holdout ROI · Sharpe vs B&H · verdict | Cross-market (unseen) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 4h 2y BTC·ETH·SOL·BNB | VOL_BREAKOUT | long-only | 25,000 | 16 | **0** | 1% | 14/25 | 5 / 5 | S-7634 TR / ATR(10)[1] > 2.5, close up AND Volume_Ratio(20) > 2.00 (5p, val. 10 trades, -$28/trade) | 100% / 13.7% | +2.9% · 1.06 vs 0.48 · Overfit | 0/4 profitable, median Sharpe -0.72 → fail |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | VOL_BREAKOUT | long-only | 25,000 | 16 | **0** | 1% | 23/25 | 5 / 5 | – | – | – | – |
+| 4h 2y BTC·ETH·SOL·BNB | VOL_BREAKOUT | asymmetric | 25,000 | 14 | **0** | 0% | 23/25 | 6 / 6 | S-20055 TR / ATR(10)[1] > 2.5, close up AND SMA(76) > SMA(76)[10] / short gate SMA(142) < SMA(142)[10] (6p, val. 10 trades, +$105/trade) | 100% / 23.5% | -3.2% · -0.89 vs 0.48 · Overfit | 2/4 profitable, median Sharpe -0.11 → fail |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | VOL_BREAKOUT | asymmetric | 25,000 | 16 | **0** | 1% | 23/25 | 6 / 6 | – | – | – | – |
+| 4h 2y BTC·ETH·SOL·BNB | TREND_FOLLOWING | long-only | 25,000 | 14 | **0** | 0% | 22/25 | 5 / 5 | S-10979 SMA(28) crosses above SMA(54) (5p, val. 7 trades, +$16/trade) | 100% / 21.2% | +0.6% · 0.23 vs 0.48 · Overfit | 2/4 profitable, median Sharpe -0.03 → fail |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | TREND_FOLLOWING | long-only | 25,000 | 15 | **0** | 1% | 16/25 | 5 / 5 | – | – | – | – |
+| 4h 2y BTC·ETH·SOL·BNB | TREND_FOLLOWING | asymmetric | 25,000 | 15 | **0** | 1% | 25/25 | 6 / 6 | S-11302 SMA(39) crosses above SMA(62) AND ADX(14) > 15 / short gate SMA(112) < SMA(112)[10] (6p, val. 7 trades, +$100/trade) | 100% / 11.2% | +2.0% · 0.83 vs 0.48 · Overfit | 3/4 profitable, median Sharpe 0.46 → PASS |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | TREND_FOLLOWING | asymmetric | 25,000 | 14 | **0** | 1% | 24/25 | 6 / 6 | – | – | – | – |
+| 4h 2y BTC·ETH·SOL·BNB | DIP_IN_UPTREND | long-only | 25,000 | 16 | **0** | 7% | 23/25 | 5 / 5 | S-7970 Close crosses above BB_Lower(22,1.5) AND EMA(56) > EMA(56)[10] (5p, val. 3 trades, +$155/trade) | 100% / 15.5% | -0.4% · -0.08 vs 0.48 · Overfit | 2/4 profitable, median Sharpe -0.25 → fail |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | DIP_IN_UPTREND | long-only | 25,000 | 15 | **0** | 1% | 21/25 | 5 / 5 | – | – | – | – |
+| 4h 2y BTC·ETH·SOL·BNB | RANGE_REVERSION | long-only | 25,000 | 15 | **0** | 1% | 5/25 | 5 / 5 | S-9843 Close crosses above BB_Lower(29,3.0) (5p, val. 7 trades, -$87/trade) | 43% / 37.4% | -3.0% · -2.34 vs 0.48 · Overfit | 3/4 profitable, median Sharpe 0.19 → PASS |
+| random walks (4h 2y BTC·ETH·SOL·BNB vol) | RANGE_REVERSION | long-only | 25,000 | 16 | **0** | 2% | 16/25 | 5 / 5 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | VOL_BREAKOUT | long-only | 25,000 | 17 | **0** | 3% | 9/25 | 5 / 5 | S-703 TR / ATR(10)[1] > 2.0, close up (5p, val. 10 trades, -$5/trade) | 100% / 14.8% | -0.1% · 0.01 vs -0.64 · Overfit | 2/4 profitable, median Sharpe 0.10 → fail |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | VOL_BREAKOUT | long-only | 25,000 | 16 | **0** | 1% | 25/25 | 5 / 5 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | VOL_BREAKOUT | asymmetric | 25,000 | 14 | **0** | 3% | 6/25 | 6 / 6 | S-14857 TR / ATR(10)[1] > 2.0, close up / short gate SMA(164) < SMA(164)[10] (6p, val. 10 trades, -$9/trade) | 100% / 17.3% | +2.2% · 0.43 vs -0.64 · Overfit | 1/4 profitable, median Sharpe -0.33 → fail |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | VOL_BREAKOUT | asymmetric | 25,000 | 16 | **0** | 4% | 15/25 | 6 / 6 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | TREND_FOLLOWING | long-only | 25,000 | 16 | **0** | 2% | 20/25 | 5 / 5 | S-17377 SMA(28) crosses above SMA(30) (5p, val. 12 trades, -$18/trade) | 100% / 16.0% | +5.2% · 0.88 vs -0.64 · Overfit | 3/4 profitable, median Sharpe 0.31 → PASS |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | TREND_FOLLOWING | long-only | 25,000 | 15 | **0** | 1% | 25/25 | 4 / 5 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | TREND_FOLLOWING | asymmetric | 25,000 | 14 | **0** | 1% | 8/25 | 6 / 6 | S-13355 Close crosses above Highest_High(20)[1] AND Close > SMA(102) / short gate EMA(88) < EMA(88)[10] (6p, val. 15 trades, -$22/trade) | 100% / 15.9% | +8.9% · 1.67 vs -0.64 · Overfit | 4/4 profitable, median Sharpe 0.39 → PASS |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | TREND_FOLLOWING | asymmetric | 25,000 | 15 | **0** | 0% | 25/25 | 5 / 6 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | DIP_IN_UPTREND | long-only | 25,000 | 14 | **0** | 3% | 22/25 | 5 / 5 | S-22851 RSI(5) crosses above 25 AND SMA(88) > SMA(88)[10] (5p, val. 9 trades, +$66/trade) | 100% / 16.2% | -3.6% · -2.07 vs -0.64 · Overfit | 3/4 profitable, median Sharpe 0.17 → PASS |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | DIP_IN_UPTREND | long-only | 25,000 | 16 | **0** | 1% | 22/25 | 5 / 5 | – | – | – | – |
+| 1d 5y BTC·ETH·SOL·XRP | RANGE_REVERSION | long-only | 25,000 | 16 | **0** | 1% | 23/25 | 5 / 5 | S-1517 Close crosses above BB_Lower(21,1.5) AND ADX(14) < 25 (5p, val. 7 trades, +$87/trade) | 100% / 7.9% | +0.1% · 0.07 vs -0.64 · Overfit | 3/4 profitable, median Sharpe 0.21 → PASS |
+| random walks (1d 5y BTC·ETH·SOL·XRP vol) | RANGE_REVERSION | long-only | 25,000 | 16 | **0** | 3% | 16/25 | 5 / 5 | – | – | – | – |
+
+What it shows:
+
+- **(c) Noise still fails:** 0 robust strategies on all 12 random-walk controls (best deflated Sharpe
+  0–4%).
+- **(b) Parsimonious strategies with positive validation expectancy are found:** on 8 of the 12 live
+  boards most strategies have a positive validation expectancy (up to 25 of 25), all with ≤ 5 tunable
+  numbers (6 with an Asymmetric short gate), over 14–17 restart cycles per run. But the random-walk boards
+  are just as positive (15–25 of 25): after 25,000 trials, positive validation expectancy at the top of a
+  board is what selection produces on noise too. That is exactly why the deflated Sharpe is the gate.
+- **No live run reached the robust bar** (best deflated Sharpe 0–7%), as in the 2026-11-16 benchmark. The
+  binding constraint is statistical power, not the search: a 0.4-year (4h) or 1-year (daily) validation
+  segment measures an annualised Sharpe with a standard error of about 1–1.6, so the luck hurdle sits at
+  an annualised validation Sharpe of roughly 4 or more (4.6 on the 4h pool after only 1,100 trials in the
+  browser run). Some live strategies still behaved like edges out of sample – the daily
+  Asymmetric trend breakout made +8.9% on the untouched holdout (Sharpe 1.67 vs Buy & Hold's −0.64) and
+  was profitable on 4 of 4 unseen coins – but nothing separates them from the luckiest of 25,000 tries, and
+  the app says so instead of certifying them.
+
+The next steps of 2026-11-16 stand and are now the main lever for real discoveries: **pooled
+significance** (a portfolio-level deflated Sharpe over the pool's returns instead of the median of
+per-asset statistics), the **effective number of trials** (clustering near-identical trials), and
+**walk-forward re-optimisation**. Each raises statistical power without weakening the test, and each must
+be calibrated against the random-walk suite before it ships.
+
 ---
 
 ### References

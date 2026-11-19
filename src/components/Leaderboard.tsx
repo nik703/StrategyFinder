@@ -1,18 +1,19 @@
 /**
- * Step 3 – the live, sortable Top-25 leaderboard. Clicking a row opens the strategy in the
+ * Step 3 – the live, sortable ranked leaderboard. Clicking a row opens the strategy in the
  * Strategy Workbench below; ticking up to three rows compares them side by side.
  *
- * Risk-adjusted, selection-bias-aware figures lead: the default order is the
- * deflated Sharpe ratio, and every return figure is labelled in-sample. There is
- * deliberately no holdout column – the holdout is revealed for one locked
+ * The default order is the run's rank: strategies passing every robustness gate first, then the
+ * rest by composite fitness. Risk-adjusted, selection-bias-aware figures lead (sparkline, deflated
+ * Sharpe, stress test, Sortino, max drawdown, trades) and every return figure is labelled
+ * in-sample. There is deliberately no holdout column – the holdout is revealed for one locked
  * strategy only, so it can never be sorted on.
  */
 
 import { ChevronDown, ChevronsUpDown, ChevronUp, Columns3, Lock } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
+import { MAX_PARAMETERS } from '../engine/genome';
 import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
-import { overfittingRisk } from '../lib/risk';
 import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type TradeGates, type Verdict } from '../types/trading';
 import { cx, Panel, Pill, Sparkline, StepHeader } from './ui';
 
@@ -41,8 +42,6 @@ type SortKey =
   | 'params'
   | 'gates'
   | 'dsr'
-  | 'haircut'
-  | 'risk'
   | 'valSharpe'
   | 'sortino'
   | 'verdict'
@@ -68,8 +67,8 @@ interface Row {
   locked: boolean;
 }
 
-/** Default order: highest deflated Sharpe first. */
-const DEFAULT_SORT: SortState = { key: 'dsr', dir: 'desc' };
+/** Default order: the run's rank (robust strategies first, then by fitness). */
+const DEFAULT_SORT: SortState = { key: 'rank', dir: 'asc' };
 
 interface Column {
   key: SortKey | 'indicators' | 'curve';
@@ -100,7 +99,7 @@ const COLUMNS: Column[] = [
   {
     key: 'rank',
     label: 'Rank',
-    title: 'Rank by composite fitness score',
+    title: 'Strategies passing every robustness gate first, then by composite fitness',
     align: 'left',
     value: (row) => row.rank,
     firstDir: 'asc',
@@ -196,37 +195,6 @@ const COLUMNS: Column[] = [
     },
   },
   {
-    key: 'haircut',
-    detail: true,
-    label: 'Haircut Sharpe',
-    title:
-      'Validation Sharpe after a Bonferroni haircut for every strategy tried on this data window, in any run or session (Harvey & Liu). 0 = fully explained by multiple testing.',
-    align: 'right',
-    value: ({ strategy }) => strategy.haircutSharpe ?? -Infinity,
-    render: ({ strategy }) => (
-      <span className={strategy.haircutSharpe !== undefined && strategy.haircutSharpe > 0 ? 'text-ink' : 'text-ink-3'}>
-        {strategy.haircutSharpe === undefined ? '–' : fmtNum(strategy.haircutSharpe)}
-      </span>
-    ),
-  },
-  {
-    key: 'risk',
-    label: 'Overfit risk',
-    title: 'Overfitting risk score 0–100: selection bias, multiple testing, parameter spike, fold inconsistency, regime collapse, thin sample. Open a row for the breakdown.',
-    align: 'right',
-    value: ({ strategy }) => overfittingRisk(strategy).score,
-    firstDir: 'asc',
-    render: ({ strategy }) => {
-      const risk = overfittingRisk(strategy);
-      return (
-        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-          <span className="num font-semibold text-ink">{risk.score}</span>
-          <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level}</Pill>
-        </span>
-      );
-    },
-  },
-  {
     key: 'valSharpe',
     label: 'Validation Sharpe',
     title: 'Annualised Sharpe ratio on the validation segment (the input to the deflated Sharpe)',
@@ -245,7 +213,6 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'sortino',
-    detail: true,
     label: 'Sortino (in-sample)',
     title: 'Annualised Sortino ratio over train + validation',
     align: 'right',
@@ -337,11 +304,11 @@ const COLUMNS: Column[] = [
     key: 'params',
     detail: true,
     label: 'Params',
-    title: 'Number of tunable parameters (hard cap 5, +1 for an Asymmetric short regime; fitness penalty above 4)',
+    title: `Number of tunable parameters (hard cap ${MAX_PARAMETERS}, +1 for an Asymmetric short regime filter)`,
     align: 'right',
     value: ({ strategy }) => strategy.params,
     firstDir: 'asc',
-    render: ({ strategy }) => <span className={strategy.params > 4 ? 'text-warn' : 'text-ink-2'}>{strategy.params}</span>,
+    render: ({ strategy }) => <span className="text-ink-2">{strategy.params}</span>,
   },
   {
     key: 'verdict',
@@ -357,7 +324,7 @@ const COLUMNS: Column[] = [
     detail: true,
     label: 'Score',
     title:
-      'Composite fitness: the median fold score (Sortino, Sharpe, Calmar and expectancy × frequency) plus the deflated validation Sharpe, minus drawdown, regime-collapse and complexity penalties, blended towards the one-step parameter neighbours when they are worse',
+      'Composite fitness: 1.5 × the median-fold risk-adjusted return (Sortino / Calmar) + expectancy × trade frequency − a drawdown guard beyond 25%, blended 30% towards the one-step parameter neighbours when they are worse. The deflated Sharpe is a gate, not part of the score.',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
     render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,
@@ -416,7 +383,7 @@ export default function Leaderboard({
         <StepHeader
           step={3}
           title={`Ranked leaderboard · ${strategies.length} / ${LEADERBOARD_SIZE}`}
-          hint="Sorted by the chance the edge is real. Returns are in-sample. Click a row to open it in the workbench; tick up to three to compare."
+          hint="Robust strategies first, then by composite fitness. Returns are in-sample. Click a row to open it in the workbench; tick up to three to compare."
         >
           <button
             type="button"
@@ -448,7 +415,7 @@ export default function Leaderboard({
                 : 'Loading market data…'
               : status === 'converged' || status === 'stopped'
                 ? `No candidate had ${gateText ?? 'enough trades'}. Try a longer history, shorter candles, or pool several assets.`
-                : 'Configure an asset above and press Start Optimization.'}
+                : 'Pick a preset and press 1-Click Run in the top bar.'}
           </p>
         </div>
       ) : (

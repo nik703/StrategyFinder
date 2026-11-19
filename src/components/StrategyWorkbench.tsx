@@ -34,8 +34,7 @@ import {
   shortRuleLabel,
   type RuleDescription,
 } from '../engine/describe';
-import { FREE_PARAMETERS, HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
-import { overfittingRisk } from '../lib/risk';
+import { HYPOTHESES, MAX_PARAMETERS } from '../engine/genome';
 import StabilityHeatmap from './StabilityHeatmap';
 import { MIN_HOLDOUT_TRADES_FLOOR } from '../engine/backtester';
 import { generatePineScript } from '../engine/pine';
@@ -295,7 +294,7 @@ export default function StrategyWorkbench({
   const report = analysis?.report ?? strategy.robustness;
   const verdict = analysis?.verdict ?? strategy.verdict;
   const revealed = strategy.holdout !== null;
-  const risk = useMemo(() => overfittingRisk(strategy), [strategy]);
+  const pooled = context.universe.length > 1;
   const hypothesis = genome.hypothesis ? HYPOTHESES[genome.hypothesis] : null;
   const trials = context.priorTrials.count + testedCount;
 
@@ -323,6 +322,7 @@ export default function StrategyWorkbench({
     () =>
       generatePineScript(strategy, {
         label: context.label,
+        assets: context.universe,
         interval: context.interval,
         settings: context.settings,
         components: context.components,
@@ -380,7 +380,7 @@ export default function StrategyWorkbench({
           <Pill tone={genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exit.mode}</Pill>
           {genome.exit.breakeven && <Pill tone="accent">Breakeven lock</Pill>}
           {genome.exit.mode === 'dynamic' && genome.exit.trailing && <Pill tone="accent">Trailing ATR stop</Pill>}
-          <Pill tone={strategy.params > FREE_PARAMETERS ? 'warn' : 'neutral'}>{strategy.params} params</Pill>
+          <Pill>{strategy.params} params</Pill>
           {verdict !== null && <VerdictPill verdict={verdict} />}
           <span className="num ml-1 truncate text-xs text-ink-3">
             {context.venue} · {context.interval} candles · {fmtDate(context.windowStart)} → {fmtDate(context.windowEnd)} · found at
@@ -541,7 +541,7 @@ export default function StrategyWorkbench({
               </div>
               <p className="mt-2 text-xs text-ink-3">
                 {mcSummary.simulations} replays of its {mcSummary.trades} search-period trades
-                {context.settings.poolAssets ? ` (pooled over the ${context.universe.length} assets)` : ''}, each fill shocked by on average
+                {pooled ? ` (pooled over the ${context.universe.length} assets)` : ''}, each fill shocked by on average
                 twice its modelled cost. The backtest&apos;s own drawdown on the same
                 trades was {fmtPct(mcSummary.baseDrawdown, false, 1)}
                 {mcSummary.drawdownP95 > 1.5 * mcSummary.baseDrawdown
@@ -656,7 +656,7 @@ export default function StrategyWorkbench({
         </Section>
         <Section className="border-t xl:border-t-0" title="Locked holdout reveal" hint="The last 20% of history · one strategy per run">
           {revealed && strategy.holdout ? (
-            <div className="space-y-2 text-sm text-ink-2">
+            <div className="space-y-3 text-sm text-ink-2">
               <div className="flex flex-wrap items-center gap-2">
                 <Lock size={14} className="text-accent-strong" />
                 <span className="font-semibold text-ink">Revealed for {strategy.id}.</span>
@@ -668,10 +668,44 @@ export default function StrategyWorkbench({
                 <StatTile label="B&H Sharpe" value={fmtNum(benchmark.holdout?.sharpe ?? null)} />
                 <StatTile label="Holdout trades" value={fmtInt(strategy.sample?.holdoutTrades ?? strategy.holdout.trades)} />
               </div>
-              {holdoutCi && (
-                <p className="text-xs text-ink-3">
-                  95% confidence interval of the holdout Sharpe: {fmtNum(holdoutCi[0], 2)} to {fmtNum(holdoutCi[1], 2)}
-                  {holdoutCi[0] <= 0 ? ' – it includes zero, so the holdout alone does not prove an edge.' : '.'}
+              <ul className="space-y-1.5">
+                <TestRow pass={strategy.dsr >= 0.95} label="Deflated Sharpe ≥ 95%" detail={fmtPct(strategy.dsr * 100, false, 1)} />
+                {holdoutCi && (
+                  <TestRow
+                    pass={holdoutCi[0] > 0}
+                    label="Holdout Sharpe 95% interval above zero"
+                    detail={`${fmtNum(holdoutCi[0], 2)} to ${fmtNum(holdoutCi[1], 2)}`}
+                  />
+                )}
+                <TestRow
+                  pass={strategy.holdout.sharpe > (benchmark.holdout?.sharpe ?? Infinity)}
+                  label="Holdout Sharpe beats Buy & Hold"
+                  detail={`${fmtNum(strategy.holdout.sharpe)} vs ${fmtNum(benchmark.holdout?.sharpe ?? null)} · ROI ${fmtPct(strategy.holdout.roi, true)} vs ${fmtPct(benchmark.holdout?.roi ?? null, true)}`}
+                />
+                <TestRow
+                  pass={(strategy.sample?.holdoutTrades ?? strategy.holdout.trades) >= (strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR)}
+                  label={`At least ${strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR} holdout trades${pooled ? ' (pooled over the assets)' : ''}`}
+                  detail={fmtInt(strategy.sample?.holdoutTrades ?? strategy.holdout.trades)}
+                />
+              </ul>
+              {strategy.verdictNotes && strategy.verdictNotes.length > 0 ? (
+                <div>
+                  <div className="text-xs font-semibold text-ink">{verdict === 'Overfit' ? 'Rejected:' : 'Why it is not Robust:'}</div>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs text-ink-2">
+                    {strategy.verdictNotes.map((note) => (
+                      <li key={note}>{note}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : verdict === 'Robust' ? (
+                <p className="text-xs text-up">
+                  Every Robust condition held: the search-period gates, the untouched holdout, the stress test and generalisation beyond one chart.
+                </p>
+              ) : null}
+              {context.priorHoldoutReveals > 0 && (
+                <p className="text-xs text-warn">
+                  This holdout period had already been revealed {context.priorHoldoutReveals} time{context.priorHoldoutReveals === 1 ? '' : 's'} before this run,
+                  so it is no longer untouched data.
                 </p>
               )}
             </div>
@@ -734,36 +768,6 @@ export default function StrategyWorkbench({
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 xl:divide-x xl:divide-line">
-          <Section title="Overfitting risk" hint="0 = low · 100 = high">
-            <div className="flex flex-wrap items-baseline gap-3">
-              <span className="num text-3xl font-semibold text-ink">{risk.score}</span>
-              <Pill tone={risk.level === 'low' ? 'up' : risk.level === 'moderate' ? 'warn' : 'down'}>{risk.level} risk</Pill>
-              <span className="text-xs text-ink-3">
-                {risk.level === 'low'
-                  ? 'The evidence that this is more than a lucky fit is comparatively strong.'
-                  : risk.level === 'moderate'
-                    ? 'Some of the evidence points to a fit of past noise.'
-                    : 'Most of the evidence points to a fit of past noise – treat it as unproven.'}
-              </span>
-            </div>
-            <ul className="mt-3 space-y-1.5">
-              {risk.components.map((component) => (
-                <li key={component.key} className="grid grid-cols-[150px_minmax(0,1fr)_44px] items-center gap-3 text-xs">
-                  <span className="text-ink-2" title={`${component.weight} of 100 points`}>
-                    {component.label} <span className="text-ink-3">· {component.weight}</span>
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block h-1.5 overflow-hidden rounded-full bg-line" aria-hidden="true">
-                      <span className="block h-full rounded-full bg-ink-3" style={{ width: `${component.risk * 100}%` }} />
-                    </span>
-                    <span className="mt-0.5 block truncate text-[11px] text-ink-3">{component.detail}</span>
-                  </span>
-                  <span className="num text-right font-semibold text-ink">{Math.round(component.weight * component.risk)}</span>
-                </li>
-              ))}
-            </ul>
-          </Section>
-
           <Section title="The idea" hint={hypothesis ? `Hypothesis: ${hypothesis.label}` : ARCHETYPE_LABEL[genome.archetype]}>
             {hypothesis && (
               <p className="mb-2 text-sm leading-relaxed text-ink">
@@ -776,7 +780,7 @@ export default function StrategyWorkbench({
 
           <Section
             title="Indicators & exact parameters"
-            hint={`${strategy.params} tunable values (cap ${MAX_PARAMETERS}, penalty above ${FREE_PARAMETERS})`}
+            hint={`${strategy.params} tunable values (cap ${MAX_PARAMETERS}${genome.shortRegime ? ' + 1 short regime filter' : ''})`}
           >
             <div className="mb-3 flex flex-wrap gap-1">
               {indicatorBadges(genome).map((badge) => (
@@ -894,139 +898,10 @@ export default function StrategyWorkbench({
               </div>
             )}
 
-            <div className="mt-3 flex gap-2 rounded-lg border border-line px-3 py-2.5 text-xs leading-relaxed text-ink-2">
-              <Info size={14} className="mt-0.5 shrink-0 text-ink-3" />
-              <div>
-                <p>
-                  <span className="font-semibold text-ink">Selection bias.</span>{' '}
-                  <span className="num">{fmtInt(context.priorTrials.count + testedCount)}</span> strategies have been tried on this data window (all runs). Deflated Sharpe Ratio of the
-                  validation segment: <span className="num font-semibold text-ink">{fmtPct(strategy.dsr * 100, false, 1)}</span> – the
-                  probability that the validation Sharpe of <span className="num">{fmtNum(strategy.validation.sharpe)}</span> is real
-                  rather than the luckiest of that many attempts. Below 95% it is not statistically distinguishable from luck.
-                </p>
-                {strategy.holdout && holdoutCi ? (
-                  <p className="mt-1.5">
-                    <span className="font-semibold text-ink">Holdout.</span> Sharpe{' '}
-                    <span className="num font-semibold text-ink">{fmtNum(strategy.holdout.sharpe)}</span>, 95% confidence interval{' '}
-                    <span className="num font-semibold text-ink">
-                      {fmtNum(holdoutCi[0], 1)} to {fmtNum(holdoutCi[1], 1)}
-                    </span>{' '}
-                    from <span className="num">{fmtInt(strategy.holdout.bars)}</span> candles and{' '}
-                    <span className="num">{fmtInt(strategy.holdout.trades)}</span> trades.
-                    {holdoutCi[0] <= 0 ? ' The interval includes zero, so the holdout alone does not prove an edge.' : ''}
-                    {context.priorHoldoutReveals > 0
-                      ? ` This holdout period had already been revealed ${context.priorHoldoutReveals} time${context.priorHoldoutReveals === 1 ? '' : 's'} before this run, so it is no longer untouched data.`
-                      : ''}
-                  </p>
-                ) : null}
-              </div>
-            </div>
-          </Section>
-
-          <Section title="Robustness" hint="Tested on train + validation; the holdout is not used">
-            {report ? (
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  {verdict !== null ? <VerdictPill verdict={verdict} /> : <Pill>{revealed ? 'Verdict pending' : 'Verdict after lock'}</Pill>}
-                  <span className="text-xs text-ink-3">
-                    {verdict === 'Robust'
-                      ? 'Deflated Sharpe of 95% or more, a holdout Sharpe whose 95% interval is above zero and beats Buy & Hold, enough holdout trades, an untouched holdout, live data, and every test below passed.'
-                      : verdict === 'Fragile'
-                        ? 'Survived the holdout, but did not meet every Robust condition:'
-                        : verdict === 'Overfit'
-                          ? 'Rejected:'
-                          : 'A verdict needs the holdout, so only the one locked strategy of a run gets one.'}
-                  </span>
-                </div>
-                {strategy.verdictNotes && strategy.verdictNotes.length > 0 && (
-                  <ul className="list-disc space-y-0.5 pl-5 text-xs text-ink-2">
-                    {strategy.verdictNotes.map((note) => (
-                      <li key={note}>{note}</li>
-                    ))}
-                  </ul>
-                )}
-                <ul className="space-y-1.5">
-                  <TestRow
-                    pass={!report.sensitivity.fragile}
-                    label="Parameter sensitivity (±20%)"
-                    detail={`${report.sensitivity.variants} variants · ROI ${fmtPct(report.sensitivity.baseRoi, true)} → median ${fmtPct(report.sensitivity.medianRoi, true)}, worst ${fmtPct(report.sensitivity.worstRoi, true)} · score ${fmtNum(report.sensitivity.baseFitness)} → median ${fmtNum(report.sensitivity.medianFitness)}, worst ${fmtNum(report.sensitivity.worstFitness)}`}
-                  />
-                  <TestRow
-                    pass={report.topTrades.profitable}
-                    label={`Without the ${report.topTrades.removed} best trades`}
-                    detail={`net PnL ${fmtUsd(report.topTrades.netPnl, true)} → ${fmtUsd(report.topTrades.netPnlWithout, true)}`}
-                  />
-                  {report.crossAsset ? (
-                    <TestRow
-                      pass={report.crossAsset.share >= 2 / 3 - 1e-9}
-                      label="Same rules on other assets"
-                      detail={`profitable on ${report.crossAsset.rows.filter((row) => row.profitable).length} of ${report.crossAsset.rows.length}`}
-                    />
-                  ) : (
-                    <li className="flex items-start gap-2 text-sm text-ink-3">
-                      {analysisPending ? <Loader2 size={15} className="mt-0.5 shrink-0 animate-spin" /> : <Info size={15} className="mt-0.5 shrink-0" />}
-                      {analysisPending ? 'Loading other assets for the cross-asset test…' : 'Cross-asset test not available for this run.'}
-                    </li>
-                  )}
-                  <TestRow
-                    pass={strategy.dsr >= 0.95}
-                    label="Deflated Sharpe ≥ 95%"
-                    detail={fmtPct(strategy.dsr * 100, false, 1)}
-                  />
-                  {strategy.holdout && holdoutCi && (
-                    <>
-                      <TestRow
-                        pass={holdoutCi[0] > 0}
-                        label="Holdout Sharpe 95% interval above zero"
-                        detail={`${fmtNum(holdoutCi[0], 2)} to ${fmtNum(holdoutCi[1], 2)}`}
-                      />
-                      <TestRow
-                        pass={strategy.holdout.sharpe > (benchmark.holdout?.sharpe ?? Infinity)}
-                        label="Holdout Sharpe beats Buy & Hold"
-                        detail={`${fmtNum(strategy.holdout.sharpe)} vs ${fmtNum(benchmark.holdout?.sharpe ?? null)} · ROI ${fmtPct(strategy.holdout.roi, true)} vs ${fmtPct(benchmark.holdout?.roi ?? null, true)}`}
-                      />
-                      <TestRow
-                        pass={(strategy.sample?.holdoutTrades ?? strategy.holdout.trades) >= (strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR)}
-                        label={`At least ${strategy.sample?.gates.holdout ?? MIN_HOLDOUT_TRADES_FLOOR} holdout trades${strategy.sample?.pooled ? ' (pooled over the assets)' : ''}`}
-                        detail={fmtInt(strategy.sample?.holdoutTrades ?? strategy.holdout.trades)}
-                      />
-                    </>
-                  )}
-                </ul>
-                {report.crossAsset && (
-                  <div className="overflow-x-auto rounded-lg border border-line">
-                    <table className="num w-full text-sm">
-                      <thead>
-                        <tr className="border-b border-line bg-raised/50 text-[11px] uppercase tracking-wider text-ink-3">
-                          <th scope="col" className="px-3 py-2 text-left font-medium">Asset (untuned)</th>
-                          <th scope="col" className="px-3 py-2 text-right font-medium">ROI</th>
-                          <th scope="col" className="px-3 py-2 text-right font-medium">Sharpe</th>
-                          <th scope="col" className="px-3 py-2 text-right font-medium">Trades</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {report.crossAsset.rows.map((row) => (
-                          <tr key={row.symbol} className="border-b border-line/70 last:border-b-0">
-                            <th scope="row" className="px-3 py-1.5 text-left font-normal text-ink">{row.symbol}</th>
-                            <td className={cx('px-3 py-1.5 text-right', toneClass(row.roi))}>{fmtPct(row.roi, true)}</td>
-                            <td className="px-3 py-1.5 text-right text-ink-2">{fmtNum(row.sharpe)}</td>
-                            <td className="px-3 py-1.5 text-right text-ink-2">{fmtInt(row.trades)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <p className="flex items-center gap-2 text-sm text-ink-3">
-                <Loader2 size={15} className="animate-spin" /> Running the robustness tests…
-              </p>
-            )}
           </Section>
 
           {strategy.assets.length > 1 && (
-            <Section title="Robust universe" hint="The same rules, scored separately on every asset">
+            <Section title="Per-asset results" hint="The same rules on every asset of the pool">
               <div className="overflow-x-auto rounded-lg border border-line">
                 <table className="num w-full text-sm">
                   <thead>

@@ -1,7 +1,7 @@
 /**
  * Next Entry Forecast card: directional readiness, the exact next-candle close
  * that would fire each entry rule, the resulting fill / stop / target, a
- * rule-by-rule checklist, and (for baskets and universes) a ranked table of
+ * rule-by-rule checklist, and (for baskets and asset pools) a ranked table of
  * every asset. Forecasts are computed by the forecast worker.
  */
 
@@ -142,8 +142,19 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
               value={fmtPrice(forecast.fillPrice)}
               hint="Next-bar open execution (assumed at the trigger close) plus the configured slippage"
             />
-            <PriceRow label="Stop loss" value={fmtPrice(forecast.stopLoss)} />
+            <PriceRow
+              label={forecast.stopMode === 'trailing' ? 'Stop loss (initial, trailing)' : 'Stop loss'}
+              value={fmtPrice(forecast.stopLoss)}
+              hint={
+                forecast.stopMode === 'trailing'
+                  ? `Ratchets ${forecast.trailAtrMult} × ATR behind the best price after every close, and never moves back`
+                  : 'Fixed for the life of the trade (unless the breakeven lock moves it to the entry)'
+              }
+            />
             <PriceRow label="Take profit" value={forecast.takeProfit === null ? 'None – trailing / signal exit' : fmtPrice(forecast.takeProfit)} />
+            {forecast.breakevenAt !== null && (
+              <PriceRow label="Breakeven lock at" value={fmtPrice(forecast.breakevenAt)} hint="At +1R the stop moves to the entry price, from the next candle on" />
+            )}
           </dl>
         </>
       ) : (

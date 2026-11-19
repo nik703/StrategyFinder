@@ -8,7 +8,6 @@ import {
   mutateGenome,
   normalizeGenome,
   parameterAxes,
-  parameterVariants,
   randomGenome,
   stepNeighbours,
   type GenomeLimits,
@@ -112,9 +111,12 @@ describe('EMA / SMA lengths', () => {
     // The same distance as one step of the coarse grid.
     const coarse = stepNeighbours(trend(20, 56), 'long-only', GRID).map((n) => n.longEntry.conditions[0] as Extract<Condition, { ind: 'MA_CROSS' }>);
     expect(coarse.filter((c) => c.slowPeriod === 56 && c.fastPeriod !== 20).map((c) => c.fastPeriod).sort((a, b) => a - b)).toEqual([14, 28]);
-    // ±20% sensitivity checks move to the nearest integers.
-    const pct = parameterVariants(trend(23, 87), 'long-only', INTEGER).map((n) => n.longEntry.conditions[0] as Extract<Condition, { ind: 'MA_CROSS' }>);
-    expect(pct.filter((c) => c.slowPeriod === 87 && c.fastPeriod !== 23).map((c) => c.fastPeriod).sort((a, b) => a - b)).toEqual([18, 28]);
+    // Off the coarse grid the ×√2 step is rounded to the nearest integer: 23 → 16 and 33.
+    const offGrid = stepNeighbours(trend(23, 87), 'long-only', INTEGER).map((n) => n.longEntry.conditions[0] as Extract<Condition, { ind: 'MA_CROSS' }>);
+    expect(offGrid.filter((c) => c.slowPeriod === 87 && c.fastPeriod !== 23).map((c) => c.fastPeriod).sort((a, b) => a - b)).toEqual([
+      Math.round(23 / FINE_STEP),
+      Math.round(23 * FINE_STEP),
+    ]);
   });
 
   it('gives the stability map a ×√2 ladder through the exact length', () => {
@@ -138,6 +140,7 @@ describe('EMA / SMA lengths', () => {
       { id: 'S-1', genome: g, dsr: 0, holdout: null, train: emptyMetrics(), validation: emptyMetrics(), search: emptyMetrics() } as never,
       {
         label: 'BTC-USD',
+        assets: ['BTC-USD'],
         interval: '1d',
         settings: { initialCapital: 10_000, feePct: 0.1, slippagePct: 0.05, tradeMode: 'long-only', sizing: { mode: 'full', riskPct: 2, compounding: true }, fundingPctPerBar: 0 },
         components: [{ symbol: 'BTC-USD', weight: 1 }],

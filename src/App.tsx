@@ -3,42 +3,44 @@
  *
  * The main thread only loads market data, renders the UI and relays messages:
  * every indicator, backtest and optimisation step runs in `optimizer.worker.ts`.
+ *
+ * Layout – one guided flow: (1) the top action bar and the presets, (2) the live discovery
+ * scanner, (3) the ranked leaderboard, (4) the strategy workbench.
  */
 
-import { Activity, Info, Lock, TriangleAlert, X } from 'lucide-react';
+import { Info, Lock, TriangleAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ComparePanel from './components/ComparePanel';
 import ControlBar from './components/ControlBar';
 import Leaderboard, { MAX_COMPARE } from './components/Leaderboard';
 import StrategyWorkbench, { type CrossMarketState } from './components/StrategyWorkbench';
 import TelemetryStrip from './components/TelemetryStrip';
-import { cx, Panel, StepHeader } from './components/ui';
+import TopActionBar from './components/TopActionBar';
+import { Panel, StepHeader } from './components/ui';
 import { buildDataset } from './data/basket';
 import { loadMarketData } from './data/marketData';
 import {
   crossMarketSuggestion,
   DEFAULT_CONFIG,
-  defaultUniverse,
-  isCrypto,
-  parseUniverse,
   resolveAssets,
-  resolveUniverse,
+  resolvePool,
   runSymbols,
   settingsFrom,
   venueLabel,
   type RunConfig,
   type RunContext,
 } from './lib/config';
+import { resetForecastWorker } from './lib/forecastClient';
 import { fmtDate, fmtInt } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
+import { activePreset } from './lib/presets';
+import { clearRunStorage } from './lib/resetRuns';
 import { budgetStatus, estimateSearchWindow, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, windowBudget, type TrialWindow } from './lib/trialLedger';
 import { buildSnapshot, fetchSnapshot, type MarketSnapshot } from './lib/marketSnapshot';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
 import type { EvaluatorConnect } from './engine/evaluation';
 import {
   clampRange,
-  DEFAULT_CRYPTO_UNIVERSE,
-  DEFAULT_STOCK_UNIVERSE,
   type BenchmarkResult,
   type ChartAxis,
   type EngineStatus,
@@ -70,11 +72,8 @@ function evaluatorPoolSize(): number {
   return size >= 2 ? size : 0;
 }
 
-const DEFAULT_UNIVERSES = [DEFAULT_CRYPTO_UNIVERSE.join(', '), DEFAULT_STOCK_UNIVERSE.join(', ')];
-
 const EMPTY_TELEMETRY: ProgressSnapshot = {
   iteration: 0,
-  stagnation: 0,
   evaluations: 0,
   windowTrials: 0,
   fitnessStall: 0,
@@ -140,9 +139,6 @@ export default function App(): JSX.Element {
   const finishedRef = useRef(false);
   /** Analysis requests already sent, keyed by strategy id and run phase. */
   const requestedRef = useRef(new Set<string>());
-  /** Extra assets for the cross-asset test of single-asset runs: loaded once per run. */
-  const extraUniverseRef = useRef<Promise<NamedDataset[]> | null>(null);
-  const extraUniverseSentRef = useRef(false);
 
   const disposePool = useCallback(() => {
     for (const evaluator of evaluatorsRef.current) evaluator.terminate();
@@ -160,18 +156,38 @@ export default function App(): JSX.Element {
 
   useEffect(() => disposeWorker, [disposeWorker]);
 
-  /** Changing the ticker's asset class switches the Robust universe to that class's default. */
   const updateConfig = useCallback((patch: Partial<RunConfig>) => {
     setConfig((current) => {
       const next = { ...current, ...patch };
       // Short timeframes can only load a limited history: clamp the range when the timeframe changes.
       next.range = clampRange(next.interval, next.range);
-      if (patch.symbol !== undefined && isCrypto(patch.symbol) !== isCrypto(current.symbol)) {
-        next.robustUniverse = isCrypto(patch.symbol); // on by default for crypto, off for stocks
-        if (DEFAULT_UNIVERSES.includes(current.universe.trim())) next.universe = defaultUniverse(patch.symbol);
-      }
       return next;
     });
+  }, []);
+
+  /** Forget everything about the current run (results, telemetry, selections) – before a new run or on a reset. */
+  const clearRunState = useCallback(() => {
+    finishedRef.current = false;
+    requestedRef.current = new Set();
+    contextRef.current = null;
+    lastLedgerWrite.current = 0;
+    setError(null);
+    setTelemetry(EMPTY_TELEMETRY);
+    setLeaderboard([]);
+    setBenchmark(null);
+    setAxis(null);
+    setGates(null);
+    setPooledRun(false);
+    setContext(null);
+    setSnapshot(null);
+    setPinned(null);
+    setCompareIds([]);
+    setCrossMarket({});
+    setAnalyses({});
+    setPendingAnalyses({});
+    setLockedId(null);
+    setLockPending(false);
+    setStopReason(null);
   }, []);
 
   /** Progress arrives every 25 iterations (hundreds of times per second on fast data) – paint at most once per frame. */
@@ -254,12 +270,24 @@ export default function App(): JSX.Element {
           setAnalyses((current) => ({ ...current, [message.strategyId]: { report: message.report, verdict: message.verdict } }));
           setPendingAnalyses((current) => ({ ...current, [message.strategyId]: false }));
           break;
-        case 'cross-market':
+        case 'cross-market': {
           setCrossMarket((current) => {
             const previous = current[message.strategyId];
             return { ...current, [message.strategyId]: { status: 'done', symbols: previous?.symbols ?? [], report: message.report } };
           });
+          // The locked strategy's verdict was judged again with the cross-market evidence.
+          const locked = message.locked;
+          if (locked) {
+            setLeaderboard((current) => current.map((entry) => (entry.id === locked.id ? locked : entry)));
+            setPinned((current) => (current && current.id === locked.id ? locked : current));
+            setAnalyses((current) => {
+              const next = { ...current };
+              delete next[locked.id];
+              return next;
+            });
+          }
           break;
+        }
         case 'error':
           setError(message.message);
           setPendingAnalyses({});
@@ -285,50 +313,30 @@ export default function App(): JSX.Element {
       setError(assets.error);
       return;
     }
-    const universe = resolveUniverse(config, assets.components[0].symbol);
-    if (!universe.ok) {
-      setError(universe.error);
+    const pool = resolvePool(config);
+    if (!pool.ok) {
+      setError(pool.error);
       return;
     }
     // Remember the custom tickers of this run so they never have to be typed again.
     saveTickers(assets.components.map((component) => component.symbol));
     disposeWorker();
     const runId = ++runIdRef.current;
-    finishedRef.current = false;
-    requestedRef.current = new Set();
-    extraUniverseRef.current = null;
-    extraUniverseSentRef.current = false;
-    contextRef.current = null;
-    setError(null);
+    clearRunState();
     setStatus('loading');
-    setTelemetry(EMPTY_TELEMETRY);
-    setLeaderboard([]);
-    setBenchmark(null);
-    setAxis(null);
-    setContext(null);
-    setSnapshot(null);
-    setPinned(null);
-    setCompareIds([]);
-    setCrossMarket({});
-    setAnalyses({});
-    setPendingAnalyses({});
-    setLockedId(null);
-    setLockPending(false);
-    setStopReason(null);
-    lastLedgerWrite.current = 0;
     const ledgerRunId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 
     try {
       const tradedSymbols = assets.components.map((component) => component.symbol);
-      const symbols = [...new Set([...tradedSymbols, ...universe.symbols])];
+      const symbols = [...new Set([...tradedSymbols, ...pool.symbols])];
       const loaded = await loadMarketData(symbols, config.interval, config.range);
       if (runId !== runIdRef.current) return; // cancelled while downloading
       const dataset = buildDataset(loaded.series, assets.components);
       const settings = settingsFrom(config);
       const bars = dataset.data.t.length;
-      // The primary asset first; every other universe asset is backtested separately with the same rules.
+      // The primary asset first; every other pool asset is traded separately with the same rules.
       const datasets: NamedDataset[] = [{ symbol: dataset.isBasket ? 'Basket' : tradedSymbols[0], data: dataset.data }];
-      for (const symbol of universe.symbols.slice(1)) {
+      for (const symbol of pool.symbols.slice(1)) {
         datasets.push({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data });
       }
       // Every symbol whose holdout this run can show, over the dates of the primary dataset's holdout.
@@ -348,7 +356,7 @@ export default function App(): JSX.Element {
         return;
       }
       const runContext: RunContext = {
-        label: config.assetMode === 'pool' ? `Pool: ${universe.symbols.join(' · ')}` : dataset.label,
+        label: config.assetMode === 'pool' ? `Pool: ${pool.symbols.join(' · ')}` : dataset.label,
         interval: config.interval,
         range: config.range,
         settings,
@@ -358,7 +366,7 @@ export default function App(): JSX.Element {
         trialWindow,
         priorTrials: prior,
         universe: datasets.map((entry) => entry.symbol),
-        venue: venueLabel((config.assetMode === 'pool' ? universe.symbols : tradedSymbols).map((symbol) => loaded.series[symbol])),
+        venue: venueLabel((config.assetMode === 'pool' ? pool.symbols : tradedSymbols).map((symbol) => loaded.series[symbol])),
         holdoutWindow,
         priorHoldoutReveals: earlier.reduce((sum, entry) => sum + entry.views, 0),
         lastHoldoutReveal: earlier.length > 0 ? earlier[earlier.length - 1].revealedAt : null,
@@ -430,7 +438,7 @@ export default function App(): JSX.Element {
       setError(cause instanceof Error ? cause.message : 'Could not start the optimisation.');
       setStatus('error');
     }
-  }, [config, disposePool, disposeWorker, handleMessage, saveTickers]);
+  }, [config, clearRunState, disposePool, disposeWorker, handleMessage, saveTickers]);
 
   const stop = useCallback(() => {
     if (status === 'optimizing' && workerRef.current) {
@@ -443,41 +451,30 @@ export default function App(): JSX.Element {
     }
   }, [status]);
 
-  /**
-   * Ask the worker for a robustness report. Single-asset runs have no other assets
-   * loaded, so the default universe for the asset class is fetched once and sent along
-   * for the cross-asset test.
-   */
-  const requestAnalysis = useCallback(async (strategy: StrategyResult) => {
+  /** Ask the worker for a robustness report (top-trade removal, stability map, Monte Carlo bands). */
+  const requestAnalysis = useCallback((strategy: StrategyResult) => {
     const worker = workerRef.current;
-    const runContext = contextRef.current;
-    const runId = runIdRef.current;
-    if (!worker || !runContext) return;
+    if (!worker || !contextRef.current) return;
     setPendingAnalyses((current) => ({ ...current, [strategy.id]: true }));
-
-    let universe: NamedDataset[] | undefined;
-    const needsUniverse = !runContext.isBasket && runContext.universe.length <= 1 && !extraUniverseSentRef.current;
-    if (needsUniverse) {
-      const primary = runContext.components[0].symbol;
-      extraUniverseRef.current ??= (async () => {
-        const symbols = parseUniverse(defaultUniverse(primary)).filter((symbol) => symbol !== primary);
-        const loaded = await loadMarketData(symbols, runContext.interval, runContext.range);
-        // Never mix live and simulated candles in one comparison.
-        if (loaded.usedFallback !== runContext.simulated) return [];
-        return symbols.map((symbol) => ({ symbol, data: buildDataset(loaded.series, [{ symbol, weight: 1 }]).data }));
-      })().catch(() => []);
-      universe = await extraUniverseRef.current;
-      if (runId !== runIdRef.current || workerRef.current !== worker) return;
-      extraUniverseSentRef.current = true;
-    }
-    const request: WorkerRequest = {
-      type: 'analyze',
-      strategyId: strategy.id,
-      genome: strategy.genome,
-      universe: universe && universe.length > 0 ? universe : undefined,
-    };
+    const request: WorkerRequest = { type: 'analyze', strategyId: strategy.id, genome: strategy.genome };
     worker.postMessage(request);
   }, []);
+
+  /**
+   * "Reset Runs & Clear Cache" (confirmed in the top bar): terminate every worker, drop every
+   * result held in memory and delete the persistent trial ledger and holdout log, so the next run
+   * starts from a clean 0-trial slate. Settings and saved tickers are kept.
+   */
+  const resetRuns = useCallback(() => {
+    runIdRef.current++; // anything still in flight belongs to a run that no longer exists
+    disposeWorker();
+    resetForecastWorker();
+    clearRunStorage();
+    clearRunState();
+    setStatus('idle');
+    setLedgerVersion((v) => v + 1);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [clearRunState, disposeWorker]);
 
   /** Lock ONE strategy of the finished run and reveal its holdout. The worker refuses a second lock. */
   const lockStrategy = useCallback(
@@ -602,71 +599,45 @@ export default function App(): JSX.Element {
     setError(null);
   }, [budget]);
 
-  // The workbench requests a robustness report (stress curve, stability map, sensitivity): for a
+  // The workbench requests a robustness report (stress curve, stability map, top-trade test): for a
   // strategy the user picked while the run is live, and for whatever it shows once the run has ended.
   // Following the moving #1 during a live run does not, so the search is not slowed down.
   useEffect(() => {
     if (!displayed || !workerRef.current) return;
     if (!(finished || (status === 'optimizing' && pinned !== null))) return;
-    const crossAssetMissing = !context?.isBasket && displayed.robustness?.crossAsset == null;
-    if (displayed.robustness !== null && !crossAssetMissing) return;
+    if (displayed.robustness !== null) return;
     const key = `${displayed.id}|${finished ? 'final' : 'live'}`;
     if (requestedRef.current.has(key)) return;
     requestedRef.current.add(key);
-    void requestAnalysis(displayed);
-  }, [displayed, pinned, status, finished, context, requestAnalysis]);
+    requestAnalysis(displayed);
+  }, [displayed, pinned, status, finished, requestAnalysis]);
 
   const compared = useMemo(
     () => compareIds.map((id) => leaderboard.find((entry) => entry.id === id)).filter((entry): entry is StrategyResult => entry !== undefined),
     [compareIds, leaderboard],
   );
   const crossSuggestion = useMemo(() => (context ? crossMarketSuggestion([...context.universe, ...context.components.map((c) => c.symbol)]).join(', ') : ''), [context]);
+  const preset = useMemo(() => activePreset(config), [config]);
+  /** Robust strategies the scan looks for: the run's, or before the first run the next run's. */
+  const scanTarget = busy || telemetry.iteration > 0 ? telemetry.robustTarget : config.robustTarget;
   /** Where the user is in the guided workflow. */
   const stage = displayed ? 4 : leaderboard.length > 0 ? 3 : busy || telemetry.iteration > 0 ? 2 : 1;
 
-  const STEPS = [
-    { n: 1, label: 'Setup', target: 'step-setup' },
-    { n: 2, label: 'Discover', target: 'step-scan' },
-    { n: 3, label: 'Rank & compare', target: 'step-rank' },
-    { n: 4, label: 'Workbench', target: 'step-workbench' },
-  ];
-
   return (
-    <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col gap-4 px-4 py-5 sm:px-6">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div className="grid h-9 w-9 place-items-center rounded-lg border border-accent/40 bg-accent/15 text-accent-strong">
-            <Activity size={18} />
-          </div>
-          <div>
-            <h1 className="text-lg font-semibold leading-5 text-ink">StrategyFinder</h1>
-            <p className="text-xs text-ink-3">From market to a verified, exportable strategy – with every overfitting check in plain English</p>
-          </div>
-        </div>
-        <nav aria-label="Workflow" className="flex flex-wrap items-center gap-1">
-          {STEPS.map((step, index) => (
-            <span key={step.n} className="inline-flex items-center gap-1">
-              <a
-                href={`#${step.target}`}
-                aria-current={stage === step.n ? 'step' : undefined}
-                className={cx(
-                  'inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs transition-colors',
-                  stage === step.n
-                    ? 'border-accent/60 bg-accent/15 font-semibold text-ink'
-                    : stage > step.n
-                      ? 'border-line text-ink-2 hover:text-ink'
-                      : 'border-line text-ink-3 hover:text-ink-2',
-                )}
-              >
-                <span className="num">{step.n}</span> {step.label}
-              </a>
-              {index < STEPS.length - 1 && <span aria-hidden="true" className="text-ink-3">›</span>}
-            </span>
-          ))}
-        </nav>
-      </header>
+    <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col gap-4 px-4 pb-5 sm:px-6">
+      <TopActionBar
+        status={status}
+        presetTitle={preset?.title ?? null}
+        onRun={() => void start()}
+        onStop={stop}
+        runBlocked={budgetBlocked}
+        budget={budget}
+        onExtendBudget={extendBudget}
+        onReset={resetRuns}
+        stage={stage}
+      />
 
-      <div id="step-setup" className="scroll-mt-4">
+      <div id="step-setup" className="scroll-mt-20">
         <ControlBar
           config={config}
           onChange={updateConfig}
@@ -674,18 +645,14 @@ export default function App(): JSX.Element {
           onSaveTickers={saveTickers}
           onRemoveTicker={forgetTicker}
           status={status}
-          onStart={() => void start()}
-          onStop={stop}
-          budgetBlocked={budgetBlocked}
-          onExtendBudget={extendBudget}
         />
       </div>
 
-      <div id="step-scan" className="scroll-mt-4">
+      <div id="step-scan" className="scroll-mt-20">
         <TelemetryStrip
           maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
+          robustTarget={scanTarget}
           stopReason={stopReason}
-          budget={budget}
           status={status}
           telemetry={telemetry}
           benchmarkSharpe={benchmark?.validation.sharpe ?? null}
@@ -744,7 +711,7 @@ export default function App(): JSX.Element {
         <div className="rounded-lg border border-line bg-panel px-3 py-2 text-xs text-ink-2">{context.notes.join(' · ')}</div>
       )}
 
-      <div id="step-rank" className="scroll-mt-4">
+      <div id="step-rank" className="scroll-mt-20">
         <Leaderboard
           strategies={leaderboard}
           selectedId={displayed?.id ?? null}
@@ -767,7 +734,7 @@ export default function App(): JSX.Element {
         />
       )}
 
-      <div id="step-workbench" ref={workbenchRef} className="scroll-mt-4">
+      <div id="step-workbench" ref={workbenchRef} className="scroll-mt-20">
         {displayed && benchmark && context ? (
           <StrategyWorkbench
             strategy={displayed}
@@ -799,7 +766,7 @@ export default function App(): JSX.Element {
                 ? 'Loading market data…'
                 : busy
                   ? 'Appears as soon as the scanner finds its first strategy.'
-                  : 'Pick a preset or a market above and press Start Discovery. The best strategy opens here automatically; click any leaderboard row to inspect another one.'}
+                  : 'Pick a preset above (or keep the default) and press 1-Click Run. The best strategy opens here automatically; click any leaderboard row to inspect another one.'}
             </p>
           </Panel>
         )}

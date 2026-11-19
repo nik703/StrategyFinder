@@ -25,11 +25,9 @@
 
 import {
   allowsShorts,
-  REGIME_NAMES,
   SLOPE_LAG,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
-  type RegimeMetrics,
   type BacktestSettings,
   type Condition,
   type PerformanceMetrics,
@@ -37,8 +35,7 @@ import {
   type StrategyGenome,
   type TradeGates,
 } from '../types/trading';
-import { sharpeConfidenceInterval, type DeflatedSharpe } from '../lib/stats';
-import { FREE_PARAMETERS } from './genome';
+import { sharpeConfidenceInterval } from '../lib/stats';
 import type { IndicatorCache } from './indicators';
 
 /* -------------------------------------------------------------------------- */
@@ -292,13 +289,8 @@ export class BacktestWorkspace {
 /*  Core simulation                                                           */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Simulate `genome` over the first `bars` candles of the dataset (default: all).
- * Results are written into `ws`. Candles at or beyond `bars` are never read, so a
- * run limited to the search period cannot see the holdout.
- */
 /** ATR lookback used to scale slippage with volatility. */
-export const SLIPPAGE_ATR_PERIOD = 14;
+const SLIPPAGE_ATR_PERIOD = 14;
 
 /**
  * Adverse slippage (as a fraction) of a fill on the candle after `closedIndex`: the larger of the
@@ -313,6 +305,11 @@ export function fillSlippage(settings: BacktestSettings, ind: IndicatorCache, cl
   return scaled > slip ? scaled : slip;
 }
 
+/**
+ * Simulate `genome` over the first `bars` candles of the dataset (default: all).
+ * Results are written into `ws`. Candles at or beyond `bars` are never read, so a
+ * run limited to the search period cannot see the holdout.
+ */
 export function runBacktest(
   ind: IndicatorCache,
   genome: StrategyGenome,
@@ -790,7 +787,7 @@ export function segmentMetrics(
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Folds and market regimes of the search period                             */
+/*  Folds of the search period                                                */
 /* -------------------------------------------------------------------------- */
 
 /** Number of equal, sequential folds the search period is cut into for scoring. */
@@ -804,73 +801,8 @@ export function foldBounds(split: Split): number[] {
   return bounds;
 }
 
-/** Bit flags of `Regimes.mask`, in the order of `REGIME_NAMES`. */
-export const REGIME_BULL = 1;
-export const REGIME_BEAR = 2;
-export const REGIME_HIGH_VOL = 4;
-const REGIME_BITS = [REGIME_BULL, REGIME_BEAR, REGIME_HIGH_VOL] as const;
-/** Bars above this percentile of trailing realised volatility count as "high volatility". */
-export const HIGH_VOL_PERCENTILE = 2 / 3;
-
-/** Regime label of every search-period bar. */
-export interface Regimes {
-  /** Bit mask per bar (REGIME_BULL | REGIME_BEAR | REGIME_HIGH_VOL); 0 during the warm-up and in the holdout. */
-  mask: Uint8Array;
-  /** Search-period bars carrying each label, in `REGIME_NAMES` order. */
-  bars: [number, number, number];
-  /** Search-period length the coverage is measured against. */
-  searchBars: number;
-}
-
-/**
- * Label the search period with market regimes, causally:
- *   bull / bear      – sign of the trailing return over about a quarter of a year;
- *   high volatility  – trailing realised volatility over about a month above the 67th percentile.
- * Each label at bar i uses closes up to bar i only. The volatility threshold is a percentile of
- * the SEARCH period's own volatility, so nothing about the holdout enters the labels. Lookbacks
- * are calendar-based (bars per year), so the same labels mean the same thing on every timeframe,
- * and capped so short histories still get labelled for most of their length.
- */
-export function regimeMask(close: Float64Array, split: Split, periodsPerYear: number): Regimes {
-  const H = split.holdoutStart;
-  const mask = new Uint8Array(close.length);
-  const trendLook = Math.max(5, Math.min(Math.round(periodsPerYear / 4), Math.floor(H / 8)));
-  const volLook = Math.max(5, Math.min(Math.round(periodsPerYear / 12), Math.floor(H / 16)));
-
-  // Trailing realised volatility (std of log returns over `volLook` bars ending at i).
-  const vol = new Float64Array(H).fill(NaN);
-  let sum = 0;
-  let sumSq = 0;
-  for (let i = 1; i < H; i++) {
-    const r = Math.log(close[i] / close[i - 1]);
-    sum += r;
-    sumSq += r * r;
-    if (i > volLook) {
-      const old = Math.log(close[i - volLook] / close[i - volLook - 1]);
-      sum -= old;
-      sumSq -= old * old;
-    }
-    if (i >= volLook) {
-      const mean = sum / volLook;
-      vol[i] = Math.sqrt(Math.max(0, sumSq / volLook - mean * mean));
-    }
-  }
-  const sorted = Array.from(vol).filter((v) => v === v).sort((a, b) => a - b);
-  const threshold = sorted.length > 0 ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * HIGH_VOL_PERCENTILE))] : Infinity;
-
-  const bars: [number, number, number] = [0, 0, 0];
-  for (let i = 0; i < H; i++) {
-    let m = 0;
-    if (i >= trendLook) m |= close[i] > close[i - trendLook] ? REGIME_BULL : REGIME_BEAR;
-    if (vol[i] > threshold) m |= REGIME_HIGH_VOL;
-    mask[i] = m;
-    for (let j = 0; j < 3; j++) if (m & REGIME_BITS[j]) bars[j]++;
-  }
-  return { mask, bars, searchBars: H };
-}
-
 /* -------------------------------------------------------------------------- */
-/*  Search-period metrics: segments, folds and regimes in one pass            */
+/*  Search-period metrics: segments and folds in one pass                     */
 /* -------------------------------------------------------------------------- */
 
 /** Metrics of everything the search may look at. */
@@ -881,8 +813,6 @@ export interface SearchMetrics {
   validation: PerformanceMetrics;
   /** The search period cut into `FOLDS` equal, sequential folds (oldest first). */
   folds: PerformanceMetrics[];
-  /** Bull, bear and high-volatility slices of the search period; null when no regime labels were supplied. */
-  regimes: RegimeMetrics[] | null;
 }
 
 /** Running totals of one segment. Raw power sums let every moment be derived without a second pass. */
@@ -939,8 +869,6 @@ const SEARCH_PART: Partition = { bounds: [], tallies: [newTally()], seg: 0, peak
 const SPLIT_PART: Partition = { bounds: [], tallies: [newTally(), newTally()], seg: 0, peak: 0, tradeSeg: 0, streak: 0 };
 const FOLD_PART: Partition = { bounds: [], tallies: Array.from({ length: FOLDS }, newTally), seg: 0, peak: 0, tradeSeg: 0, streak: 0 };
 const PARTS = [SEARCH_PART, SPLIT_PART, FOLD_PART];
-/** Regime slices: per-bar return sums (s1, s2) and trade totals. */
-const REGIME_ACC = Array.from({ length: 3 }, () => ({ s1: 0, s2: 0, trades: 0, pnl: 0 }));
 
 /** Turn a tally into metrics. Produces the same numbers as `segmentMetrics`. */
 function finishTally(t: Tally, periodsPerYear: number, withTrades: boolean): PerformanceMetrics {
@@ -1001,74 +929,17 @@ function finishTally(t: Tally, periodsPerYear: number, withTrades: boolean): Per
   return m;
 }
 
-/** Reference (slow) regime statistics: walks every search-period bar. Used when there is no trade list. */
-function regimeStatsReference(
-  equity: Float64Array,
-  initialCapital: number,
-  periodsPerYear: number,
-  regimes: Regimes,
-  ws: BacktestWorkspace | null,
-): RegimeMetrics[] {
-  for (const acc of REGIME_ACC) acc.s1 = acc.s2 = acc.trades = acc.pnl = 0;
-  let prev = initialCapital;
-  for (let i = 0; i < regimes.searchBars; i++) {
-    const value = equity[i];
-    const r = prev > 0 ? value / prev - 1 : 0;
-    prev = value;
-    const m = regimes.mask[i];
-    for (let j = 0; j < 3; j++) {
-      if (m & REGIME_BITS[j]) {
-        REGIME_ACC[j].s1 += r;
-        REGIME_ACC[j].s2 += r * r;
-      }
-    }
-  }
-  if (ws !== null) {
-    for (let k = 0; k < ws.tradeCount; k++) {
-      const entry = ws.tradeEntryBar[k];
-      if (entry >= regimes.searchBars) break;
-      const m = regimes.mask[entry];
-      for (let j = 0; j < 3; j++) {
-        if (m & REGIME_BITS[j]) {
-          REGIME_ACC[j].trades++;
-          REGIME_ACC[j].pnl += ws.tradePnl[k];
-        }
-      }
-    }
-  }
-  return finishRegimes(regimes, periodsPerYear);
-}
-
-function finishRegimes(regimes: Regimes, periodsPerYear: number): RegimeMetrics[] {
-  const annualiser = Math.sqrt(periodsPerYear);
-  return REGIME_NAMES.map((regime, j) => {
-    const bars = regimes.bars[j];
-    const acc = REGIME_ACC[j];
-    const mean = bars > 0 ? acc.s1 / bars : 0;
-    const std = bars > 0 ? Math.sqrt(Math.max(0, acc.s2 / bars - mean * mean)) : 0;
-    return {
-      regime,
-      bars,
-      coverage: regimes.searchBars > 0 ? bars / regimes.searchBars : 0,
-      trades: acc.trades,
-      netPnl: acc.pnl,
-      sharpe: std > 1e-12 ? (mean / std) * annualiser : 0,
-    };
-  });
-}
-
 /**
- * Train / validation / combined metrics, the `FOLDS` sequential folds and (with `regimes`) the
- * regime slices of a run that simulated bars `[0, split.holdoutStart)` (or more – anything from
- * the holdout onwards is ignored).
+ * Train / validation / combined metrics and the `FOLDS` sequential folds of a run that simulated
+ * bars `[0, split.holdoutStart)` (or more – anything from the holdout onwards is ignored).
  *
  * This is the optimiser's hottest function after the simulation itself, so it does not walk the
  * whole curve. Outside a trade equity cannot move (no position, no funding, the intrabar low
  * equals the close), so such bars add nothing to returns, drawdown or exposure. Only the bars
  * from each trade's entry to its exit are visited – ONCE – and every view of the period is filled
- * from that single pass: each visited bar's return goes into its segment, its fold and its regime
- * slices. Each segment starts from the equity at its first bar, exactly like `segmentMetrics`,
- * whose results this reproduces.
+ * from that single pass: each visited bar's return goes into its segment and its fold. Each
+ * segment starts from the equity at its first bar, exactly like `segmentMetrics`, whose results
+ * this reproduces.
  */
 export function searchMetrics(
   equity: Float64Array,
@@ -1077,7 +948,6 @@ export function searchMetrics(
   periodsPerYear: number,
   ws: BacktestWorkspace | null,
   equityLow: Float64Array | null = ws ? ws.equityLow : null,
-  regimes: Regimes | null = null,
 ): SearchMetrics {
   const { validationStart, holdoutStart } = split;
   const capitalAt = (bar: number): number => (bar === 0 ? initialCapital : equity[bar - 1]);
@@ -1098,7 +968,6 @@ export function searchMetrics(
       train: seg(0, validationStart),
       validation: seg(validationStart, holdoutStart),
       folds: fb.slice(0, -1).map((from, k) => seg(from, fb[k + 1])),
-      regimes: regimes ? regimeStatsReference(equity, initialCapital, periodsPerYear, regimes, ws) : null,
     };
   }
 
@@ -1109,8 +978,6 @@ export function searchMetrics(
     part.peak = initialCapital;
     part.tallies.forEach((t, s) => resetTally(t, part.bounds[s + 1] - part.bounds[s], capitalAt(part.bounds[s]), capitalAt(part.bounds[s + 1])));
   }
-  for (const acc of REGIME_ACC) acc.s1 = acc.s2 = acc.trades = acc.pnl = 0;
-  const mask = regimes ? regimes.mask : null;
 
   const low = ws.equityLow;
   const { inMarket, tradeEntryBar, tradeExitBar, tradePnl, tradeAmbiguous, tradeCount } = ws;
@@ -1153,21 +1020,6 @@ export function searchMetrics(
         if (value > part.peak) part.peak = value;
         t.exposed += exposed;
       }
-      if (mask !== null && r !== 0) {
-        const m = mask[i];
-        if (m & REGIME_BULL) {
-          REGIME_ACC[0].s1 += r;
-          REGIME_ACC[0].s2 += r2;
-        }
-        if (m & REGIME_BEAR) {
-          REGIME_ACC[1].s1 += r;
-          REGIME_ACC[1].s2 += r2;
-        }
-        if (m & REGIME_HIGH_VOL) {
-          REGIME_ACC[2].s1 += r;
-          REGIME_ACC[2].s2 += r2;
-        }
-      }
     }
     if (to + 1 > cursor) cursor = to + 1;
 
@@ -1199,15 +1051,6 @@ export function searchMetrics(
         if (part.streak > t.worstStreak) t.worstStreak = part.streak;
       }
     }
-    if (mask !== null) {
-      const m = mask[entry];
-      for (let j = 0; j < 3; j++) {
-        if (m & REGIME_BITS[j]) {
-          REGIME_ACC[j].trades++;
-          REGIME_ACC[j].pnl += pnl;
-        }
-      }
-    }
   }
 
   return {
@@ -1215,7 +1058,6 @@ export function searchMetrics(
     train: finishTally(SPLIT_PART.tallies[0], periodsPerYear, true),
     validation: finishTally(SPLIT_PART.tallies[1], periodsPerYear, true),
     folds: FOLD_PART.tallies.map((t) => finishTally(t, periodsPerYear, true)),
-    regimes: regimes ? finishRegimes(regimes, periodsPerYear) : null,
   };
 }
 
@@ -1266,10 +1108,9 @@ export function evaluateSearch(
   ws: BacktestWorkspace,
   split: Split,
   periodsPerYear: number,
-  regimes: Regimes | null = null,
 ): SearchMetrics {
   runBacktest(ind, genome, settings, ws, split.holdoutStart);
-  return searchMetrics(ws.equity, split, settings.initialCapital, periodsPerYear, ws, ws.equityLow, regimes);
+  return searchMetrics(ws.equity, split, settings.initialCapital, periodsPerYear, ws, ws.equityLow);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1314,7 +1155,6 @@ export function benchmarkSearch(
     train: decorateBenchmark(m.train, true),
     validation: decorateBenchmark(m.validation, false),
     folds: m.folds.map((fold, k) => decorateBenchmark(fold, k === 0)),
-    regimes: null,
   };
 }
 
@@ -1389,7 +1229,7 @@ const clampTo = (v: number, min: number, max: number): number => (v < min ? min 
 
 /** Drawdown floor of the Calmar ratio, in percent: a fold that barely dipped is not "infinitely" good. */
 const CALMAR_DD_FLOOR = 2;
-/** Payoff ratio cap of the R-expectancy (a fold without a single loser is not infinitely good either). */
+/** Payoff ratio cap of the R-expectancy (a sample without a single loser is not infinitely good either). */
 const PAYOFF_CAP = 5;
 /** R per year that scores 1 in the edge term (e.g. 0.35 R × 30 trades a year ≈ 10 R). */
 const EDGE_SCALE = 10;
@@ -1413,55 +1253,24 @@ export function edgeRate(m: PerformanceMetrics, periodsPerYear: number): number 
 }
 
 /**
- * Score of one fold on a Sharpe-like scale, every input clamped so no outlier can dominate:
- * 35% Sortino, 25% Sharpe, 20% Calmar (return over drawdown) and 20% expectancy × trade
- * frequency (R a year). The last two reward an edge that pays for its drawdowns and repeats often
- * enough to matter after costs – not just a smooth curve.
+ * Risk-adjusted return of one fold on a Sharpe-like scale: the mean of its Sortino ratio (clamped
+ * to [−3, 4.5], scaled by 1/1.5) and its Calmar ratio (return over drawdown, clamped to ±3), so
+ * neither a fold without losing bars nor one with a tiny drawdown can dominate.
  */
-export function foldScore(m: PerformanceMetrics, periodsPerYear = 0): number {
-  return (
-    0.35 * (clampTo(m.sortino, -3, 4.5) / 1.5) +
-    0.25 * clampTo(m.sharpe, -3, 3) +
-    0.2 * calmar(m) +
-    0.2 * clampTo(edgeRate(m, periodsPerYear) / EDGE_SCALE, -1.5, 3)
-  );
+export function foldScore(m: PerformanceMetrics): number {
+  return 0.5 * (clampTo(m.sortino, -3, 4.5) / 1.5) + 0.5 * calmar(m);
 }
 
 /** A strategy is consistent when at least this many of the five folds made money (scaled to its active folds). */
-export const CONSISTENT_FOLDS = 3;
+const CONSISTENT_FOLDS = 3;
 /** Folds a strategy must be active in (in the market at some point) before flat folds are set aside. */
-export const MIN_ACTIVE_FOLDS = 3;
-/** Fitness bonus for a consistent strategy, and the cost of each profitable fold it is short of one. */
-export const CONSISTENCY_BONUS = 0.5;
-/** Intrabar drawdown inside a single fold beyond which the fold counts as a catastrophe. */
+const MIN_ACTIVE_FOLDS = 3;
+/** Intrabar drawdown inside a single fold beyond which the fold gate fails. */
 export const CATASTROPHIC_FOLD_DRAWDOWN = 0.35;
-/** A regime slice is only judged when it covers at least this share of the search period ... */
-export const REGIME_MIN_COVERAGE = 0.1;
-/** ... and the strategy opened at least this many trades in it. */
-export const REGIME_MIN_TRADES = 10;
-/** Annualised Sharpe below which a strategy has collapsed in a regime slice. */
-export const REGIME_COLLAPSE_SHARPE = -0.5;
-/** Fitness cost of each regime slice the strategy collapses in. */
-export const REGIME_COLLAPSE_PENALTY = 0.75;
-
-/** Linear-interpolation quantile (`q` in [0, 1]) of a list of numbers. */
-export function quantile(values: readonly number[], q: number): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const pos = (sorted.length - 1) * q;
-  const lo = Math.floor(pos);
-  const hi = Math.ceil(pos);
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-}
 
 /** True when the strategy held a position at some point during the fold. */
-export function isActiveFold(fold: PerformanceMetrics): boolean {
+function isActiveFold(fold: PerformanceMetrics): boolean {
   return fold.trades > 0 || fold.exposure > 0;
-}
-
-/** Score of every fold of the search period, oldest first (see `foldScore`). */
-export function foldScores(m: SearchMetrics, periodsPerYear = 0): number[] {
-  return m.folds.map((fold) => foldScore(fold, periodsPerYear));
 }
 
 /**
@@ -1480,126 +1289,64 @@ export function foldsNeeded(judged: number): number {
   return Math.ceil((CONSISTENT_FOLDS / FOLDS) * judged - 1e-9);
 }
 
-/** Regime slices that carry enough bars and trades to be judged. */
-export function testableRegimes(regimes: readonly RegimeMetrics[] | null): RegimeMetrics[] {
-  return (regimes ?? []).filter((r) => r.coverage >= REGIME_MIN_COVERAGE && r.trades >= REGIME_MIN_TRADES);
-}
-
-/** Testable regime slices in which the strategy collapsed (annualised Sharpe below `REGIME_COLLAPSE_SHARPE`). */
-export function collapsedRegimes(regimes: readonly RegimeMetrics[] | null): RegimeMetrics[] {
-  return testableRegimes(regimes).filter((r) => r.sharpe < REGIME_COLLAPSE_SHARPE);
-}
+/** Weights of the three parts of the per-asset score (see `assetBaseScore`). */
+export const FITNESS_WEIGHTS = { riskAdjusted: 1.5, edge: 1, drawdown: 4 } as const;
+/** Search-period drawdown (intrabar, as a fraction) beyond which the drawdown guard starts to cost. */
+export const DRAWDOWN_GUARD = 0.25;
 
 /**
- * True when ALL of a strategy's profit comes from one regime: at least two regime slices are
- * testable, exactly one of them made money, and the strategy collapsed in every other one.
- * Such a strategy is a bet on that regime continuing, not an edge – it is disqualified.
+ * Per-asset score – the single source of truth for ranking strategies (higher is better):
+ *
+ *   + 1.5 × median-fold risk-adjusted return: the MEDIAN over the judged folds of
+ *           ½ Sortino / 1.5 + ½ Calmar (see `foldScore`)
+ *   + 1.0 × expectancy × trade frequency: the R-expectancy of the search period times its trades
+ *           per year, in units of 10 R a year, clamped to [−1.5, 3] (see `edgeRate`)
+ *   − 4.0 × every unit of search-period drawdown beyond 25% (a smooth guard against the blow-ups
+ *           the median of five folds cannot see)
+ *
+ * A fold in which the strategy never held a position is FLAT: when it was active in at least 3
+ * folds, flat folds are left out of the median. Parameter-neighbourhood stability is applied on top
+ * by `plateauFitness`. Statistical significance – the deflated Sharpe ratio – is a GATE, not part of
+ * the score (see `RobustChecks`): the score never depends on how many strategies were tried, so it
+ * stays fixed for the whole run and the search does not hill-climb the validation Sharpe. Nothing
+ * here rewards raw return over Buy & Hold.
  */
-export function isSingleRegime(regimes: readonly RegimeMetrics[] | null): boolean {
-  const testable = testableRegimes(regimes);
-  if (testable.length < 2) return false;
-  const winners = testable.filter((r) => r.sharpe > 0);
-  if (winners.length !== 1) return false;
-  return testable.every((r) => r === winners[0] || r.sharpe < REGIME_COLLAPSE_SHARPE);
-}
-
-/**
- * Per-asset score, everything except the deflated-Sharpe term (which changes as
- * more strategies are tried and is therefore added separately – see `deflatedTerm`):
- *
- *   + 1.50 × MEDIAN of the fold scores (Sortino, Sharpe, Calmar and expectancy × frequency, clamped –
- *     see `foldScore`)
- *   + 0.50 when at least 3 of 5 folds made money, else − 0.50 per profitable fold short of that
- *
- *   A fold in which the strategy never held a position is FLAT: it neither made nor lost money.
- *   When a strategy was active in at least 3 folds, flat folds are left out of the median and the
- *   consistency count (which then asks for 60% of the active folds) – a regime filter that sat out
- *   a bear year did its job and is not punished for it. Below 3 active folds every fold counts.
- *
- *   − 3 (and 6 more per unit beyond 35%) when any single fold suffers a catastrophic drawdown
- *   − drawdown penalty beyond 20% over the whole search period, steeper beyond 45%
- *   − 0.75 for every regime slice (bull, bear, high volatility) the strategy collapses in
- *
- * The median, not a low quantile: a trend follower that sits out a sideways year loses a little in
- * that fold, and grading it on its second-worst fold punished exactly the strategies that work.
- * Consistency is enforced instead by counting profitable folds, and blow-ups by the per-fold
- * drawdown. Nothing here rewards raw return over Buy & Hold.
- */
-export function assetBaseScore(m: SearchMetrics, periodsPerYear = 0): number {
-  const scores = foldScores(m, periodsPerYear);
-  const judged = judgedFolds(m.folds);
-  let score = 1.5 * median(judged.map((k) => scores[k]));
-  const profitable = judged.filter((k) => m.folds[k].roi > 0).length;
-  const needed = foldsNeeded(judged.length);
-  score += profitable >= needed ? CONSISTENCY_BONUS : -CONSISTENCY_BONUS * (needed - profitable);
-  let worstFold = 0;
-  for (const fold of m.folds) if (fold.maxDrawdown > worstFold) worstFold = fold.maxDrawdown;
-  worstFold /= 100;
-  if (worstFold > CATASTROPHIC_FOLD_DRAWDOWN) score -= 3 + 6 * (worstFold - CATASTROPHIC_FOLD_DRAWDOWN);
-  const dd = m.search.maxDrawdown / 100;
-  score -= 4 * Math.max(0, dd - 0.2) + 6 * Math.max(0, dd - 0.45);
-  score -= REGIME_COLLAPSE_PENALTY * collapsedRegimes(m.regimes).length;
-  return score;
-}
-
-/**
- * Deflated-Sharpe contribution to the fitness: 3 × DSR, plus a small slice of the
- * underlying z-score so the search still has a gradient while the DSR is pinned near 0 or 1.
- */
-export function deflatedTerm(d: DeflatedSharpe): number {
-  return 3 * d.probability + 0.25 * clampTo(d.z, -4, 4);
+export function assetBaseScore(m: SearchMetrics, periodsPerYear: number): number {
+  const riskAdjusted = median(judgedFolds(m.folds).map((k) => foldScore(m.folds[k])));
+  const edge = clampTo(edgeRate(m.search, periodsPerYear) / EDGE_SCALE, -1.5, 3);
+  const drawdown = Math.max(0, m.search.maxDrawdown / 100 - DRAWDOWN_GUARD);
+  return FITNESS_WEIGHTS.riskAdjusted * riskAdjusted + FITNESS_WEIGHTS.edge * edge - FITNESS_WEIGHTS.drawdown * drawdown;
 }
 
 export interface FitnessInputs {
-  /** One score per asset: `assetBaseScore + deflatedTerm`. */
+  /** One `assetBaseScore` per asset, the primary asset first. */
   assetScores: number[];
-  /** Train + Validation trades: the primary asset's, or the pooled total over a pooled universe. */
+  /** Train + Validation trades: the primary asset's, or the total over a pooled run. */
   trades: number;
-  /** Validation trades, primary or pooled like `trades`. */
+  /** Validation trades, counted like `trades`. */
   validationTrades: number;
-  /** Trades per year of the search period: the lowest rate of any asset, or the pooled rate. */
+  /** Trades per year of the search period, counted like `trades`. */
   tradesPerYear: number;
   /** The minimum-trade gates of the run's data (see `tradeGatesFor`). */
   gates: TradeGates;
-  /** True when the primary asset makes all of its money in a single market regime (see `isSingleRegime`). */
-  singleRegime: boolean;
-  /** Share of assets that were profitable on validation (0–1). */
-  profitableShare: number;
-  /** Number of tunable parameters. */
-  params: number;
-  /** Reward-to-risk ratio of the exit, or null without a fixed target. */
-  rewardToRisk: number | null;
-  /** Validation win rate of the primary asset, in percent. */
-  validationWinRate: number;
 }
 
 /**
- * Composite fitness used to rank strategies (higher is better).
- *
- *   UNFIT (disqualified) below the minimum-trade gates (see `tradeGatesFor`), or when the primary
- *   asset makes all of its money in one market regime and collapses in the others; otherwise
- *
- *   median of the per-asset scores (a single asset without a universe)
- *   − 1.0 when fewer than 2/3 of the universe is profitable on validation
- *   − 0.15 for every tunable parameter above `FREE_PARAMETERS` (4)
- *   − 0.75 for reward:risk below 1:1, unless the validation win rate clears break-even by 10 points
+ * Point fitness of a strategy: UNFIT (disqualified) below the minimum-trade gates, otherwise the
+ * MEDIAN of its per-asset scores – one asset, or every asset of a pooled run, so one lucky asset
+ * cannot carry the pool. Complexity is capped by the genome (at most `MAX_PARAMETERS` tunable
+ * values), not penalised here.
  */
 export function combineFitness(f: FitnessInputs): number {
-  if (f.assetScores.length === 0 || !passesTradeGates(f) || f.singleRegime) return UNFIT;
-  let score = median(f.assetScores);
-  if (f.assetScores.length > 1 && f.profitableShare < 2 / 3 - 1e-9) score -= 1;
-  score -= 0.15 * Math.max(0, f.params - FREE_PARAMETERS);
-  if (f.rewardToRisk !== null && f.rewardToRisk < 1) {
-    const breakeven = 100 / (1 + f.rewardToRisk);
-    if (f.validationWinRate < breakeven + 10) score -= 0.75;
-  }
+  if (f.assetScores.length === 0 || !passesTradeGates(f)) return UNFIT;
+  const score = median(f.assetScores);
   return Number.isFinite(score) ? score : UNFIT;
 }
 
 /** Weight of the neighbourhood in the rank fitness of a strategy that sits above its neighbours. */
 export const STABILITY_WEIGHT = 0.3;
 /** A neighbour counts as at worst this far below the strategy itself (a disqualified neighbour is not −1000). */
-export const NEIGHBOUR_SPAN = 3;
+const NEIGHBOUR_SPAN = 3;
 
 /**
  * Rank fitness after the parameter-neighbourhood check: a proportional blend of the strategy's own
@@ -1611,9 +1358,18 @@ export const NEIGHBOUR_SPAN = 3;
  * never lifts a score, so it never lifts a strategy over the leaderboard floor.
  */
 export function plateauFitness(point: number, neighbours: readonly number[]): number {
-  if (neighbours.length === 0 || point <= UNFIT) return point;
-  const m = median(neighbours.map((value) => Math.max(value, point - NEIGHBOUR_SPAN)));
+  const m = neighbourhoodMedian(point, neighbours);
+  if (m === null || point <= UNFIT) return point;
   return m < point ? (1 - STABILITY_WEIGHT) * point + STABILITY_WEIGHT * m : point;
+}
+
+/**
+ * The neighbourhood's median fitness exactly as `plateauFitness` uses it: every neighbour counted as
+ * at worst `NEIGHBOUR_SPAN` below the strategy. Null without neighbours.
+ */
+export function neighbourhoodMedian(point: number, neighbours: readonly number[]): number | null {
+  if (neighbours.length === 0) return null;
+  return median(neighbours.map((value) => Math.max(value, point - NEIGHBOUR_SPAN)));
 }
 
 /** True when a strategy clears every hard minimum-trade gate. */
@@ -1640,7 +1396,8 @@ export function passesValidationGate(validation: PerformanceMetrics): boolean {
 
 /**
  * Multi-fold consistency: 3 of 5 folds profitable – counted over the folds the strategy was active
- * in, exactly as the fitness counts them (see `judgedFolds`) – and no fold beyond the drawdown cap.
+ * in, the same folds the fitness takes its median over (see `judgedFolds`) – and no fold beyond the
+ * drawdown cap.
  */
 export function passesFoldGate(folds: readonly PerformanceMetrics[]): boolean {
   if (folds.length === 0) return false;

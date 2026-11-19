@@ -14,15 +14,19 @@
  *   the whole board would turn the holdout into one more selection set.
  * • Strategies with too few trades are disqualified outright (see the gates in
  *   `backtester.ts`).
- * • Fitness is built on the Deflated Sharpe Ratio of the validation segment, so
- *   the bar rises with every strategy that is tried.
- * • With a "Robust universe" the same rules are backtested on every asset and the
- *   median score counts.
+ * • Ranking uses one composite fitness (median-fold Sortino / Calmar, expectancy ×
+ *   trade frequency, parameter-neighbourhood stability – see `assetBaseScore`). The
+ *   Deflated Sharpe Ratio of the validation segment is a GATE: its hurdle rises with
+ *   every strategy tried, on this run and on earlier runs over the same data.
+ * • A multi-asset run trades every asset with the same rules; the trade gates apply to
+ *   the pooled sample and the fitness is the median over the assets.
  *
- * Search: evolutionary hill-climbing with mutation (seeds, mutation of the
- * champion or a rank-biased parent, crossover, random immigrants). It runs until
- * the UI sends `stop` or the configured number of consecutive iterations fails
- * to improve the top fitness score.
+ * Search: evolutionary hill-climbing (textbook seeds, mutation of the cycle's best or
+ * a rank-biased parent, crossover, random immigrants) until the run finds its target
+ * number of robust strategies, spends its evaluation budget, exhausts the search
+ * space, or the UI sends `stop`. When the best fitness stalls for `FITNESS_PATIENCE`
+ * evaluations the population restarts: the top `ELITE_SIZE` strategies are kept and
+ * the rest is re-seeded with fresh random genomes.
  */
 
 import {
@@ -30,7 +34,7 @@ import {
   evaluateSearch,
   holdoutMetrics,
   holdoutShortfalls,
-  median,
+  neighbourhoodMedian,
   passesTradeGates,
   ROBUST_MIN_DSR,
   runBacktest,
@@ -45,11 +49,9 @@ import {
   rankFitness,
   robustChecks,
   sampleCurve,
-  scoreAssets,
   scoreNeighbours,
   sampleOf,
   tradesPerYear,
-  type Asset,
   type AssetScore,
   type CandidateResult,
   type EvalContext,
@@ -68,14 +70,13 @@ import {
   mulberry32,
   mutateGenome,
   parameterAxes,
-  parameterVariants,
   randomGenome,
   repairGenome,
   withParameterValues,
   type GenomeLimits,
   type Rng,
 } from '../engine/genome';
-import { expectedMaxSharpe, haircutSharpe, RunningStats } from '../lib/stats';
+import { expectedMaxSharpe, RunningStats } from '../lib/stats';
 import { monteCarloStress, summarise, tradesFrom, type McTrade } from '../engine/monteCarlo';
 import {
   DEFAULT_ROBUST_TARGET,
@@ -193,7 +194,6 @@ scope.onmessage = (event) => {
   if (message.type === 'analyze') {
     try {
       if (!session) throw new Error('No optimisation run is available to analyse.');
-      if (message.universe) addUniverse(session, message.universe);
       const report = analyze(session, message.genome);
       // A verdict needs the holdout, and only the locked strategy's holdout is ever revealed.
       const locked = session.locked !== null && session.locked.id === message.strategyId ? session.finals.get(message.strategyId) : undefined;
@@ -209,7 +209,15 @@ scope.onmessage = (event) => {
       if (!session) throw new Error('No optimisation run is available.');
       const report = crossMarketCheck(session, message.genome, message.datasets, message.runSymbols ?? []);
       session.crossMarket.set(message.strategyId, report);
-      scope.postMessage({ type: 'cross-market', strategyId: message.strategyId, report });
+      // The locked strategy's verdict depends on the check: judge it again with the new evidence.
+      const final = session.locked?.id === message.strategyId ? session.finals.get(message.strategyId) : undefined;
+      let locked: StrategyResult | undefined;
+      if (final?.robustness) {
+        const { verdict, notes } = judge(session, final.robustness, final);
+        locked = { ...final, verdict, verdictNotes: notes };
+        session.finals.set(final.id, locked);
+      }
+      scope.postMessage({ type: 'cross-market', strategyId: message.strategyId, report, ...(locked ? { locked } : {}) });
     } catch (error) {
       fail(error);
     }
@@ -251,10 +259,8 @@ interface Entry {
   neighbours: NeighbourScore[];
 }
 
-/** A run's state. The scoring context (`assets` = the universe, primary first) is shared with the evaluator pool. */
+/** A run's state. The scoring context (`assets`, primary first) is shared with the evaluator pool. */
 interface Session extends EvalContext {
-  /** Additional assets used only by the cross-asset robustness test. */
-  extra: Asset[];
   mode: TradeMode;
   /** The market hypothesis every strategy of this run is built from. */
   hypothesis: Hypothesis;
@@ -291,17 +297,10 @@ interface Session extends EvalContext {
   crossMarket: Map<string, CrossMarketReport>;
 }
 
-/** Gates for one asset of a pooled universe: the pooled gates shared out over the assets. */
+/** Gates for one asset of a pooled run: the pooled gates shared out over the assets. */
 function perAssetGates(s: Session): Session['gates'] {
   const k = Math.max(1, s.assets.length);
   return { ...s.gates, search: Math.ceil(s.gates.search / k), validation: Math.ceil(s.gates.validation / k), perYear: s.gates.perYear / k };
-}
-
-function addUniverse(s: Session, universe: NamedDataset[]): void {
-  const known = new Set([...s.assets, ...s.extra].map((asset) => asset.symbol));
-  const fresh = universe.filter((dataset) => !known.has(dataset.symbol));
-  const budget = INDICATOR_BUDGET_BYTES / Math.max(1, s.assets.length + s.extra.length + fresh.length);
-  for (const dataset of fresh) s.extra.push(buildAsset(dataset, s.settings, budget));
 }
 
 /** Simple returns between consecutive samples of an equity curve. */
@@ -419,33 +418,35 @@ function seedGenomes(h: Hypothesis, mode: TradeMode, limits: GenomeLimits, rng: 
 /*  Scoring                                                                   */
 /* -------------------------------------------------------------------------- */
 
-/** Re-score the leaderboard against the latest hurdle (it rises as more strategies are tried). */
+/**
+ * Move the luck hurdle to the latest trial count (it rises as more strategies are tried) and
+ * re-check every reported strategy's deflated Sharpe and robustness gates against it. The fitness
+ * does not depend on the hurdle, so the leaderboard order only changes through new entries.
+ */
 function rescoreBoard(s: Session): void {
   s.hurdleTrials = s.trials.count;
   s.hurdleVariance = s.trials.variance;
   s.hurdle = expectedMaxSharpe(s.hurdleTrials, s.hurdleVariance);
   const entries = new Set([...s.board, ...s.robust.values()]);
   for (const entry of entries) {
-    const { fitness, point, neighbourMedian, dsr } = rankFitness(s, entry.result.genome, entry.scores, entry.neighbours);
-    entry.result.fitness = fitness;
-    entry.result.pointFitness = point;
-    entry.result.neighbourMedian = neighbourMedian;
+    const { dsr } = fitnessOf(s, entry.scores);
     entry.result.dsr = dsr;
-    const haircut = haircutSharpe(entry.scores[0].metrics.validation, s.hurdleTrials, s.assets[0].periodsPerYear);
-    entry.result.haircutSharpe = haircut.sharpe;
-    entry.result.haircut = haircut.haircut;
     // The deflated Sharpe falls as trials accrue: a strategy can drop out of the robust set.
     entry.result.robust = robustChecks(s, entry.scores, dsr, entry.neighbours);
   }
   for (const [key, entry] of s.robust) if (!entry.result.robust?.passed) s.robust.delete(key);
-  s.board.sort((a, b) => b.result.fitness - a.result.fitness);
 }
 
-/** Every strategy the run reports: the leaderboard plus robust strategies that fell off it. */
+/**
+ * Every strategy the run reports, in rank order: strategies passing every robustness gate first
+ * (including robust ones that fell off the fitness board), then the rest of the leaderboard, each
+ * group by fitness.
+ */
 function reportedEntries(s: Session): Entry[] {
   const out = [...s.board];
   for (const entry of s.robust.values()) if (!out.includes(entry)) out.push(entry);
-  return out.sort((a, b) => b.result.fitness - a.result.fitness);
+  const passed = (entry: Entry): number => (entry.result.robust?.passed ? 1 : 0);
+  return out.sort((a, b) => passed(b) - passed(a) || b.result.fitness - a.result.fitness);
 }
 
 function searchAssetResults(s: Session, scores: AssetScore[]): AssetResult[] {
@@ -531,70 +532,36 @@ function crossMarketCheck(s: Session, genome: StrategyGenome, datasets: NamedDat
 }
 
 /**
- * Robustness tests on the search period only (the holdout is not touched):
- * ±20% parameter sensitivity, removal of the best trades, the same rules on other assets, and
- * the Monte Carlo execution stress test.
+ * Robustness tests on the search period only (the holdout is not touched): removal of the best
+ * trades, the parameter-stability map and the Monte Carlo execution stress test. (Parameter
+ * stability as a gate is the one-step neighbourhood of `RobustChecks`; generalisation to other
+ * markets is the cross-market check on unseen assets.)
  */
 function analyze(s: Session, genome: StrategyGenome): RobustnessReport {
-  const baseScores = scoreAssets(s, genome).scores;
-  const base = fitnessOf(s, genome, baseScores);
-  const baseRoi = baseScores[0].metrics.search.roi;
-
-  // Top-trade removal – read straight from the primary workspace left by `scoreAssets`.
-  const ws = s.assets[0].ws;
-  const pnls = Array.from(ws.tradePnl.subarray(0, ws.tradeCount)).sort((x, y) => y - x);
+  // Top-trade removal over the sample the strategy was gated on: the primary asset's search-period
+  // trades, or every asset's in a pooled run.
+  const pnls: number[] = [];
+  for (const asset of s.pooled ? s.assets : s.assets.slice(0, 1)) {
+    runBacktest(asset.ind, genome, s.settings, asset.ws, asset.split.holdoutStart);
+    for (let k = 0; k < asset.ws.tradeCount; k++) if (asset.ws.tradeEntryBar[k] < asset.split.holdoutStart) pnls.push(asset.ws.tradePnl[k]);
+  }
+  pnls.sort((x, y) => y - x);
   const removed = Math.min(TOP_TRADES_REMOVED, pnls.length);
   let netPnl = 0;
   for (const pnl of pnls) netPnl += pnl;
   let top = 0;
   for (let k = 0; k < removed; k++) top += pnls[k];
 
-  // Parameter sensitivity.
-  const rois: number[] = [];
-  const fitnesses: number[] = [];
-  for (const variant of parameterVariants(genome, s.mode, s.limits)) {
-    const { scores } = scoreAssets(s, variant);
-    rois.push(scores[0].metrics.search.roi);
-    fitnesses.push(Math.max(UNFIT, fitnessOf(s, variant, scores).fitness));
-  }
-  const worstRoi = rois.length > 0 ? Math.min(...rois) : baseRoi;
-  const worstFitness = fitnesses.length > 0 ? Math.min(...fitnesses) : base.fitness;
-
-  // Cross-asset: the exact rules, untuned, on every other asset we have.
-  const others = [...s.assets, ...s.extra];
-  let crossAsset: RobustnessReport['crossAsset'] = null;
-  if (others.length > 1) {
-    const rows = others.map((asset) => {
-      const m = evaluateSearch(asset.ind, genome, s.settings, asset.ws, asset.split, asset.periodsPerYear).search;
-      return { symbol: asset.symbol, roi: m.roi, sharpe: m.sharpe, trades: m.trades, profitable: m.roi > 0 };
-    });
-    crossAsset = { rows, share: rows.filter((row) => row.profitable).length / rows.length };
-  }
-
-  const monteCarlo = stressTest(s, genome);
-
   return {
-    sensitivity: {
-      variants: rois.length,
-      baseRoi,
-      medianRoi: rois.length > 0 ? medianOf(rois) : baseRoi,
-      worstRoi,
-      baseFitness: base.fitness,
-      medianFitness: fitnesses.length > 0 ? medianOf(fitnesses) : base.fitness,
-      worstFitness,
-      // Fragile: a 20% nudge of one parameter costs more than half of the return (or turns it negative).
-      fragile: baseRoi > 0 ? worstRoi < 0.5 * baseRoi : true,
-    },
     topTrades: { netPnl, netPnlWithout: netPnl - top, removed, profitable: netPnl - top > 0 },
     stability: stabilityGrid(s, genome),
-    crossAsset,
-    monteCarlo,
+    monteCarlo: stressTest(s, genome),
   };
 }
 
 /**
  * Parameter-stability map of the primary asset. The two axes are the parameters whose one-grid-step
- * neighbours move the search-period Sharpe the most (the Stage 2 neighbourhood, read per parameter);
+ * neighbours move the search-period Sharpe the most (the ranking neighbourhood, read per parameter);
  * the map spans `STABILITY_RADIUS` grid steps either side of the chosen values.
  */
 function stabilityGrid(s: Session, genome: StrategyGenome): StabilityGrid | null {
@@ -677,10 +644,13 @@ function stabilityGrid(s: Session, genome: StrategyGenome): StabilityGrid | null
  *             non-positive Sharpe.
  *   Robust  – ALL of the following hold:
  *             • deflated Sharpe of the validation segment ≥ 95%;
+ *             • the search-period gates: validation, fold consistency and a stable one-step
+ *               parameter neighbourhood (see `RobustChecks`);
  *             • holdout Sharpe 95% confidence interval entirely above zero;
  *             • holdout Sharpe above Buy & Hold's holdout Sharpe (risk-adjusted, not raw return);
  *             • at least `gates.holdout` holdout trades (summed over the assets when pooled);
- *             • ±20% parameter sensitivity, top-trade removal and cross-asset tests all pass;
+ *             • profitable without its best trades, and the Monte Carlo stress test passed;
+ *             • generalisation shown: a pooled multi-asset run, or a passed cross-market check;
  *             • the holdout period had never been revealed before (untouched data);
  *             • the run used live market data, not the simulated fallback.
  *   Fragile – anything in between.
@@ -699,14 +669,14 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
 
   const notes: string[] = [];
   if (result.dsr < 0.95) notes.push(`Deflated Sharpe ${pct(result.dsr)} is under 95%: not distinguishable from the luckiest of the strategies tried.`);
-  // With a pooled universe the holdout sample is pooled too.
+  const gates = result.robust;
+  if (gates && !gates.validation) notes.push('Validation gate failed: the validation Sharpe is not above 0.3 with a profit after costs.');
+  if (gates && !gates.folds) notes.push('Fold gate failed: fewer than 3 of 5 search-period slices made money, or one lost more than 35%.');
+  if (gates && !gates.neighbours) notes.push('Parameter neighbourhood: the one-step neighbours do not keep a positive median profit per trade.');
+  // In a pooled run the holdout sample is pooled too.
   const holdoutTrades = result.sample?.holdoutTrades ?? holdout.trades;
   notes.push(...holdoutShortfalls(holdout, finalBenchmark(s).holdout, s.assets[0].periodsPerYear, s.gates.holdout, holdoutTrades));
-  if (report.sensitivity.fragile) notes.push('A ±20% change of one parameter costs more than half of the return.');
   if (!report.topTrades.profitable) notes.push(`Unprofitable without its ${report.topTrades.removed} best trades.`);
-  if (report.crossAsset !== null && report.crossAsset.share < 2 / 3 - 1e-9) {
-    notes.push(`Profitable on only ${Math.round(report.crossAsset.share * 100)}% of the other assets (two thirds needed).`);
-  }
   const mc = report.monteCarlo;
   if (mc && !mc.passed) {
     notes.push(
@@ -717,6 +687,8 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
   const cross = s.crossMarket.get(result.id);
   if (cross && cross.tested > 0 && !cross.passed) {
     notes.push(`Cross-market check: profitable on ${Math.round(cross.share * 100)}% of ${cross.tested} unseen assets, median Sharpe ${cross.medianSharpe.toFixed(2)}.`);
+  } else if (!s.pooled && !(cross && cross.passed)) {
+    notes.push('Generalisation not shown yet: run the cross-market check on unseen markets (or pool several assets in the run).');
   }
   const lock = s.locked;
   if (lock !== null && lock.priorReveals > 0) {
@@ -742,7 +714,7 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     const asset = s.assets[a];
     // Train / validation figures stay exactly what the search ranked on: a backtest that ends at
     // the holdout boundary (any open trade is closed there, with costs) ...
-    const m = evaluateSearch(asset.ind, base.genome, s.settings, asset.ws, asset.split, asset.periodsPerYear, asset.regimes);
+    const m = evaluateSearch(asset.ind, base.genome, s.settings, asset.ws, asset.split, asset.periodsPerYear);
     // ... and only the holdout comes from a backtest over the whole history.
     runBacktest(asset.ind, base.genome, s.settings, asset.ws);
     assets[a] = {
@@ -759,7 +731,6 @@ function revealHoldout(s: Session, base: StrategyResult): StrategyResult {
     train: primary.train,
     validation: primary.validation,
     folds: primary.folds,
-    regimes: primary.regimes,
     holdout: primary.holdout,
     alpha: primary.search.roi - s.assets[0].benchmark.search.roi,
     equity,
@@ -918,7 +889,6 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
 
   const s: Session = {
     ...ctx,
-    extra: [],
     mode: settings.tradeMode,
     hypothesis,
     // The ledger stores annualised Sharpe ratios; the hurdle works per bar of the primary asset.
@@ -963,17 +933,20 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const seen = new Set<string>();
   const seeds = seedGenomes(hypothesis, mode, limits, rng);
   let iteration = 0;
-  /** Proposals since the top fitness last improved (informational). */
-  let stagnation = 0;
   /** Unique, trading strategies evaluated by this run: its trials. */
   let evaluations = 0;
-  /** Evaluations since a candidate last improved the best fitness on the board. */
+  /** Evaluations since a candidate last improved the best fitness on the board (a restart at `FITNESS_PATIENCE`). */
   let fitnessStall = 0;
-  /** Population cycle (1, +1 at every diversity restart) and the iteration it started at. */
+  /** Population cycle: 1, then +1 at every diversity restart. */
   let cycle = 1;
-  let cycleStart = 0;
-  /** Elite strategies kept across restarts (the best of the board at each restart). */
-  const hallOfFame: StrategyGenome[] = [];
+  /** The best `ELITE_SIZE` strategies of the board at the last restart: they survive it. */
+  let elite: StrategyGenome[] = [];
+  /**
+   * After a restart, the re-seeded part of the population: the best candidates scored since the
+   * restart (by fitness, whether or not they made the leaderboard), so fresh genomes are evolved
+   * rather than only sampled.
+   */
+  let cyclePool: { genome: StrategyGenome; fitness: number }[] = [];
   /** Proposals since the last new (non-duplicate, trading) evaluation. */
   let sinceNew = 0;
   /** Trade-log fingerprints registered since the last batch was sent to the evaluators. */
@@ -986,10 +959,9 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
 
   const snapshot = (): ProgressSnapshot => {
     let leader: StrategyResult | null = null;
-    for (const entry of board) if (leader === null || entry.result.dsr > leader.dsr) leader = entry.result;
+    for (const entry of [...board, ...s.robust.values()]) if (leader === null || entry.result.dsr > leader.dsr) leader = entry.result;
     return {
       iteration,
-      stagnation,
       evaluations,
       windowTrials: prior.count + evaluations,
       fitnessStall,
@@ -1016,17 +988,25 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   };
 
   /**
-   * The parent population of the current cycle: strategies found since the last restart, ranked by
-   * fitness, after the hall of fame (the elite kept at the restarts). In the first cycle that is
-   * simply the leaderboard.
+   * The parent population of the current cycle, best first. In the first cycle it is the
+   * leaderboard. After a restart it is the cycle's own best candidates (the re-seeded part), then
+   * the elite: the fresh genomes lead and are hill-climbed, while the elite still breed through
+   * crossover and rank-biased picks without pulling every mutation back to the optimum the run had
+   * stalled on.
    */
   let parents: StrategyGenome[] = [];
   const refreshParents = (): void => {
-    const fresh = board.filter((entry) => entry.result.foundAt >= cycleStart).map((entry) => entry.result.genome);
-    // After a restart the cycle's own discoveries lead (and are hill-climbed); the elite follow, so
-    // they still breed through crossover and rank-biased picks without pulling every mutation back
-    // to the optimum the run had stalled on.
-    parents = cycle === 1 ? board.map((entry) => entry.result.genome) : [...fresh, ...hallOfFame.slice(-ELITE_SIZE)];
+    parents = cycle === 1 ? board.map((entry) => entry.result.genome) : [...cyclePool.map((member) => member.genome), ...elite];
+  };
+  /** Offer a fully scored candidate to the re-seeded part of the population (cycles after the first). */
+  const joinCyclePool = (genome: StrategyGenome, fitness: number): void => {
+    if (cycle === 1 || !(fitness > UNFIT)) return;
+    const capacity = LEADERBOARD_SIZE - ELITE_SIZE;
+    if (cyclePool.length >= capacity && fitness <= cyclePool[cyclePool.length - 1].fitness) return;
+    let at = cyclePool.length;
+    while (at > 0 && cyclePool[at - 1].fitness < fitness) at--;
+    cyclePool.splice(at, 0, { genome, fitness });
+    if (cyclePool.length > capacity) cyclePool.length = capacity;
   };
   /** Rank-biased parent selection: quadratic bias towards the top of the parent population. */
   const pickParent = (): StrategyGenome => parents[Math.floor(rng() * rng() * parents.length)];
@@ -1046,18 +1026,16 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   };
 
   /**
-   * Diversity restart: keep the best `ELITE_SIZE` strategies in the hall of fame and re-seed the rest
-   * of the parent population with fresh random single- and dual-indicator genomes, so a long scan
-   * escapes the local optimum it has stalled on instead of looping on minor tweaks.
+   * Diversity restart: keep the best `ELITE_SIZE` strategies of the board as the elite and re-seed
+   * the rest of the parent population with fresh random single- and dual-indicator genomes, so a
+   * long scan escapes the local optimum it has stalled on instead of looping on minor tweaks – and
+   * keeps scanning instead of stopping. The leaderboard and the robust archive are untouched.
    */
   const restart = (): void => {
     cycle++;
-    cycleStart = iteration;
     fitnessStall = 0;
-    for (const entry of board.slice(0, ELITE_SIZE)) {
-      const signature = genomeSignature(entry.result.genome);
-      if (!hallOfFame.some((g) => genomeSignature(g) === signature)) hallOfFame.push(entry.result.genome);
-    }
+    elite = board.slice(0, ELITE_SIZE).map((entry) => entry.result.genome);
+    cyclePool = [];
     for (let k = 0; k < 2 * SEED_POPULATION; k++) seeds.push(randomGenome(rng, mode, limits, hypothesis));
     refreshParents();
   };
@@ -1074,13 +1052,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   interface Outcome {
     /** False when the candidate was not a trial: it never traded, or repeated a known trade log. */
     trial: boolean;
-    /** The top fitness improved. */
-    improvedFitness: boolean;
-    /** The candidate entered the board with a deflated Sharpe above the board's best. */
-    /** The top fitness improved by at least `FITNESS_MIN_GAIN` (resets the early-stopping clock). */
-    improvedMeaningfully: boolean;
+    /** The best fitness on the board improved by at least `FITNESS_MIN_GAIN` (resets the restart clock). */
+    improved: boolean;
   }
-  const NOT_A_TRIAL: Outcome = { trial: false, improvedFitness: false, improvedMeaningfully: false };
+  const NOT_A_TRIAL: Outcome = { trial: false, improved: false };
 
   /** A leaderboard / robust-archive entry for a fully scored candidate. */
   const buildEntry = (
@@ -1096,8 +1071,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const primaryMetrics = scores[0].metrics;
     const equity = curve ?? evaluated.curve ?? primaryCurve(genome);
     const monteCarlo = summarise(stressTest(s, genome));
-    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.genome, nb.scores).fitness);
-    const haircut = haircutSharpe(primaryMetrics.validation, s.hurdleTrials, primary.periodsPerYear);
+    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.scores).fitness);
     return {
       niche: genomeNiche(genome),
       fingerprint,
@@ -1109,11 +1083,9 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         genome,
         fitness,
         pointFitness,
-        neighbourMedian: neighbourValues.length > 0 ? median(neighbourValues) : null,
+        neighbourMedian: neighbourhoodMedian(pointFitness, neighbourValues),
         neighbourCount: neighbourValues.length,
         dsr,
-        haircutSharpe: haircut.sharpe,
-        haircut: haircut.haircut,
         params: countParameters(genome, limits),
         sample: { ...sampleOf(s, scores), holdoutTrades: null, gates: s.gates, pooled: s.pooled },
         robust,
@@ -1121,7 +1093,6 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         train: primaryMetrics.train,
         validation: primaryMetrics.validation,
         folds: primaryMetrics.folds,
-        regimes: primaryMetrics.regimes,
         holdout: null,
         alpha: primaryMetrics.search.roi - primary.benchmark.search.roi,
         equity,
@@ -1155,7 +1126,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     // Every new, trading strategy is a trial, whether or not it makes the leaderboard.
     s.trials.push(primaryMetrics.validation.sharpeRaw);
     s.runTrials.push(primaryMetrics.validation.sharpeRaw * annualiser);
-    const trialOnly: Outcome = { trial: true, improvedFitness: false, improvedMeaningfully: false };
+    const trialOnly: Outcome = { trial: true, improved: false };
     if (!complete) return trialOnly;
 
     // Robustness funnel: which gates this candidate clears on its own (the neighbourhood comes later).
@@ -1171,13 +1142,14 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       if (isUndersampled(scores)) s.undersampled++;
       return trialOnly;
     }
+    joinCyclePool(genome, fitness);
     const fingerprint = tradeHash ?? genomeSignature(genome);
     // A candidate that clears every other gate always gets its neighbourhood checked, even when its
     // fitness would not make the leaderboard: it may be one of the robust strategies the run is after.
     if (cheap.validation && cheap.folds && cheap.significance && !s.robust.has(fingerprint)) {
       if (neighbours === null) {
         neighbours = scoreNeighbours(s, genome);
-        fitness = rankFitness(s, genome, scores, neighbours).fitness;
+        fitness = rankFitness(s, scores, neighbours).fitness;
       }
       funnel.neighboursChecked++;
       const checks = robustChecks(s, scores, dsr, neighbours);
@@ -1196,7 +1168,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       // Rare: the candidate did not beat the round's frozen floor, but the board has since shrunk.
       // Nothing enters the board without its neighbourhood cap.
       neighbours = scoreNeighbours(s, genome);
-      fitness = rankFitness(s, genome, scores, neighbours).fitness;
+      fitness = rankFitness(s, scores, neighbours).fitness;
     }
     const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return trialOnly;
@@ -1240,7 +1212,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     if (board.length > LEADERBOARD_SIZE) board.length = LEADERBOARD_SIZE;
     boardDirty = true;
     const onBoard = board.includes(entry);
-    return { trial: true, improvedFitness: onBoard && fitness > best + 1e-9, improvedMeaningfully: onBoard && fitness > best + FITNESS_MIN_GAIN };
+    return { trial: true, improved: onBoard && fitness > best + FITNESS_MIN_GAIN };
   };
 
   /** Propose a candidate the search has not proposed before (a few retries, then accept the repeat). */
@@ -1328,11 +1300,10 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       considered++;
       const outcome = candidate.duplicate ? NOT_A_TRIAL : consider(candidate.genome, results[next++]);
       if (candidate.duplicate) s.duplicates++;
-      stagnation = outcome.improvedFitness ? 0 : stagnation + 1;
       if (outcome.trial) {
         evaluations++;
         sinceNew = 0;
-        fitnessStall = outcome.improvedMeaningfully ? 0 : fitnessStall + 1;
+        fitnessStall = outcome.improved ? 0 : fitnessStall + 1;
       } else {
         sinceNew++;
       }

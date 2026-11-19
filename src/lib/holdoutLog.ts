@@ -9,7 +9,7 @@
  * shares at least one symbol AND its date window overlaps. The log is therefore
  * not fooled by the things that used to reset it: a new end date the next day,
  * a different range (the 1y / 2y / 5y holdouts are nested), another timeframe
- * over the same dates, or adding a symbol to the universe.
+ * over the same dates, or adding a symbol to the pool.
  */
 
 import { splitFor } from '../engine/backtester';
@@ -18,11 +18,13 @@ import { INTERVAL_MS, RANGE_DAYS, type HistoryRange, type Interval } from '../ty
 const STORAGE_KEY = 'strategyfinder.holdoutReveals.v2';
 /** Pre-v2 log: reveal counts keyed by `symbols|interval|range|endDate`. Migrated on first read. */
 const LEGACY_KEY = 'strategyfinder.holdoutViews.v1';
+/** Every localStorage key of the holdout log (cleared by "Reset Runs & Clear Cache"). */
+export const HOLDOUT_LOG_KEYS: readonly string[] = [STORAGE_KEY, LEGACY_KEY];
 const DAY_MS = 86_400_000;
 
 /** The market period a run's holdout covers. */
 export interface HoldoutWindow {
-  /** Every symbol whose holdout the run can show (traded assets and universe), upper case, sorted. */
+  /** Every symbol whose holdout the run can show (every traded asset), upper case, sorted. */
   symbols: string[];
   interval: Interval;
   /** Open time of the first holdout candle (ms). */

@@ -102,6 +102,12 @@ describe('plain-English diagnostics', () => {
     expect(locked.tone).toBe('weak');
     expect(locked.headline).toMatch(/did not hold up/);
     expect(locked.risks[0]).toContain('Lost money on the holdout');
+    // The small-sample warning counts the sample the gates counted: pooled over the assets of a pool.
+    const pooledSample = { trades: 160, validationTrades: 30, holdoutTrades: null, gates: { search: 60, validation: 15, perYear: 15, holdout: 15 }, pooled: true };
+    const thinPrimary = strategy({ validation: { ...emptyMetrics(), trades: 4 }, sample: pooledSample });
+    expect(strategyVerdict({ strategy: thinPrimary, report: null, crossMarket: null, trials: 5000 }).risks.join(' ')).not.toMatch(/small sample/);
+    const thinPool = strategy({ validation: { ...emptyMetrics(), trades: 4 }, sample: { ...pooledSample, validationTrades: 12 } });
+    expect(strategyVerdict({ strategy: thinPool, report: null, crossMarket: null, trials: 5000 }).risks.join(' ')).toMatch(/Only 12 trades in the validation period \(pooled over the assets\)/);
     // Overfit only because of the deflated Sharpe: the holdout made money, and the verdict says so.
     const lucky = strategy({
       dsr: 0.04,
@@ -128,6 +134,8 @@ describe('presets', () => {
       expect(config.slippagePct).toBeGreaterThan(0);
     }
     expect(PRESETS.map((p) => p.patch.tradeMode)).toEqual(['long-only', 'asymmetric', 'long-only', 'long-short']);
-    expect(activePreset(DEFAULT_CONFIG)).toBeNull();
+    // The app opens on the first preset: Crypto Multi-Asset Swing (4h).
+    expect(activePreset(DEFAULT_CONFIG)?.id).toBe('crypto-swing-4h');
+    expect(DEFAULT_CONFIG).toMatchObject({ assetMode: 'pool', interval: '4h', range: '2y', tradeMode: 'long-only', hypothesis: 'VOL_BREAKOUT' });
   });
 });

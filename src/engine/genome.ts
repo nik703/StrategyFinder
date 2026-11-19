@@ -165,12 +165,8 @@ export const GRIDS = {
 
 /** One entry trigger plus at most ONE filter. */
 export const MAX_CONDITIONS = 2;
-/** Indicator-reversal exits are a single condition. */
-export const MAX_EXIT_CONDITIONS = 1;
-/** Hard cap on the number of tunable numbers in a strategy. */
+/** Hard cap on the number of tunable numbers in a strategy (an Asymmetric short regime filter gets one more). */
 export const MAX_PARAMETERS = 5;
-/** Parameters above this count cost fitness. */
-export const FREE_PARAMETERS = 4;
 /** "Short-term" triggers look back at most this many bars; regime filters at least `SLOW_LOOKBACK`. */
 export const SHORT_LOOKBACK = 30;
 export const SLOW_LOOKBACK = 100;
@@ -1042,11 +1038,6 @@ export function hypothesisFilter(rng: Rng, h: Hypothesis, limits: GenomeLimits, 
   );
 }
 
-/** The primitives of every slot of `h` (for the UI and tests). */
-export function hypothesisPrimitives(h: Hypothesis): HypothesisSlots {
-  return SLOTS[h];
-}
-
 /* -------------------------------------------------------------------------- */
 /*  Asymmetric L/S: the short side's own bear-regime filter                  */
 /* -------------------------------------------------------------------------- */
@@ -1724,52 +1715,32 @@ export function crossoverGenomes(
 }
 
 /**
- * How a neighbour moves one parameter:
- *   pct20 – ±20%, snapped to the grid (the adjacent grid value when ±20% rounds back) – the
- *           post-run sensitivity report;
- *   step  – exactly one grid step down and one up – the neighbourhood used for ranking.
+ * The one-step parameter neighbourhood of a strategy – the single definition of "nearby settings"
+ * used by the ranking (`plateauFitness`) and the neighbourhood gate. Each tunable parameter is moved
+ * one grid step down and one up while every other parameter stays put; on an every-integer EMA / SMA
+ * axis one step is the geometric grid's spacing (×√2), not ±1, because EMA(50) vs EMA(51) would
+ * always look stable and let a fine-tuned spike through. Variants that would break the archetype, or
+ * that normalise back to an already listed genome, are skipped.
  */
-export type NeighbourKind = 'pct20' | 'step';
-
-/**
- * Every single-parameter neighbour of a strategy (see `NeighbourKind`). Each tunable
- * parameter is moved down and up once while every other parameter stays put.
- * Variants that would break the archetype, or that normalise back to an already
- * listed genome, are skipped.
- */
-export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits, kind: NeighbourKind = 'pct20'): StrategyGenome[] {
+export function stepNeighbours(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
   const base = normalizeGenome(g, mode, limits);
-  const baseSignature = genomeSignature(base);
-  const seen = new Set<string>([baseSignature]);
+  const seen = new Set<string>([genomeSignature(base)]);
   const variants: StrategyGenome[] = [];
   const count = parameterHandles(cloneGenome(base), limits).length;
   for (let index = 0; index < count; index++) {
-    for (const factor of [0.8, 1.2]) {
+    for (const dir of [-1, 1] as const) {
       const copy = cloneGenome(base);
       const handle = parameterHandles(copy, limits)[index];
       if (!handle || handle.grid.length < 2) continue;
       const current = snap(handle.get(), handle.grid);
-      const at = handle.grid.indexOf(current);
-      let next: number;
-      if (kind === 'step' && handle.fine) {
-        // One "step" on an every-integer axis is the geometric grid's spacing (×√2), not ±1:
-        // EMA(50) vs EMA(51) would always look stable and let a fine-tuned spike through.
-        const neighbour = fineStep(current, handle.grid, factor < 1 ? -1 : 1);
-        if (neighbour === null) continue;
-        next = neighbour;
-      } else if (kind === 'step') {
-        const neighbour = at + (factor < 1 ? -1 : 1);
-        if (neighbour < 0 || neighbour >= handle.grid.length) continue;
-        next = handle.grid[neighbour];
+      let next: number | null;
+      if (handle.fine) {
+        next = fineStep(current, handle.grid, dir);
       } else {
-        const target = current * factor;
-        next = snap(target, handle.grid);
-        if (next === current) {
-          const neighbour = at + (target < current ? -1 : 1);
-          if (neighbour < 0 || neighbour >= handle.grid.length) continue;
-          next = handle.grid[neighbour];
-        }
+        const at = handle.grid.indexOf(current) + dir;
+        next = at >= 0 && at < handle.grid.length ? handle.grid[at] : null;
       }
+      if (next === null) continue;
       handle.set(next);
       const variant = normalizeGenome(copy, mode, limits);
       const signature = genomeSignature(variant);
@@ -1779,11 +1750,6 @@ export function parameterVariants(g: StrategyGenome, mode: TradeMode, limits: Ge
     }
   }
   return variants;
-}
-
-/** The one-grid-step parameter neighbourhood used to rank strategies by plateau, not spike. */
-export function stepNeighbours(g: StrategyGenome, mode: TradeMode, limits: GenomeLimits): StrategyGenome[] {
-  return parameterVariants(g, mode, limits, 'step');
 }
 
 /* -------------------------------------------------------------------------- */

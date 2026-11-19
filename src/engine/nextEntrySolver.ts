@@ -89,9 +89,16 @@ export interface SideForecast {
   activeRange: [number | null, number | null] | null;
   /** Estimated fill at the following open, including the configured slippage. */
   fillPrice: number | null;
+  /** Initial stop at the fill (the backtester's level: ATR of the signal candle, or % of the fill). */
   stopLoss: number | null;
   /** Null when the exit has no fixed target (trailing / reversal / time stop). */
   takeProfit: number | null;
+  /** 'trailing': the stop ratchets `trailAtrMult` × ATR behind the best price after every close; null without a stop. */
+  stopMode: 'fixed' | 'trailing' | null;
+  /** Trailing distance in ATRs (null for a fixed stop). */
+  trailAtrMult: number | null;
+  /** Breakeven lock: the price at +1R that moves the stop to the entry (null without a lock). */
+  breakevenAt: number | null;
   blockers: Blocker[];
   /** Why the side cannot enter (unreachable / disabled / holding). */
   reason: string | null;
@@ -494,24 +501,37 @@ function blockerDetail(check: ConditionCheck): string {
 /*  Exit levels at an entry                                                   */
 /* -------------------------------------------------------------------------- */
 
-function exitLevels(
+/**
+ * The exit levels an entry filled at `fill` starts with – exactly the backtester's: the stop and
+ * target from the ATR of the signal candle (or a % of the fill), how the stop is then managed
+ * (fixed, or trailing k × ATR behind the best price) and where the breakeven lock (+1R) would
+ * move it to the entry.
+ */
+export function exitLevels(
   genome: StrategyGenome,
   side: Side,
   fill: number,
   atrAtSignal: number,
-): { stopLoss: number | null; takeProfit: number | null } {
+): Pick<SideForecast, 'stopLoss' | 'takeProfit' | 'stopMode' | 'trailAtrMult' | 'breakevenAt'> {
   const dir = side === 'long' ? 1 : -1;
   const { exit } = genome;
+  let stopLoss: number | null = null;
+  let takeProfit: number | null = null;
   if (exit.mode === 'static') {
-    return {
-      stopLoss: fill * (1 - (dir * exit.stopLossPct) / 100),
-      takeProfit: fill * (1 + (dir * exit.takeProfitPct) / 100),
-    };
+    stopLoss = fill * (1 - (dir * exit.stopLossPct) / 100);
+    takeProfit = fill * (1 + (dir * exit.takeProfitPct) / 100);
+  } else if (atrAtSignal > 0) {
+    stopLoss = fill - dir * exit.stopAtrMult * atrAtSignal;
+    takeProfit = exit.takeProfitAtrMult === null ? null : fill + dir * exit.takeProfitAtrMult * atrAtSignal;
   }
-  if (!(atrAtSignal > 0)) return { stopLoss: null, takeProfit: null };
+  const trailing = exit.mode === 'dynamic' && exit.trailing && stopLoss !== null;
   return {
-    stopLoss: fill - dir * exit.stopAtrMult * atrAtSignal,
-    takeProfit: exit.takeProfitAtrMult === null ? null : fill + dir * exit.takeProfitAtrMult * atrAtSignal,
+    stopLoss,
+    takeProfit,
+    stopMode: stopLoss === null ? null : trailing ? 'trailing' : 'fixed',
+    trailAtrMult: trailing && exit.mode === 'dynamic' ? exit.stopAtrMult : null,
+    // 1R is the initial stop distance.
+    breakevenAt: exit.breakeven === true && stopLoss !== null ? fill + (fill - stopLoss) : null,
   };
 }
 
@@ -650,6 +670,9 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       fillPrice: null,
       stopLoss: null,
       takeProfit: null,
+      stopMode: null,
+      trailAtrMult: null,
+      breakevenAt: null,
       blockers: [],
       reason: null,
       conflict: null,

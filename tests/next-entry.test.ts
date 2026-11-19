@@ -106,6 +106,18 @@ function verifyTrigger(data: OHLCV, genome: StrategyGenome, settings: BacktestSe
     // The quoted fill is exactly the entry price the backtester records (same slippage rule).
     const recorded = ws.openPosition?.entryPrice as number;
     expect(Math.abs(recorded / (side.fillPrice as number) - 1)).toBeLessThan(1e-9);
+    // The quoted initial stop is the backtester's (1R = its initial stop distance), and so is the
+    // breakeven level; the stop mode says whether the backtester will trail it.
+    const open = ws.openPosition;
+    if (open && side.stopLoss !== null) {
+      const dir = side.side === 'long' ? 1 : -1;
+      expect(Math.abs((open.entryPrice - dir * open.risk) / side.stopLoss - 1)).toBeLessThan(1e-6);
+      if (genome.exit.breakeven) expect(Math.abs((side.breakevenAt as number) / (open.entryPrice + dir * open.risk) - 1)).toBeLessThan(1e-6);
+      else expect(side.breakevenAt).toBeNull();
+      const trailing = genome.exit.mode === 'dynamic' && genome.exit.trailing;
+      expect(side.stopMode).toBe(trailing ? 'trailing' : 'fixed');
+      expect(side.trailAtrMult).toBe(trailing && genome.exit.mode === 'dynamic' ? genome.exit.stopAtrMult : null);
+    }
   }
 }
 

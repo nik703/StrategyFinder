@@ -1,7 +1,7 @@
 /**
  * Trial ledger: every strategy evaluated on a data window, across runs and sessions.
  *
- * The deflated Sharpe ratio and the haircut Sharpe only protect against luck if they know how
+ * The deflated Sharpe ratio only protects against luck if it knows how
  * many strategies were really tried on the data. A run that started from zero every time would let
  * a user run the optimiser ten times and pick the luckiest run. So every run records its trials
  * here – count, mean and spread of their annualised Sharpe ratios – in localStorage, keyed by the
@@ -29,6 +29,8 @@ import {
 
 const STORAGE_KEY = 'strategyfinder.trialLedger.v1';
 const EXTENSIONS_KEY = 'strategyfinder.budgetExtensions.v1';
+/** Every localStorage key of the trial ledger (cleared by "Reset Runs & Clear Cache"). */
+export const TRIAL_LEDGER_KEYS: readonly string[] = [STORAGE_KEY, EXTENSIONS_KEY];
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365.25 * DAY_MS;
 /** Oldest records are dropped beyond this many. */
@@ -38,7 +40,7 @@ export const MIN_WINDOW_OVERLAP = 0.5;
 
 /** The search period (train + validation) of a run. */
 export interface TrialWindow {
-  /** Every symbol the run scored strategies on (traded assets and universe), upper case, sorted. */
+  /** Every symbol the run scored strategies on (every traded asset), upper case, sorted. */
   symbols: string[];
   interval: Interval;
   /** Open time of the first candle (ms). */

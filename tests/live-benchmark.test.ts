@@ -4,11 +4,16 @@
  *   LIVE_BENCHMARK=1 npx vitest run tests/live-benchmark.test.ts
  *   (behind an HTTPS proxy also set NODE_USE_ENV_PROXY=1)
  *
- * Every hypothesis on the live 4h (BTC, ETH, SOL, BNB, 2 years) and daily (BTC, ETH, SOL, XRP, 5 years)
- * crypto pools of the presets, Long-Only and Asymmetric L/S for the breakout and trend ideas, at the
- * default budget. The top strategy of each run gets the cross-market check on unseen majors and is locked
- * to reveal its holdout. Each pool is followed by random-walk controls with the same length, volatility
- * and settings. The markdown table is written to LIVE_BENCHMARK_OUT (default ./live-benchmark.md).
+ * By default it runs the default preset's live pool - Crypto Multi-Asset Swing (4h): BTC, ETH, SOL, BNB,
+ * 2 years of 4h candles - for every hypothesis (Long-Only, plus Asymmetric L/S for the breakout and trend
+ * ideas) at the default budget. The top strategy of each run gets the cross-market check on unseen majors
+ * and is locked to reveal its holdout; every run is followed by its random-walk control (driftless walks
+ * with the pool's length, timestamps and volatility, same settings). Options:
+ *
+ *   LIVE_BENCHMARK_POOLS=4h,1d           pools: 4h = the default preset's, 1d = Trend Breakout (1d)'s
+ *   LIVE_BENCHMARK_HYPOTHESES=VOL_BREAKOUT,TREND_FOLLOWING   limit the hypotheses
+ *   LIVE_BENCHMARK_EVALS=25000           evaluations per run
+ *   LIVE_BENCHMARK_OUT=live-benchmark.md where the markdown table is written
  */
 
 import { writeFileSync } from 'node:fs';
@@ -39,6 +44,9 @@ const scope: FakeScope = { onmessage: null, postMessage: () => undefined };
 type Of<T extends WorkerResponse['type']> = Extract<WorkerResponse, { type: T }>;
 
 const OUT = process.env.LIVE_BENCHMARK_OUT ?? 'live-benchmark.md';
+const EVALS = Number(process.env.LIVE_BENCHMARK_EVALS ?? 25_000);
+const POOLS = (process.env.LIVE_BENCHMARK_POOLS ?? '4h').split(',').map((p) => p.trim());
+const ONLY = process.env.LIVE_BENCHMARK_HYPOTHESES?.split(',').map((h) => h.trim()) ?? null;
 const lines: string[] = [];
 const say = (line: string): void => {
   lines.push(line);
@@ -51,7 +59,7 @@ function runOptimizer(datasets: NamedDataset[], settings: BacktestSettings, hypo
       if (message.type === 'done') resolve(message);
       if (message.type === 'error') reject(new Error(message.message));
     };
-    scope.onmessage?.({ data: { type: 'start', payload: { datasets, settings, hypothesis, seed: 2026, maxEvaluations: 25_000, robustTarget: 3 } } });
+    scope.onmessage?.({ data: { type: 'start', payload: { datasets, settings, hypothesis, seed: 2026, maxEvaluations: EVALS, robustTarget: 3 } } });
   });
 }
 
@@ -102,23 +110,43 @@ beforeAll(async () => {
   await import('../src/workers/optimizer.worker');
 });
 
+/** Board summary: how many strategies, how many with a positive validation expectancy, and their parameter counts. */
+function boardSummary(done: Of<'done'>): { board: string; params: string } {
+  const list = done.strategies;
+  if (list.length === 0) return { board: '0', params: '–' };
+  const positive = list.filter((s) => s.validation.trades > 0 && s.validation.netPnl / s.validation.trades > 0).length;
+  const params = list.map((s) => s.params).sort((a, b) => a - b);
+  const mid = params[params.length >> 1];
+  return { board: `${positive}/${list.length}`, params: `${mid} / ${params[params.length - 1]}` };
+}
+
+/** Per-trade validation expectancy of a strategy, as text. */
+const perTrade = (s: Of<'done'>['strategies'][number]): string => {
+  const value = s.validation.netPnl / Math.max(1, s.validation.trades);
+  return `${value >= 0 ? '+' : '-'}$${Math.abs(value).toFixed(0)}/trade`;
+};
+
 describe.skipIf(!process.env.LIVE_BENCHMARK)('live benchmark sweep', () => {
-  it('runs every hypothesis on live 4h and 1d crypto pools, plus random-walk controls', async () => {
-    say('# Live sweep (Binance candles, default budget 25,000 evaluations, stop after 3 robust)');
-    say('| Pool | Hypothesis | Mode | Evals | Robust | Best DSR | Top strategy | MC P(profit) / DD95 | Locked #1: holdout ROI · Sharpe vs B&H · verdict | Cross-market (unseen) |');
-    say('|---|---|---|---|---|---|---|---|---|---|');
+  it("runs every hypothesis on the default preset's live crypto pool, plus random-walk controls", async () => {
+    say(`# Live sweep (Binance candles, ${EVALS.toLocaleString('en-US')} evaluations a run, stop after 3 robust)`);
+    say(
+      '| Pool | Hypothesis | Mode | Evals | Cycles | Robust | Best DSR | Board: val. expectancy > 0 | Params (median / max) | Top strategy | MC P(profit) / DD95 | Locked #1: holdout ROI · Sharpe vs B&H · verdict | Cross-market (unseen) |',
+    );
+    say('|---|---|---|---|---|---|---|---|---|---|---|---|---|');
     const pools = [
-      { label: '4h 2y BTC·ETH·SOL·BNB', preset: 'crypto-swing-4h', unseen: ['XRP-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD'] },
-      { label: '1d 5y BTC·ETH·SOL·XRP', preset: 'trend-breakout-1d', unseen: ['BNB-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD'] },
-    ];
-    const runs: [Hypothesis, TradeMode][] = [
-      ['TREND_FOLLOWING', 'long-only'],
-      ['TREND_FOLLOWING', 'asymmetric'],
-      ['VOL_BREAKOUT', 'long-only'],
-      ['VOL_BREAKOUT', 'asymmetric'],
-      ['DIP_IN_UPTREND', 'long-only'],
-      ['RANGE_REVERSION', 'long-only'],
-    ];
+      { id: '4h', label: '4h 2y BTC·ETH·SOL·BNB', preset: 'crypto-swing-4h', unseen: ['XRP-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD'] },
+      { id: '1d', label: '1d 5y BTC·ETH·SOL·XRP', preset: 'trend-breakout-1d', unseen: ['BNB-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD'] },
+    ].filter((pool) => POOLS.includes(pool.id));
+    const runs = (
+      [
+        ['VOL_BREAKOUT', 'long-only'],
+        ['VOL_BREAKOUT', 'asymmetric'],
+        ['TREND_FOLLOWING', 'long-only'],
+        ['TREND_FOLLOWING', 'asymmetric'],
+        ['DIP_IN_UPTREND', 'long-only'],
+        ['RANGE_REVERSION', 'long-only'],
+      ] as [Hypothesis, TradeMode][]
+    ).filter(([h]) => ONLY === null || ONLY.includes(h));
     for (const pool of pools) {
       const preset = PRESETS.find((p) => p.id === pool.preset);
       if (!preset) throw new Error(pool.preset);
@@ -127,6 +155,8 @@ describe.skipIf(!process.env.LIVE_BENCHMARK)('live benchmark sweep', () => {
       const series = await live(symbols, base.interval, base.range);
       const datasets = symbols.map((symbol) => named(series, symbol));
       const extra = await live(pool.unseen, base.interval, base.range);
+      // Random-walk controls with the pool's own length, timestamps and volatility.
+      const walks = datasets.map((d, k) => ({ symbol: `RW-${k}`, data: walkLike(d.data, 9100 + k) }));
       for (const [hypothesis, tradeMode] of runs) {
         const settings = settingsFrom({ ...base, tradeMode, hypothesis, fundingPct8h: 0.01 });
         const done = await runOptimizer(datasets, settings, hypothesis);
@@ -144,23 +174,22 @@ describe.skipIf(!process.env.LIVE_BENCHMARK)('live benchmark sweep', () => {
         const top = pick
           ? `${pick.id}${pick.robust?.passed ? ' ✓' : ''} ${pick.genome.longEntry.conditions.map(conditionFormula).join(' AND ')}${
               pick.genome.shortRegime ? ` / short gate ${conditionFormula(pick.genome.shortRegime)}` : ''
-            } (${pick.params}p)`
+            } (${pick.params}p, val. ${pick.validation.trades} trades, ${perTrade(pick)})`
           : '–';
         const mc = pick?.monteCarlo;
         const bestDsr = Math.max(0, ...done.strategies.map((s) => s.dsr));
+        const summary = boardSummary(done);
         say(
-          `| ${pool.label} | ${hypothesis} | ${tradeMode} | ${done.evaluations.toLocaleString('en-US')} | **${done.robustFound}** | ${(bestDsr * 100).toFixed(0)}% | ` +
-            `${top.replace(/\|/g, '/')} | ${mc ? `${(mc.probProfit * 100).toFixed(0)}% / ${mc.drawdownP95.toFixed(1)}%` : '–'} | ${lockText} | ${crossText} |`,
+          `| ${pool.label} | ${hypothesis} | ${tradeMode} | ${done.evaluations.toLocaleString('en-US')} | ${done.cycle} | **${done.robustFound}** | ${(bestDsr * 100).toFixed(0)}% | ${summary.board} | ${summary.params} | ` +
+            `${top.split('|').join('/')} | ${mc ? `${(mc.probProfit * 100).toFixed(0)}% / ${mc.drawdownP95.toFixed(1)}%` : '–'} | ${lockText} | ${crossText} |`,
+        );
+        const control = await runOptimizer(walks, settings, hypothesis);
+        const controlDsr = Math.max(0, ...control.strategies.map((s) => s.dsr));
+        const controlSummary = boardSummary(control);
+        say(
+          `| random walks (${pool.label} vol) | ${hypothesis} | ${tradeMode} | ${control.evaluations.toLocaleString('en-US')} | ${control.cycle} | **${control.robustFound}** | ${(controlDsr * 100).toFixed(0)}% | ${controlSummary.board} | ${controlSummary.params} | – | – | – | – |`,
         );
       }
-      // Random-walk controls with the pool's own length, timestamps and volatility.
-      const walks = datasets.map((d, k) => ({ symbol: `RW-${k}`, data: walkLike(d.data, 9100 + k) }));
-      for (const [hypothesis, tradeMode] of runs) {
-        const settings = settingsFrom({ ...base, tradeMode, hypothesis, fundingPct8h: 0.01 });
-        const done = await runOptimizer(walks, settings, hypothesis);
-        const bestDsr = Math.max(0, ...done.strategies.map((s) => s.dsr));
-        say(`| random walks (${pool.label} vol) | ${hypothesis} | ${tradeMode} | ${done.evaluations.toLocaleString('en-US')} | **${done.robustFound}** | ${(bestDsr * 100).toFixed(0)}% | – | – | – | – |`);
-      }
     }
-  }, 3_600_000);
+  }, 14_400_000);
 });
