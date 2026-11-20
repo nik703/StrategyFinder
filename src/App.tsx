@@ -10,13 +10,16 @@
 
 import { Info, Lock, TriangleAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { TooltipProvider } from '@/components/ui/tooltip';
 import ComparePanel from './components/ComparePanel';
 import ControlBar from './components/ControlBar';
 import Leaderboard, { MAX_COMPARE } from './components/Leaderboard';
 import StrategyWorkbench, { type CrossMarketState } from './components/StrategyWorkbench';
 import TelemetryStrip from './components/TelemetryStrip';
 import TopActionBar from './components/TopActionBar';
-import { Panel, StepHeader } from './components/ui';
+import { Panel, StepHeader } from './components/common';
 import { buildDataset } from './data/basket';
 import { loadMarketData } from './data/marketData';
 import {
@@ -624,159 +627,164 @@ export default function App(): JSX.Element {
   const stage = displayed ? 4 : leaderboard.length > 0 ? 3 : busy || telemetry.iteration > 0 ? 2 : 1;
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col gap-4 px-4 pb-5 sm:px-6">
-      <TopActionBar
-        status={status}
-        presetTitle={preset?.title ?? null}
-        onRun={() => void start()}
-        onStop={stop}
-        runBlocked={budgetBlocked}
-        budget={budget}
-        onExtendBudget={extendBudget}
-        onReset={resetRuns}
-        stage={stage}
-      />
-
-      <div id="step-setup" className="scroll-mt-20">
-        <ControlBar
-          config={config}
-          onChange={updateConfig}
-          savedTickers={savedTickers}
-          onSaveTickers={saveTickers}
-          onRemoveTicker={forgetTicker}
+    <TooltipProvider delayDuration={200}>
+      <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col gap-4 px-4 pb-5 sm:px-6">
+        <TopActionBar
           status={status}
+          presetTitle={preset?.title ?? null}
+          onRun={() => void start()}
+          onStop={stop}
+          runBlocked={budgetBlocked}
+          budget={budget}
+          onExtendBudget={extendBudget}
+          onReset={resetRuns}
+          stage={stage}
         />
-      </div>
 
-      <div id="step-scan" className="scroll-mt-20">
-        <TelemetryStrip
-          maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
-          robustTarget={scanTarget}
-          stopReason={stopReason}
-          status={status}
-          telemetry={telemetry}
-          benchmarkSharpe={benchmark?.validation.sharpe ?? null}
-          context={context}
-        />
-      </div>
-
-      {error && (
-        <div role="alert" className="flex items-start gap-2 rounded-lg border border-down/40 bg-down/10 px-3 py-2.5 text-sm text-down">
-          <TriangleAlert size={16} className="mt-0.5 shrink-0" />
-          <span className="min-w-0 flex-1">{error}</span>
-          <button type="button" onClick={() => setError(null)} aria-label="Dismiss error" className="shrink-0 rounded p-0.5 hover:bg-down/20">
-            <X size={14} />
-          </button>
-        </div>
-      )}
-
-      {context?.simulated && (
-        <div className="flex items-start gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2.5 text-sm text-warn">
-          <TriangleAlert size={16} className="mt-0.5 shrink-0" />
-          <div className="min-w-0">
-            <span className="font-semibold">Simulated market data.</span> The market-data function could not supply live candles, so the
-            built-in generator produced realistic placeholder prices. Results are illustrative only.
-            {context.fallbackReason && <span className="num mt-0.5 block truncate text-xs opacity-80">Reason: {context.fallbackReason}</span>}
-          </div>
-        </div>
-      )}
-
-      {context && context.priorHoldoutReveals > 0 && (
-        <div role="status" className="flex items-start gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2.5 text-sm text-warn">
-          <Info size={16} className="mt-0.5 shrink-0" />
-          <div className="min-w-0">
-            <span className="font-semibold">
-              Holdout already spent: this period ({fmtDate(context.holdoutWindow.start)} → {fmtDate(context.holdoutWindow.end)}) overlaps{' '}
-              {context.priorHoldoutReveals} earlier reveal{context.priorHoldoutReveals === 1 ? '' : 's'}
-              {context.lastHoldoutReveal !== null ? `, the last on ${fmtDate(context.lastHoldoutReveal)}` : ''}.
-            </span>{' '}
-            It is no longer untouched data, so no strategy from this run can be rated Robust. Any timeframe, range or end date over the
-            same symbols and dates counts.
-          </div>
-        </div>
-      )}
-
-      {finished && leaderboard.length > 0 && lockedId === null && (
-        <div role="status" className="flex items-start gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2.5 text-sm text-ink-2">
-          <Lock size={16} className="mt-0.5 shrink-0 text-accent-strong" />
-          <div className="min-w-0">
-            <span className="font-semibold text-ink">The holdout is still sealed.</span> Compare the candidates, choose ONE and press{' '}
-            <span className="font-semibold text-ink">Lock &amp; reveal holdout</span> in its workbench. Only that strategy&apos;s holdout is
-            revealed, once, and the reveal is recorded for every later run on the same symbols and dates.
-          </div>
-        </div>
-      )}
-
-      {context && !context.simulated && context.notes.length > 0 && (
-        <div className="rounded-lg border border-line bg-panel px-3 py-2 text-xs text-ink-2">{context.notes.join(' · ')}</div>
-      )}
-
-      <div id="step-rank" className="scroll-mt-20">
-        <Leaderboard
-          strategies={leaderboard}
-          selectedId={displayed?.id ?? null}
-          lockedId={lockedId}
-          onSelect={selectStrategy}
-          status={status}
-          gates={gates}
-          pooled={pooledRun}
-          compareIds={compareIds}
-          onToggleCompare={toggleCompare}
-        />
-      </div>
-
-      {compared.length > 0 && (
-        <ComparePanel
-          strategies={compared}
-          onRemove={(id) => setCompareIds((current) => current.filter((entry) => entry !== id))}
-          onOpen={selectStrategy}
-          onClear={() => setCompareIds([])}
-        />
-      )}
-
-      <div id="step-workbench" ref={workbenchRef} className="scroll-mt-20">
-        {displayed && benchmark && context ? (
-          <StrategyWorkbench
-            strategy={displayed}
-            rank={displayedRank}
-            benchmark={benchmark}
-            context={context}
-            axis={axis}
-            testedCount={telemetry.evaluations}
-            barsPerYear={barsPerYear}
-            analysis={analyses[displayed.id] ?? null}
-            analysisPending={pendingAnalyses[displayed.id] === true}
-            finished={finished}
-            lockedId={lockedId}
-            lockPending={lockPending}
-            onLock={() => lockStrategy(displayed)}
-            snapshot={snapshot}
-            onRefreshSnapshot={refreshSnapshot}
-            pinned={pinned !== null}
-            onFollowBest={() => setPinned(null)}
-            crossMarket={crossMarket[displayed.id] ?? null}
-            crossMarketSuggestion={crossSuggestion}
-            onRunCrossMarket={(symbols) => void runCrossMarket(displayed, symbols)}
+        <div id="step-setup" className="scroll-mt-20">
+          <ControlBar
+            config={config}
+            onChange={updateConfig}
+            savedTickers={savedTickers}
+            onSaveTickers={saveTickers}
+            onRemoveTicker={forgetTicker}
+            status={status}
           />
-        ) : (
-          <Panel className="px-4 py-4">
-            <StepHeader step={4} title="Strategy workbench" hint="Verdict, next-entry trigger prices, stress test, stability map, holdout reveal and Pine Script export." />
-            <p className="mt-3 text-sm text-ink-3">
-              {status === 'loading'
-                ? 'Loading market data…'
-                : busy
-                  ? 'Appears as soon as the scanner finds its first strategy.'
-                  : 'Pick a preset above (or keep the default) and press 1-Click Run. The best strategy opens here automatically; click any leaderboard row to inspect another one.'}
-            </p>
-          </Panel>
-        )}
-      </div>
+        </div>
 
-      <footer className="pb-2 text-[11px] leading-relaxed text-ink-3">
-        StrategyFinder is a research tool. Backtests are hypothetical, are fitted to past data and do not guarantee future results. Nothing
-        here is financial advice. Signals on candle close · fills at next open · fees, slippage and financing included · 60 / 20 / 20
-        train / validation / holdout.
-      </footer>
-    </div>
+        <div id="step-scan" className="scroll-mt-20">
+          <TelemetryStrip
+            maxEvaluations={context?.maxEvaluations ?? config.maxEvaluations}
+            robustTarget={scanTarget}
+            stopReason={stopReason}
+            status={status}
+            telemetry={telemetry}
+            benchmarkSharpe={benchmark?.validation.sharpe ?? null}
+            context={context}
+          />
+        </div>
+
+        {error && (
+          <Alert variant="destructive" className="border-down/40 bg-down/10 pr-10">
+            <TriangleAlert />
+            <AlertDescription className="text-current">{error}</AlertDescription>
+            <Button variant="ghost" size="icon-xs" onClick={() => setError(null)} aria-label="Dismiss error" className="absolute top-2 right-2 hover:bg-down/20">
+              <X />
+            </Button>
+          </Alert>
+        )}
+
+        {context?.simulated && (
+          <Alert className="border-warn/35 bg-warn/10 text-warn">
+            <TriangleAlert />
+            <AlertDescription className="block text-current">
+              <span className="font-semibold">Simulated market data.</span> The market-data function could not supply live candles, so the
+              built-in generator produced realistic placeholder prices. Results are illustrative only.
+              {context.fallbackReason && <span className="num mt-0.5 block truncate text-xs opacity-80">Reason: {context.fallbackReason}</span>}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {context && context.priorHoldoutReveals > 0 && (
+          <Alert role="status" className="border-warn/35 bg-warn/10 text-warn">
+            <Info />
+            <AlertDescription className="block text-current">
+              <span className="font-semibold">
+                Holdout already spent: this period ({fmtDate(context.holdoutWindow.start)} → {fmtDate(context.holdoutWindow.end)}) overlaps{' '}
+                {context.priorHoldoutReveals} earlier reveal{context.priorHoldoutReveals === 1 ? '' : 's'}
+                {context.lastHoldoutReveal !== null ? `, the last on ${fmtDate(context.lastHoldoutReveal)}` : ''}.
+              </span>{' '}
+              It is no longer untouched data, so no strategy from this run can be rated Robust. Any timeframe, range or end date over the
+              same symbols and dates counts.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {finished && leaderboard.length > 0 && lockedId === null && (
+          <Alert role="status" className="border-primary/40 bg-primary/10">
+            <Lock className="text-primary" />
+            <AlertDescription className="block text-secondary-foreground">
+              <span className="font-semibold text-foreground">The holdout is still sealed.</span> Compare the candidates, choose ONE and press{' '}
+              <span className="font-semibold text-foreground">Lock &amp; reveal holdout</span> in its workbench. Only that strategy&apos;s holdout is
+              revealed, once, and the reveal is recorded for every later run on the same symbols and dates.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {context && !context.simulated && context.notes.length > 0 && (
+          <Alert>
+            <Info />
+            <AlertDescription className="text-xs">{context.notes.join(' · ')}</AlertDescription>
+          </Alert>
+        )}
+
+        <div id="step-rank" className="scroll-mt-20">
+          <Leaderboard
+            strategies={leaderboard}
+            selectedId={displayed?.id ?? null}
+            lockedId={lockedId}
+            onSelect={selectStrategy}
+            status={status}
+            gates={gates}
+            pooled={pooledRun}
+            compareIds={compareIds}
+            onToggleCompare={toggleCompare}
+          />
+        </div>
+
+        {compared.length > 0 && (
+          <ComparePanel
+            strategies={compared}
+            onRemove={(id) => setCompareIds((current) => current.filter((entry) => entry !== id))}
+            onOpen={selectStrategy}
+            onClear={() => setCompareIds([])}
+          />
+        )}
+
+        <div id="step-workbench" ref={workbenchRef} className="scroll-mt-20">
+          {displayed && benchmark && context ? (
+            <StrategyWorkbench
+              strategy={displayed}
+              rank={displayedRank}
+              benchmark={benchmark}
+              context={context}
+              axis={axis}
+              testedCount={telemetry.evaluations}
+              barsPerYear={barsPerYear}
+              analysis={analyses[displayed.id] ?? null}
+              analysisPending={pendingAnalyses[displayed.id] === true}
+              finished={finished}
+              lockedId={lockedId}
+              lockPending={lockPending}
+              onLock={() => lockStrategy(displayed)}
+              snapshot={snapshot}
+              onRefreshSnapshot={refreshSnapshot}
+              pinned={pinned !== null}
+              onFollowBest={() => setPinned(null)}
+              crossMarket={crossMarket[displayed.id] ?? null}
+              crossMarketSuggestion={crossSuggestion}
+              onRunCrossMarket={(symbols) => void runCrossMarket(displayed, symbols)}
+            />
+          ) : (
+            <Panel className="px-4 py-4">
+              <StepHeader step={4} title="Strategy workbench" hint="Verdict, next-entry trigger prices, stress test, stability map, holdout reveal and Pine Script export." />
+              <p className="mt-3 text-sm text-muted-foreground">
+                {status === 'loading'
+                  ? 'Loading market data…'
+                  : busy
+                    ? 'Appears as soon as the scanner finds its first strategy.'
+                    : 'Pick a preset above (or keep the default) and press 1-Click Run. The best strategy opens here automatically; click any leaderboard row to inspect another one.'}
+              </p>
+            </Panel>
+          )}
+        </div>
+
+        <footer className="pb-2 text-[11px] leading-relaxed text-muted-foreground">
+          StrategyFinder is a research tool. Backtests are hypothetical, are fitted to past data and do not guarantee future results. Nothing
+          here is financial advice. Signals on candle close · fills at next open · fees, slippage and financing included · 60 / 20 / 20
+          train / validation / holdout.
+        </footer>
+      </div>
+    </TooltipProvider>
   );
 }

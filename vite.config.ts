@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import path from 'node:path';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig, type Plugin } from 'vite';
@@ -39,6 +40,11 @@ function netlifyFunctionDevServer(): Plugin {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), netlifyFunctionDevServer()],
+  resolve: {
+    alias: {
+      '@': path.resolve(import.meta.dirname, './src'),
+    },
+  },
   server: {
     port: 5173,
     strictPort: true,

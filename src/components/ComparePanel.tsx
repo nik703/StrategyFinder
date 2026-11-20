@@ -1,17 +1,21 @@
 /**
- * Side-by-side comparison of up to three leaderboard strategies: their equity curves on one chart
- * and the key risk / return figures and robustness checks in one table.
+ * Side-by-side comparison of up to three leaderboard strategies (a shadcn Card): their equity curves
+ * on one chart and the key risk / return figures and robustness checks in one shadcn Table.
  */
 
 import { GitCompareArrows, X } from 'lucide-react';
-import { exitModeLabel, exitTags, indicatorBadges, shortRuleLabel } from '../engine/describe';
-import { HYPOTHESES } from '../engine/genome';
-import { fmtInt, fmtNum, fmtPct } from '../lib/format';
-import type { StrategyResult } from '../types/trading';
-import { cx, Panel, Pill } from './ui';
+import { Button } from '@/components/ui/button';
+import { CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { exitModeLabel, exitTags, indicatorBadges, shortRuleLabel } from '@/engine/describe';
+import { HYPOTHESES } from '@/engine/genome';
+import { fmtInt, fmtNum, fmtPct } from '@/lib/format';
+import { cn } from '@/lib/utils';
+import type { StrategyResult } from '@/types/trading';
+import { Panel, Pill } from './common';
 
-/** Series colours of the compared strategies (identity, not quality). */
-export const COMPARE_COLORS = ['#3987e5', '#c98500', '#d55181'];
+/** Series colours of the compared strategies: the theme's chart tokens. */
+export const COMPARE_COLORS = ['var(--chart-1)', 'var(--chart-4)', 'var(--chart-5)'];
 
 interface Row {
   label: string;
@@ -78,7 +82,7 @@ function OverlayChart({ strategies }: { strategies: StrategyResult[] }): JSX.Ele
   const base = H - 4 - ((100 - lo) / span) * (H - 8);
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label="Equity curves of the compared strategies, rebased to 100">
-      {base > 0 && base < H && <line x1="0" x2={W} y1={base} y2={base} stroke="var(--color-ink-3)" strokeDasharray="4 4" strokeWidth="1" />}
+      {base > 0 && base < H && <line x1="0" x2={W} y1={base} y2={base} stroke="var(--muted-foreground)" strokeDasharray="4 4" strokeWidth="1" />}
       {series.map((values, k) => (
         <path key={strategies[k].id} d={path(values)} fill="none" stroke={COMPARE_COLORS[k]} strokeWidth="1.8" strokeLinejoin="round" />
       ))}
@@ -106,77 +110,81 @@ export default function ComparePanel({
   };
   return (
     <Panel>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
-        <div className="flex items-center gap-2">
-          <GitCompareArrows size={16} className="text-ink-3" />
-          <h2 className="text-sm font-semibold text-ink">Compare strategies</h2>
-          <span className="text-xs text-ink-3">Search period (train + validation) · the best value of each row is highlighted</span>
+      <CardHeader className="border-b px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <GitCompareArrows className="size-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-semibold">Compare strategies</CardTitle>
+            <CardDescription className="text-xs">Search period (train + validation) · the best value of each row is highlighted</CardDescription>
+          </div>
+          <Button variant="outline" size="sm" onClick={onClear}>
+            Clear
+          </Button>
         </div>
-        <button type="button" onClick={onClear} className="inline-flex h-7 items-center rounded-md border border-line px-2 text-xs text-ink-2 hover:bg-hover hover:text-ink">
-          Clear
-        </button>
-      </div>
-      <div className="grid grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]">
+      </CardHeader>
+      <CardContent className="grid grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]">
         <div>
           <OverlayChart strategies={strategies} />
-          <p className="mt-1 text-[11px] text-ink-3">Equity rebased to 100 at the start; the dashed line is the starting capital.</p>
+          <p className="mt-1 text-[11px] text-muted-foreground">Equity rebased to 100 at the start; the dashed line is the starting capital.</p>
         </div>
-        <div className="overflow-x-auto rounded-lg border border-line">
-          <table className="num w-full text-sm">
-            <thead>
-              <tr className="border-b border-line bg-raised/50 text-left text-[11px] uppercase tracking-wider text-ink-3">
-                <th scope="col" className="px-3 py-2 font-medium">Metric</th>
+        <div className="rounded-lg border border-border">
+          <Table className="num">
+            <TableHeader>
+              <TableRow className="bg-muted/50 text-[11px] uppercase tracking-wider hover:bg-muted/50">
+                <TableHead className="text-muted-foreground">Metric</TableHead>
                 {strategies.map((s, k) => (
-                  <th key={s.id} scope="col" className="px-3 py-2 text-right font-medium">
-                    <span className="inline-flex items-center gap-1.5">
+                  <TableHead key={s.id} className="text-right">
+                    <span className="inline-flex items-center gap-1">
                       <span className="inline-block h-0 w-3 border-t-2" style={{ borderColor: COMPARE_COLORS[k] }} />
-                      <button type="button" onClick={() => onOpen(s)} className="normal-case text-ink hover:text-accent-strong" title="Open in the workbench">
+                      <Button variant="link" size="xs" onClick={() => onOpen(s)} className="h-auto px-0 normal-case text-foreground" title="Open in the workbench">
                         {s.id}
-                      </button>
-                      <button type="button" onClick={() => onRemove(s.id)} aria-label={`Remove ${s.id} from the comparison`} className="text-ink-3 hover:text-ink">
-                        <X size={12} />
-                      </button>
+                      </Button>
+                      <Button variant="ghost" size="icon-xs" onClick={() => onRemove(s.id)} aria-label={`Remove ${s.id} from the comparison`}>
+                        <X />
+                      </Button>
                     </span>
-                  </th>
+                  </TableHead>
                 ))}
-              </tr>
-            </thead>
-            <tbody>
-              <tr className="border-b border-line/70">
-                <th scope="row" className="px-3 py-1.5 text-left font-normal text-ink-2">Idea</th>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow>
+                <TableHead scope="row" className="font-normal text-secondary-foreground">
+                  Idea
+                </TableHead>
                 {strategies.map((s) => (
-                  <td key={s.id} className="px-3 py-1.5 text-right">
+                  <TableCell key={s.id} className="whitespace-normal text-right">
                     <div className="flex flex-wrap justify-end gap-1">
                       {indicatorBadges(s.genome).map((badge) => (
                         <Pill key={badge}>{badge}</Pill>
                       ))}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-ink-3">
+                    <div className="mt-0.5 text-[11px] text-muted-foreground">
                       {s.genome.hypothesis ? HYPOTHESES[s.genome.hypothesis].short : s.genome.archetype} · {shortRuleLabel(s.genome)} · {exitModeLabel(s.genome)}
                       {exitTags(s.genome).length > 0 ? ` · ${exitTags(s.genome).join(' · ')}` : ''}
                     </div>
-                  </td>
+                  </TableCell>
                 ))}
-              </tr>
+              </TableRow>
               {ROWS.map((row) => {
                 const winner = best(row);
                 return (
-                  <tr key={row.label} className="border-b border-line/70 last:border-b-0">
-                    <th scope="row" title={row.title} className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink-2">
+                  <TableRow key={row.label}>
+                    <TableHead scope="row" title={row.title} className="font-normal text-secondary-foreground">
                       {row.label}
-                    </th>
+                    </TableHead>
                     {strategies.map((s, k) => (
-                      <td key={s.id} className={cx('px-3 py-1.5 text-right', winner === k ? 'font-semibold text-up' : 'text-ink')}>
+                      <TableCell key={s.id} className={cn('text-right', winner === k ? 'font-semibold text-up' : 'text-foreground')}>
                         {row.value(s)}
-                      </td>
+                      </TableCell>
                     ))}
-                  </tr>
+                  </TableRow>
                 );
               })}
-            </tbody>
-          </table>
+            </TableBody>
+          </Table>
         </div>
-      </div>
+      </CardContent>
     </Panel>
   );
 }

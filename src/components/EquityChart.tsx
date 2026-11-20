@@ -21,20 +21,21 @@ import {
 import { LineChart } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Line } from 'react-chartjs-2';
-import { fmtAxisDate, fmtDate, fmtDateTime, fmtPct, fmtUsd, fmtUsdCompact } from '../lib/format';
-import type { ChartAxis, Interval } from '../types/trading';
-import { LineKey, Segmented } from './ui';
+import { fmtAxisDate, fmtDate, fmtDateTime, fmtPct, fmtUsd, fmtUsdCompact } from '@/lib/format';
+import { chartPalette } from '@/lib/theme';
+import type { ChartAxis, Interval } from '@/types/trading';
+import { LineKey, Segmented } from './common';
 
 ChartJS.register(LineController, LineElement, PointElement, LinearScale, LogarithmicScale, Tooltip, Filler);
 
-/** Series colours – validated for CVD separation and ≥3:1 contrast on the panel surface. */
-export const STRATEGY_COLOR = '#3987e5';
-export const BENCHMARK_COLOR = '#d95926';
+/**
+ * Series colours as theme tokens (for legends and other DOM elements). The canvas resolves the same
+ * tokens to concrete colours through `chartPalette()`.
+ */
+export const STRATEGY_COLOR = 'var(--chart-1)';
+export const BENCHMARK_COLOR = 'var(--bench)';
 
-const INK = '#e8ebf3';
-const INK_MUTED = '#7f8aa5';
 const GRID = 'rgba(148, 163, 184, 0.09)';
-const AXIS = '#2c3856';
 const FONT = "'Inter Variable', ui-sans-serif, system-ui, sans-serif";
 
 interface EquityChartProps {
@@ -149,6 +150,7 @@ export default function EquityChart({
 }: EquityChartProps): JSX.Element {
   const [scale, setScale] = useState<'linear' | 'log'>('linear');
 
+  const palette = useMemo(() => chartPalette(), []);
   const data = useMemo<ChartData<'line', { x: number; y: number }[]> | null>(() => {
     if (!axis || !benchmark) return null;
     const toPoints = (curve: Float32Array): { x: number; y: number }[] => {
@@ -162,9 +164,9 @@ export default function EquityChart({
       datasets.push({
         label: strategyName ?? 'Strategy',
         data: toPoints(strategy),
-        borderColor: STRATEGY_COLOR,
+        borderColor: palette.strategy,
         backgroundColor: 'rgba(57, 135, 229, 0.10)',
-        pointHoverBackgroundColor: STRATEGY_COLOR,
+        pointHoverBackgroundColor: palette.strategy,
         fill: scale === 'linear' ? 'origin' : false,
         order: 1,
       });
@@ -172,9 +174,9 @@ export default function EquityChart({
     datasets.push({
       label: 'Buy & Hold',
       data: toPoints(benchmark),
-      borderColor: BENCHMARK_COLOR,
-      backgroundColor: BENCHMARK_COLOR,
-      pointHoverBackgroundColor: BENCHMARK_COLOR,
+      borderColor: palette.benchmark,
+      backgroundColor: palette.benchmark,
+      pointHoverBackgroundColor: palette.benchmark,
       fill: false,
       order: 2,
     });
@@ -198,7 +200,7 @@ export default function EquityChart({
       layout: { padding: { top: 4, right: 4 } },
       elements: {
         line: { borderWidth: 2, tension: 0, borderJoinStyle: 'round', borderCapStyle: 'round' },
-        point: { radius: 0, hoverRadius: 4, hitRadius: 12, hoverBorderWidth: 2, hoverBorderColor: '#0f1524' },
+        point: { radius: 0, hoverRadius: 4, hitRadius: 12, hoverBorderWidth: 2, hoverBorderColor: palette.surface },
       },
       scales: {
         x: {
@@ -206,9 +208,9 @@ export default function EquityChart({
           min: 0,
           max: last,
           grid: { display: false },
-          border: { color: AXIS },
+          border: { color: palette.axis },
           ticks: {
-            color: INK_MUTED,
+            color: palette.muted,
             font: { family: FONT, size: 11 },
             maxTicksLimit: 8,
             maxRotation: 0,
@@ -222,7 +224,7 @@ export default function EquityChart({
           grid: { color: GRID, drawTicks: false },
           border: { display: false },
           ticks: {
-            color: INK_MUTED,
+            color: palette.muted,
             font: { family: FONT, size: 11 },
             padding: 8,
             maxTicksLimit: 7,
@@ -234,19 +236,19 @@ export default function EquityChart({
         legend: { display: false },
         splitDivider: { validationPos, holdoutPos, revealed },
         tooltip: {
-          backgroundColor: '#151c2f',
-          borderColor: AXIS,
+          backgroundColor: palette.popover,
+          borderColor: palette.axis,
           borderWidth: 1,
           padding: 10,
           cornerRadius: 8,
           caretSize: 0,
-          titleColor: '#aab3c8',
+          titleColor: palette.secondary,
           titleFont: { family: FONT, size: 11, weight: 500 },
           titleMarginBottom: 6,
-          bodyColor: INK,
+          bodyColor: palette.foreground,
           bodyFont: { family: FONT, size: 12, weight: 600 },
           bodySpacing: 4,
-          footerColor: INK_MUTED,
+          footerColor: palette.muted,
           footerFont: { family: FONT, size: 10, weight: 500 },
           footerMarginTop: 6,
           boxWidth: 12,
@@ -292,16 +294,16 @@ export default function EquityChart({
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
           <span className="inline-flex items-center gap-2">
             <LineKey color={STRATEGY_COLOR} />
-            <span className="text-ink-2">{strategyName ?? 'Selected strategy'}</span>
-            <span className="num font-semibold text-ink">{fmtUsd(strategyEnd)}</span>
+            <span className="text-secondary-foreground">{strategyName ?? 'Selected strategy'}</span>
+            <span className="num font-semibold text-foreground">{fmtUsd(strategyEnd)}</span>
           </span>
           <span className="inline-flex items-center gap-2">
             <LineKey color={BENCHMARK_COLOR} />
-            <span className="text-ink-2">Buy &amp; Hold</span>
-            <span className="num font-semibold text-ink">{fmtUsd(benchmarkEnd)}</span>
+            <span className="text-secondary-foreground">Buy &amp; Hold</span>
+            <span className="num font-semibold text-foreground">{fmtUsd(benchmarkEnd)}</span>
           </span>
-          <span className="inline-flex items-center gap-2 text-ink-3">
-            <LineKey color="rgba(232, 235, 243, 0.55)" dashed />
+          <span className="inline-flex items-center gap-2 text-muted-foreground">
+            <LineKey color="color-mix(in oklab, var(--foreground) 55%, transparent)" dashed />
             60% train / 20% validation / 20% holdout
           </span>
         </div>
@@ -320,10 +322,10 @@ export default function EquityChart({
         ) : (
           <div className="grid h-full place-items-center">
             <div className="max-w-sm text-center">
-              <div className="mx-auto mb-3 grid h-11 w-11 place-items-center rounded-xl border border-line bg-raised text-ink-3">
+              <div className="mx-auto mb-3 grid h-11 w-11 place-items-center rounded-xl border border-border bg-muted text-muted-foreground">
                 <LineChart size={20} />
               </div>
-              <p className="text-sm text-ink-2">{placeholder}</p>
+              <p className="text-sm text-secondary-foreground">{placeholder}</p>
             </div>
           </div>
         )}

@@ -43,35 +43,35 @@ export default function MonteCarloChart({ report }: { report: MonteCarloReport }
       <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label="Monte Carlo equity paths: 5th to 95th percentile band, interquartile band and median">
         {ticks.map((value) => (
           <g key={value}>
-            <line x1={PAD.left} x2={W - PAD.right} y1={y(value)} y2={y(value)} stroke="var(--color-line)" strokeWidth="1" />
-            <text x={PAD.left - 6} y={y(value) + 3.5} textAnchor="end" fontSize="10" fill="var(--color-ink-3)" className="num">
+            <line x1={PAD.left} x2={W - PAD.right} y1={y(value)} y2={y(value)} stroke="var(--border)" strokeWidth="1" />
+            <text x={PAD.left - 6} y={y(value) + 3.5} textAnchor="end" fontSize="10" fill="var(--muted-foreground)" className="num">
               {fmtPct((value - 1) * 100, true, 0)}
             </text>
           </g>
         ))}
-        <path d={area(bands.p95, bands.p5)} fill="var(--color-accent)" fillOpacity="0.14" />
-        <path d={area(bands.p75, bands.p25)} fill="var(--color-accent)" fillOpacity="0.28" />
-        <line x1={PAD.left} x2={W - PAD.right} y1={y(1)} y2={y(1)} stroke="var(--color-ink-3)" strokeDasharray="4 4" strokeWidth="1" />
-        <path d={median} fill="none" stroke="var(--color-accent-strong)" strokeWidth="2" strokeLinejoin="round" />
-        <text x={PAD.left} y={H - 8} fontSize="10" fill="var(--color-ink-3)">
+        <path d={area(bands.p95, bands.p5)} fill="var(--primary)" fillOpacity="0.14" />
+        <path d={area(bands.p75, bands.p25)} fill="var(--primary)" fillOpacity="0.28" />
+        <line x1={PAD.left} x2={W - PAD.right} y1={y(1)} y2={y(1)} stroke="var(--muted-foreground)" strokeDasharray="4 4" strokeWidth="1" />
+        <path d={median} fill="none" stroke="var(--ring)" strokeWidth="2" strokeLinejoin="round" />
+        <text x={PAD.left} y={H - 8} fontSize="10" fill="var(--muted-foreground)">
           trade 0
         </text>
-        <text x={W - PAD.right} y={H - 8} fontSize="10" fill="var(--color-ink-3)" textAnchor="end" className="num">
+        <text x={W - PAD.right} y={H - 8} fontSize="10" fill="var(--muted-foreground)" textAnchor="end" className="num">
           trade {maxX}
         </text>
       </svg>
-      <figcaption className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-ink-3">
+      <figcaption className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block h-2.5 w-4 rounded-sm bg-accent/15" /> 90% of paths
+          <span className="inline-block h-2.5 w-4 rounded-sm bg-primary/15" /> 90% of paths
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block h-2.5 w-4 rounded-sm bg-accent/30" /> middle 50%
+          <span className="inline-block h-2.5 w-4 rounded-sm bg-primary/30" /> middle 50%
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block h-0 w-4 border-t-2 border-accent-strong" /> median path
+          <span className="inline-block h-0 w-4 border-t-2 border-primary" /> median path
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block h-0 w-4 border-t border-dashed border-ink-3" /> break-even
+          <span className="inline-block h-0 w-4 border-t border-dashed border-muted-foreground" /> break-even
         </span>
       </figcaption>
     </figure>

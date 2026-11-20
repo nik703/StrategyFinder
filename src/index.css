@@ -1,46 +1,129 @@
 @import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
 
 /*
- * Design tokens. Chart series colours (accent / bench) were validated for
- * colour-vision-deficiency separation and contrast against the panel surface.
+ * Theme: shadcn/ui semantic tokens (background, card, foreground, muted-foreground, border, primary …)
+ * plus four app-specific status tokens – up (gain), down (loss), warn (caution) and bench (Buy & Hold
+ * series) – defined for both themes. The app ships in dark mode (`<html class="dark">`); the light
+ * values keep every component readable if the class is removed. Components must use these tokens,
+ * never raw hex colours (chart canvases read the same variables at runtime).
  */
-@theme {
-  --color-base: #0b0f19;
-  --color-panel: #0f1524;
-  --color-raised: #151c2f;
-  --color-hover: #1a2338;
-  --color-line: #1f2940;
-  --color-line-strong: #2c3856;
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.985 0.003 255);
+  --foreground: oklch(0.2 0.03 260);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.03 260);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.03 260);
+  --primary: oklch(0.58 0.16 255);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.95 0.01 255);
+  --secondary-foreground: oklch(0.3 0.03 260);
+  --muted: oklch(0.955 0.008 255);
+  --muted-foreground: oklch(0.5 0.03 260);
+  --accent: oklch(0.94 0.012 255);
+  --accent-foreground: oklch(0.2 0.03 260);
+  --destructive: oklch(0.58 0.22 22);
+  --border: oklch(0.9 0.012 255);
+  --input: oklch(0.88 0.015 255);
+  --ring: oklch(0.58 0.16 255);
+  --chart-1: oklch(0.58 0.16 255);
+  --chart-2: oklch(0.63 0.18 40);
+  --chart-3: oklch(0.62 0.14 160);
+  --chart-4: oklch(0.7 0.15 80);
+  --chart-5: oklch(0.6 0.17 350);
+  --up: oklch(0.55 0.14 160);
+  --down: oklch(0.58 0.2 15);
+  --warn: oklch(0.62 0.14 75);
+  --bench: oklch(0.6 0.17 42);
+}
 
-  --color-ink: #e8ebf3;
-  --color-ink-2: #aab3c8;
-  --color-ink-3: #7f8aa5;
+.dark {
+  --background: #0b0f19;
+  --foreground: #e8ebf3;
+  --card: #0f1524;
+  --card-foreground: #e8ebf3;
+  --popover: #121a2c;
+  --popover-foreground: #e8ebf3;
+  --primary: #3987e5;
+  --primary-foreground: #ffffff;
+  --secondary: #151c2f;
+  --secondary-foreground: #aab3c8;
+  --muted: #151c2f;
+  --muted-foreground: #7f8aa5;
+  --accent: #1a2338;
+  --accent-foreground: #e8ebf3;
+  --destructive: #fb7185;
+  --border: #1f2940;
+  --input: #2c3856;
+  --ring: #5a9cec;
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
+  --up: #34d399;
+  --down: #fb7185;
+  --warn: #fbbf24;
+  --bench: #d95926;
+}
 
-  --color-accent: #3987e5;
-  --color-accent-strong: #5a9cec;
-  --color-bench: #d95926;
-  --color-up: #34d399;
-  --color-down: #fb7185;
-  --color-warn: #fbbf24;
-
+@theme inline {
   --font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-heading: var(--font-sans);
   --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-warn: var(--warn);
+  --color-bench: var(--bench);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
 }
 
-html {
-  color-scheme: dark;
-  background-color: var(--color-base);
-}
-
-body {
-  margin: 0;
-  min-height: 100vh;
-  background-color: var(--color-base);
-  color: var(--color-ink);
-  font-family: var(--font-sans);
-  font-feature-settings: 'cv11', 'ss01';
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply m-0 min-h-screen bg-background text-foreground antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+  }
 }
 
 /* Clean tabular numerals wherever figures must line up. */
@@ -60,63 +143,25 @@ input[type='number']::-webkit-inner-spin-button {
   margin: 0;
 }
 
-:focus-visible {
-  outline: 2px solid var(--color-accent-strong);
-  outline-offset: 2px;
-}
-
-/* Slim scrollbars that match the dark surface. */
+/* Slim scrollbars that match the surface. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--color-line-strong) transparent;
+  scrollbar-color: var(--input) transparent;
 }
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-line-strong);
+  background: var(--input);
   border-radius: 999px;
-  border: 2px solid var(--color-panel);
+  border: 2px solid var(--card);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-@keyframes drawer-in {
-  from {
-    transform: translateX(24px);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
-}
-@keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-@keyframes stripes {
-  to {
-    background-position: 28px 0;
-  }
-}
-
-.animate-drawer {
-  animation: drawer-in 180ms ease-out;
-}
-.animate-fade {
-  animation: fade-in 150ms ease-out;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .animate-drawer,
-  .animate-fade,
   .animate-pulse,
   .animate-spin {
     animation: none !important;

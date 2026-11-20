@@ -7,13 +7,15 @@
  * combinations that fail the minimum-trade gates are hatched; the chosen cell is outlined.
  */
 
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { cn } from '@/lib/utils';
 import { fmtNum } from '../lib/format';
 import type { StabilityGrid } from '../types/trading';
-import { cx } from './ui';
 
-const POSITIVE = '#3987e5';
-const NEGATIVE = '#e45a5a';
-const NEUTRAL = '#383835';
+/** Theme tokens (see `index.css`) – the heatmap is DOM, so it can use the CSS variables directly. */
+const POSITIVE = 'var(--chart-1)';
+const NEGATIVE = 'var(--down)';
+const NEUTRAL = 'var(--input)';
 /** Sharpe at which the colour saturates. */
 const SATURATION = 2;
 
@@ -23,7 +25,7 @@ function cellColor(sharpe: number): string {
   return `color-mix(in oklab, ${pole} ${Math.round(share * 85)}%, ${NEUTRAL})`;
 }
 
-const HATCH = 'repeating-linear-gradient(45deg, rgba(232,235,243,0.18) 0 2px, transparent 2px 7px)';
+const HATCH = 'repeating-linear-gradient(45deg, color-mix(in oklab, var(--foreground) 18%, transparent) 0 2px, transparent 2px 7px)';
 
 /** Share of valid cells whose Sharpe keeps at least half of the chosen cell's. */
 export function plateauShare(grid: StabilityGrid): number | null {
@@ -49,43 +51,43 @@ export default function StabilityHeatmap({ grid }: { grid: StabilityGrid }): JSX
   return (
     <div>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <p className="text-xs text-ink-2">
-          Search-period Sharpe as <span className="font-semibold text-ink">{grid.xLabel}</span>
+        <p className="text-xs text-secondary-foreground">
+          Search-period Sharpe as <span className="font-semibold text-foreground">{grid.xLabel}</span>
           {grid.yLabel !== null && (
             <>
               {' '}
-              and <span className="font-semibold text-ink">{grid.yLabel}</span>
+              and <span className="font-semibold text-foreground">{grid.yLabel}</span>
             </>
           )}{' '}
           move around the chosen values (outlined), up to two grid steps either way – fewer where a grid ends.
         </p>
         {share !== null && (
-          <span className="num text-xs text-ink-3">
+          <span className="num text-xs text-muted-foreground">
             {Math.round(share * 100)}% of neighbouring cells keep half of the Sharpe or more
             {share >= 0.6 ? ' – a plateau' : share <= 0.3 ? ' – a spike' : ''}
           </span>
         )}
       </div>
-      <div className="mt-2 overflow-x-auto">
-        <table className="num border-separate text-xs" style={{ borderSpacing: 2 }} aria-label="Parameter stability heatmap">
-          <thead>
-            <tr>
-              <th scope="col" className="px-1.5 text-right text-[10px] font-normal uppercase tracking-wide text-ink-3">
+      <div className="mt-2">
+        <Table className="num w-auto border-separate text-xs" style={{ borderSpacing: 2 }} aria-label="Parameter stability heatmap">
+          <TableHeader>
+            <TableRow className="border-0 hover:bg-transparent">
+              <TableHead scope="col" className="h-auto px-1.5 text-right text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
                 {grid.yLabel ?? ''}
-              </th>
+              </TableHead>
               {grid.xValues.map((x) => (
-                <th key={x} scope="col" className={cx('min-w-[52px] px-1 pb-1 text-center font-medium', x === grid.baseX ? 'text-ink' : 'text-ink-3')}>
+                <TableHead key={x} scope="col" className={cn('h-auto min-w-[52px] px-1 pb-1 text-center font-medium', x === grid.baseX ? 'text-foreground' : 'text-muted-foreground')}>
                   {x}
-                </th>
+                </TableHead>
               ))}
-            </tr>
-          </thead>
-          <tbody>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {rows.map((y, r) => (
-              <tr key={Number.isNaN(y) ? 'only' : y}>
-                <th scope="row" className={cx('px-1.5 text-right font-medium', y === grid.baseY ? 'text-ink' : 'text-ink-3')}>
+              <TableRow className="border-0 hover:bg-transparent" key={Number.isNaN(y) ? 'only' : y}>
+                <TableHead scope="row" className={cn('h-auto px-1.5 text-right font-medium', y === grid.baseY ? 'text-foreground' : 'text-muted-foreground')}>
                   {Number.isNaN(y) ? '' : y}
-                </th>
+                </TableHead>
                 {grid.xValues.map((x, c) => {
                   const value = grid.cells[r][c];
                   const under = grid.undersampled[r][c];
@@ -96,32 +98,32 @@ export default function StabilityHeatmap({ grid }: { grid: StabilityGrid }): JSX
                       ? `${where}: not a valid strategy`
                       : `${where}: Sharpe ${fmtNum(value)}${under ? ' (fails the minimum-trade gates)' : ''}${chosen ? ' – the chosen values' : ''}`;
                   return (
-                    <td
+                    <TableCell
                       key={x}
                       title={tip}
                       aria-label={tip}
-                      className={cx(
-                        'h-9 rounded-[4px] px-1 text-center font-medium',
-                        value === null ? 'text-ink-3' : 'text-ink',
-                        chosen && 'outline outline-2 outline-offset-[-2px] outline-[var(--color-ink)]',
+                      className={cn(
+                        'h-9 rounded-[4px] p-0 px-1 text-center font-medium',
+                        value === null ? 'text-muted-foreground' : 'text-foreground',
+                        chosen && 'outline outline-2 outline-offset-[-2px] outline-[var(--foreground)]',
                       )}
                       style={{
                         background: value === null ? 'transparent' : cellColor(value),
                         backgroundImage: under && value !== null ? HATCH : undefined,
-                        border: value === null ? '1px dashed var(--color-line)' : undefined,
+                        border: value === null ? '1px dashed var(--border)' : undefined,
                       }}
                     >
                       {value === null ? '–' : fmtNum(value, 1)}
-                    </td>
+                    </TableCell>
                   );
                 })}
-              </tr>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
-      {grid.yLabel === null && <p className="mt-1 text-[11px] text-ink-3">The strategy has a single tunable parameter, so the map is one row.</p>}
-      <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-3">
+      {grid.yLabel === null && <p className="mt-1 text-[11px] text-muted-foreground">The strategy has a single tunable parameter, so the map is one row.</p>}
+      <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2.5 w-16 rounded-sm" style={{ background: `linear-gradient(90deg, ${NEGATIVE}, ${NEUTRAL}, ${POSITIVE})` }} />
           Sharpe −{SATURATION} … 0 … +{SATURATION}
@@ -131,7 +133,7 @@ export default function StabilityHeatmap({ grid }: { grid: StabilityGrid }): JSX
           too few trades
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-2.5 w-4 rounded-sm outline outline-2 outline-offset-[-2px] outline-[var(--color-ink)]" />
+          <span className="h-2.5 w-4 rounded-sm outline outline-2 outline-offset-[-2px] outline-[var(--foreground)]" />
           chosen values
         </span>
       </div>

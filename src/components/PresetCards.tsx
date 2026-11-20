@@ -1,67 +1,76 @@
 /**
- * One-click quick-start templates (see `lib/presets.ts`): each card configures the assets,
- * timeframe, costs, direction mode and hypothesis of a common way of trading.
+ * One-click quick-start templates (see `lib/presets.ts`) as selectable shadcn Cards: each card
+ * configures the assets, timeframe, costs, direction mode and hypothesis of a common way of trading.
  */
 
 import { Check, Coins, LineChart, TrendingUp, Zap } from 'lucide-react';
-import type { RunConfig } from '../lib/config';
-import { activePreset, PRESETS, type Preset, type PresetIcon } from '../lib/presets';
-import { cx } from './ui';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import type { RunConfig } from '@/lib/config';
+import { activePreset, PRESETS, type Preset, type PresetIcon } from '@/lib/presets';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { cn } from '@/lib/utils';
 
 const ICONS: Record<PresetIcon, typeof Coins> = { coins: Coins, trend: TrendingUp, stock: LineChart, zap: Zap };
 
-export default function PresetCards({
-  config,
-  onApply,
-  disabled,
-}: {
-  config: RunConfig;
-  onApply: (preset: Preset) => void;
-  disabled: boolean;
-}): JSX.Element {
+export default function PresetCards({ config, onApply, disabled }: { config: RunConfig; onApply: (preset: Preset) => void; disabled: boolean }): JSX.Element {
   const active = activePreset(config);
   return (
-    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4" role="group" aria-label="Quick-start presets">
+    <ToggleGroup
+      type="single"
+      value={active?.id ?? ''}
+      onValueChange={(id) => {
+        const preset = PRESETS.find((entry) => entry.id === id);
+        if (preset) onApply(preset);
+      }}
+      disabled={disabled}
+      spacing={2}
+      aria-label="Quick-start presets"
+      className="grid w-full grid-cols-1 items-stretch sm:grid-cols-2 xl:grid-cols-4"
+    >
       {PRESETS.map((preset) => {
         const Icon = ICONS[preset.icon];
         const on = active?.id === preset.id;
         return (
-          <button
+          <ToggleGroupItem
             key={preset.id}
-            type="button"
-            disabled={disabled}
-            aria-pressed={on}
-            onClick={() => onApply(preset)}
-            className={cx(
-              'group flex min-w-0 flex-col gap-2 rounded-lg border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60',
-              on ? 'border-accent bg-accent/10' : 'border-line bg-base hover:border-line-strong hover:bg-hover/50',
-            )}
+            value={preset.id}
+            aria-label={preset.title}
+            className="group block h-auto w-full self-stretch rounded-xl p-0 text-left font-normal whitespace-normal hover:bg-transparent disabled:cursor-not-allowed data-[state=on]:bg-transparent"
           >
-            <div className="flex items-start justify-between gap-2">
-              <span className="flex min-w-0 items-center gap-2">
-                <span
-                  className={cx(
-                    'grid h-7 w-7 shrink-0 place-items-center rounded-md border',
-                    on ? 'border-accent/50 bg-accent/20 text-accent-strong' : 'border-line bg-raised text-ink-2',
-                  )}
-                >
-                  <Icon size={14} />
-                </span>
-                <span className="text-sm font-semibold leading-tight text-ink">{preset.title}</span>
-              </span>
-              {on && <Check size={15} className="mt-1 shrink-0 text-accent-strong" aria-label="Active preset" />}
-            </div>
-            <p className="text-xs leading-snug text-ink-2">{preset.tagline}</p>
-            <ul className="num mt-auto flex flex-wrap gap-1">
-              {preset.facts.map((fact) => (
-                <li key={fact} className="rounded border border-line bg-raised/60 px-1.5 py-0.5 text-[10.5px] text-ink-3">
-                  {fact}
-                </li>
-              ))}
-            </ul>
-          </button>
+            <Card
+              size="sm"
+              className={cn(
+                'h-full transition-colors',
+                on ? 'bg-primary/10 ring-2 ring-primary' : 'group-hover:bg-accent/50 group-hover:ring-input',
+              )}
+            >
+              <CardHeader className="grid-cols-[1fr_auto]">
+                <CardTitle className="flex min-w-0 items-center gap-2 text-sm font-semibold">
+                  <span
+                    className={cn(
+                      'grid size-7 shrink-0 place-items-center rounded-md border',
+                      on ? 'border-primary/50 bg-primary/20 text-primary' : 'border-border bg-muted text-secondary-foreground',
+                    )}
+                  >
+                    <Icon className="size-3.5" />
+                  </span>
+                  <span className="leading-tight">{preset.title}</span>
+                </CardTitle>
+                {on && <Check className="mt-1 size-4 text-primary" aria-label="Active preset" />}
+                <CardDescription className="col-span-2 text-xs leading-snug">{preset.tagline}</CardDescription>
+              </CardHeader>
+              <CardContent className="mt-auto flex flex-wrap gap-1">
+                {preset.facts.map((fact) => (
+                  <Badge key={fact} variant="outline" className="num rounded-md px-1.5 text-[10.5px] font-normal text-muted-foreground">
+                    {fact}
+                  </Badge>
+                ))}
+              </CardContent>
+            </Card>
+          </ToggleGroupItem>
         );
       })}
-    </div>
+    </ToggleGroup>
   );
 }

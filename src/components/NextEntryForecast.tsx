@@ -1,18 +1,25 @@
 /**
- * Next Entry Forecast card: directional readiness, the exact next-candle close
- * that would fire each entry rule, the resulting fill / stop / target, a
- * rule-by-rule checklist, and (for baskets and asset pools) a ranked table of
- * every asset. Forecasts are computed by the forecast worker.
+ * Next Entry Forecast (a shadcn Card): Long vs Short readiness Progress gauges, the directional
+ * verdict Badge, the exact next-candle close that would fire each entry rule with the resulting
+ * fill / stop / target summary Cards, a rule-by-rule checklist, a Refresh Latest Price Button and
+ * (for baskets and asset pools) a ranked Table of every asset. Forecasts are computed by the
+ * forecast worker; this file only renders them.
  */
 
 import { ArrowDownRight, ArrowUpRight, Crosshair, Loader2, RefreshCw, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { proximityRank, type CheckState, type NextEntryForecast, type SideForecast, type SideStatus, type Verdict } from '../engine/nextEntrySolver';
-import { requestForecasts, type ForecastResult } from '../lib/forecastClient';
-import { fmtDateTime, fmtPct, fmtPrice } from '../lib/format';
-import type { MarketSnapshot } from '../lib/marketSnapshot';
-import type { BacktestSettings, StrategyGenome } from '../types/trading';
-import { cx, Pill } from './ui';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { proximityRank, type CheckState, type NextEntryForecast, type SideForecast, type SideStatus, type Verdict } from '@/engine/nextEntrySolver';
+import { requestForecasts, type ForecastResult } from '@/lib/forecastClient';
+import { fmtDateTime, fmtPct, fmtPrice } from '@/lib/format';
+import type { MarketSnapshot } from '@/lib/marketSnapshot';
+import { cn } from '@/lib/utils';
+import type { BacktestSettings, StrategyGenome } from '@/types/trading';
+import { Pill } from './common';
 
 interface NextEntryForecastProps {
   /** Extra classes for the card (the margin around it). */
@@ -66,21 +73,16 @@ function ReadinessMeter({ side, forecast }: { side: 'Long' | 'Short'; forecast: 
   return (
     <div>
       <div className="mb-1 flex items-baseline justify-between text-xs">
-        <span className="font-medium text-ink-2">{side} readiness</span>
-        <span className="num font-semibold text-ink">
+        <span className="font-medium text-secondary-foreground">{side} readiness</span>
+        <span className="num font-semibold text-foreground">
           {disabled ? 'Not traded' : forecast.status === 'holding' ? 'Position open' : `${value.toFixed(0)}%`}
         </span>
       </div>
-      <div
-        className={cx('h-2 overflow-hidden rounded-full', long ? 'bg-up/15' : 'bg-down/15')}
-        role="meter"
+      <Progress
+        value={value}
         aria-label={`${side} readiness`}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={value}
-      >
-        <div className={cx('h-full rounded-full transition-[width] duration-300', long ? 'bg-up' : 'bg-down')} style={{ width: `${value}%` }} />
-      </div>
+        className={cn('h-2', long ? 'bg-up/15 *:data-[slot=progress-indicator]:bg-up' : 'bg-down/15 *:data-[slot=progress-indicator]:bg-down')}
+      />
     </div>
   );
 }
@@ -88,8 +90,8 @@ function ReadinessMeter({ side, forecast }: { side: 'Long' | 'Short'; forecast: 
 function PriceRow({ label, value, hint }: { label: string; value: string; hint?: string }): JSX.Element {
   return (
     <div className="flex items-baseline justify-between gap-3 py-1" title={hint}>
-      <dt className="text-xs text-ink-3">{label}</dt>
-      <dd className="num text-sm text-ink">{value}</dd>
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className="num text-sm text-foreground">{value}</dd>
     </div>
   );
 }
@@ -102,21 +104,24 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
   const Arrow = movePct !== null && movePct < 0 ? ArrowDownRight : ArrowUpRight;
 
   return (
-    <div className="rounded-lg border border-line bg-panel p-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <h4 className={cx('text-sm font-semibold', long ? 'text-up' : 'text-down')}>Next {long ? 'Long' : 'Short'} Entry</h4>
-        <Pill tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Pill>
-      </div>
+    <Card size="sm" className="gap-2">
+      <CardHeader>
+        <CardTitle className={cn('text-sm font-semibold', long ? 'text-up' : 'text-down')}>Next {long ? 'Long' : 'Short'} Entry</CardTitle>
+        <CardAction>
+          <Pill tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Pill>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
 
       {showPrices ? (
         <>
-          <div className="num text-xl font-semibold text-ink">
+          <div className="num text-xl font-semibold text-foreground">
             {fmtPrice(triggerPrice)}
             {status === 'blocked' && blockedNote && (
               <span className="ml-1.5 align-middle text-xs font-medium text-warn">(Blocked: {blockedNote})</span>
             )}
           </div>
-          <p className="num mt-0.5 flex items-center gap-1 text-xs text-ink-3">
+          <p className="num mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
             {status === 'pending' ? (
               'Signal fired on the last close: fills at the next open'
             ) : status === 'now' ? (
@@ -129,13 +134,13 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
               </>
             ) : (
               <>
-                <Arrow size={13} className={cx('shrink-0', movePct !== null && movePct < 0 ? 'text-down' : 'text-up')} />
+                <Arrow className={cn('size-3.5 shrink-0', movePct !== null && movePct < 0 ? 'text-down' : 'text-up')} />
                 {fmtPct(movePct, true, 2)} from {fmtPrice(lastClose)} · next candle must close {movePct !== null && movePct < 0 ? '≤' : '≥'}{' '}
                 {fmtPrice(triggerPrice)}
               </>
             )}
           </p>
-          <dl className="mt-2 divide-y divide-line/60 border-t border-line/60">
+          <dl className="mt-2 divide-y divide-border/60 border-t border-border/60">
             <PriceRow label="Signal trigger price" value={fmtPrice(triggerPrice)} hint="Close of the next candle needed to fire the entry rule" />
             <PriceRow
               label="Estimated fill"
@@ -158,16 +163,17 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
           </dl>
         </>
       ) : (
-        <p className="text-sm text-ink-3">{forecast.reason ?? 'No trigger price on the next candle.'}</p>
+        <p className="text-sm text-muted-foreground">{forecast.reason ?? 'No trigger price on the next candle.'}</p>
       )}
-      {showPrices && forecast.reason && <p className="mt-2 text-xs text-ink-3">{forecast.reason}</p>}
+      {showPrices && forecast.reason && <p className="mt-2 text-xs text-muted-foreground">{forecast.reason}</p>}
       {forecast.conflict && (
         <p className="mt-2 flex items-start gap-1.5 text-xs text-warn">
-          <TriangleAlert size={13} className="mt-0.5 shrink-0" />
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
           {forecast.conflict}
         </p>
       )}
-    </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -175,7 +181,7 @@ function Checklist({ forecast }: { forecast: SideForecast }): JSX.Element | null
   if (forecast.conditions.length === 0) return null;
   return (
     <div>
-      <div className={cx('mb-1.5 text-xs font-semibold', forecast.side === 'long' ? 'text-up' : 'text-down')}>
+      <div className={cn('mb-1.5 text-xs font-semibold', forecast.side === 'long' ? 'text-up' : 'text-down')}>
         {forecast.side === 'long' ? 'Long' : 'Short'} rules
       </div>
       <ul className="space-y-1.5">
@@ -184,8 +190,8 @@ function Checklist({ forecast }: { forecast: SideForecast }): JSX.Element | null
             <Pill tone={CHECK_TONE[check.state]} className="mt-px w-[84px] shrink-0 justify-center">
               {CHECK_LABEL[check.state]}
             </Pill>
-            <span className="min-w-0 text-ink-2">
-              <span className="text-[11px] uppercase tracking-wider text-ink-3">{check.job} · </span>
+            <span className="min-w-0 text-secondary-foreground">
+              <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{check.job} · </span>
               <span className="num">{stripTag(check.text)}</span>
             </span>
           </li>
@@ -261,53 +267,47 @@ export default function NextEntryForecast({ className, genome, settings, snapsho
   };
 
   return (
-    <section className={cx('rounded-xl border border-accent/30 bg-raised/40 p-4', className ?? 'mx-5 mb-5')} aria-labelledby="next-entry-title">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <Crosshair size={16} className="text-accent-strong" />
-            <h3 id="next-entry-title" className="text-sm font-semibold text-ink">
-              Next Entry Forecast
-            </h3>
-            {forecast && <Pill tone={VERDICT_TONE[forecast.verdict]}>{forecast.verdict}</Pill>}
-            {(computing || refreshing) && <Loader2 size={14} className="animate-spin text-ink-3" aria-label="Updating" />}
-          </div>
-          {forecast && snapshot && (
-            <p className="num mt-1 text-xs text-ink-3">
-              Last close {fmtPrice(forecast.lastClose)} · candle of {fmtDateTime(forecast.lastTime)} · ATR(14) {fmtPrice(forecast.atr)} ·{' '}
-              {snapshot.simulated ? 'simulated prices' : snapshot.venue} · fetched {fmtDateTime(snapshot.fetchedAt)}
-            </p>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={() => void refresh()}
-          disabled={refreshing || !snapshot}
-          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel px-3 text-xs font-medium text-ink-2 transition-colors hover:bg-hover hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          <RefreshCw size={13} className={cx(refreshing && 'animate-spin')} />
-          {refreshing ? 'Fetching…' : 'Refresh Latest Price'}
-        </button>
-      </div>
+    <Card className={cn('gap-0 py-4 ring-primary/30', className)} aria-labelledby="next-entry-title">
+      <CardHeader className="px-4">
+        <CardTitle id="next-entry-title" className="flex flex-wrap items-center gap-2 text-sm font-semibold">
+          <Crosshair className="size-4 text-primary" />
+          Next Entry Forecast
+          {forecast && <Pill tone={VERDICT_TONE[forecast.verdict]}>{forecast.verdict}</Pill>}
+          {(computing || refreshing) && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="Updating" />}
+        </CardTitle>
+        {forecast && snapshot && (
+          <CardDescription className="num text-xs">
+            Last close {fmtPrice(forecast.lastClose)} · candle of {fmtDateTime(forecast.lastTime)} · ATR(14) {fmtPrice(forecast.atr)} ·{' '}
+            {snapshot.simulated ? 'simulated prices' : snapshot.venue} · fetched {fmtDateTime(snapshot.fetchedAt)}
+          </CardDescription>
+        )}
+        <CardAction>
+          <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing || !snapshot}>
+            <RefreshCw className={cn(refreshing && 'animate-spin')} />
+            {refreshing ? 'Fetching…' : 'Refresh Latest Price'}
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="px-4">
 
       {snapshot?.simulated && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs text-warn">
-          <TriangleAlert size={13} className="mt-0.5 shrink-0" />
-          Live candles were unavailable, so these levels come from simulated prices and are not tradable.
-        </p>
+        <Alert className="mt-3 border-warn/40 bg-warn/10 text-warn">
+          <TriangleAlert />
+          <AlertDescription className="text-current">Live candles were unavailable, so these levels come from simulated prices and are not tradable.</AlertDescription>
+        </Alert>
       )}
-      {error && (
-        <p role="alert" className="mt-2 text-xs text-down">
-          {error}
-        </p>
+      {(error || primary?.error) && (
+        <Alert variant="destructive" className="mt-3">
+          <TriangleAlert />
+          <AlertDescription>{error ?? primary?.error}</AlertDescription>
+        </Alert>
       )}
-      {primary?.error && <p className="mt-2 text-xs text-down">{primary.error}</p>}
 
       {!forecast ? (
-        <p className="mt-3 flex items-center gap-2 text-sm text-ink-3">
+        <p className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
           {snapshot ? (
             <>
-              <Loader2 size={14} className="animate-spin" /> Solving the next-candle trigger prices…
+              <Loader2 className="size-3.5 animate-spin" /> Solving the next-candle trigger prices…
             </>
           ) : (
             'Latest candles are not available for this run.'
@@ -316,48 +316,48 @@ export default function NextEntryForecast({ className, genome, settings, snapsho
       ) : (
         <div className="mt-3 space-y-4">
           {forecast.position && (
-            <div className="rounded-lg border border-accent/40 bg-accent/10 p-3 text-sm">
-              <div className="font-semibold text-ink">
+            <Alert className="block border-primary/40 bg-primary/10 p-3 text-sm">
+              <div className="font-semibold text-foreground">
                 In a {forecast.position.dir} position since {fmtDateTime(forecast.position.entryTime)} at {fmtPrice(forecast.position.entryPrice)}
-                <span className={cx('num ml-2', forecast.position.unrealisedPct >= 0 ? 'text-up' : 'text-down')}>
+                <span className={cn('num ml-2', forecast.position.unrealisedPct >= 0 ? 'text-up' : 'text-down')}>
                   {fmtPct(forecast.position.unrealisedPct, true, 2)}
                 </span>
               </div>
-              <dl className="num mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs text-ink-2 sm:grid-cols-4">
+              <dl className="num mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs text-secondary-foreground sm:grid-cols-4">
                 <div>
-                  <dt className="text-ink-3">Stop for next candle</dt>
-                  <dd className="text-ink">{fmtPrice(forecast.position.stopLoss)}</dd>
+                  <dt className="text-muted-foreground">Stop for next candle</dt>
+                  <dd className="text-foreground">{fmtPrice(forecast.position.stopLoss)}</dd>
                 </div>
                 <div>
-                  <dt className="text-ink-3">Take profit</dt>
-                  <dd className="text-ink">{forecast.position.takeProfit === null ? 'None' : fmtPrice(forecast.position.takeProfit)}</dd>
+                  <dt className="text-muted-foreground">Take profit</dt>
+                  <dd className="text-foreground">{forecast.position.takeProfit === null ? 'None' : fmtPrice(forecast.position.takeProfit)}</dd>
                 </div>
                 <div>
-                  <dt className="text-ink-3">Signal exit / reversal at close</dt>
-                  <dd className="text-ink">
+                  <dt className="text-muted-foreground">Signal exit / reversal at close</dt>
+                  <dd className="text-foreground">
                     {forecast.position.signalExitPrice === null ? 'None in range' : fmtPrice(forecast.position.signalExitPrice)}
-                    {forecast.position.signalExitSource && <span className="text-ink-3"> ({forecast.position.signalExitSource})</span>}
+                    {forecast.position.signalExitSource && <span className="text-muted-foreground"> ({forecast.position.signalExitSource})</span>}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-ink-3">Time stop</dt>
-                  <dd className="text-ink">{forecast.position.timeStopIn === null ? 'None' : `${forecast.position.timeStopIn} candles left`}</dd>
+                  <dt className="text-muted-foreground">Time stop</dt>
+                  <dd className="text-foreground">{forecast.position.timeStopIn === null ? 'None' : `${forecast.position.timeStopIn} candles left`}</dd>
                 </div>
               </dl>
               {(forecast.position.breakevenLocked || forecast.position.breakevenAt !== null) && (
-                <p className="num mt-1.5 text-xs text-ink-2">
+                <p className="num mt-1.5 text-xs text-secondary-foreground">
                   Breakeven lock:{' '}
                   {forecast.position.breakevenLocked ? (
                     <span className="font-medium text-up">active – the stop sits at the entry price, this trade can no longer become a full loss</span>
                   ) : (
                     <>
-                      moves the stop to the entry once price reaches <span className="font-medium text-ink">{fmtPrice(forecast.position.breakevenAt)}</span> (+1R)
+                      moves the stop to the entry once price reaches <span className="font-medium text-foreground">{fmtPrice(forecast.position.breakevenAt)}</span> (+1R)
                     </>
                   )}
                 </p>
               )}
               {forecast.position.exitAtNextOpen && <p className="mt-1.5 text-xs font-medium text-warn">{forecast.position.exitAtNextOpen}</p>}
-            </div>
+            </Alert>
           )}
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -377,45 +377,45 @@ export default function NextEntryForecast({ className, genome, settings, snapsho
 
           {ranked.length > 1 && (
             <div>
-              <div className="mb-1.5 text-xs font-semibold text-ink-2">All assets, closest to an entry first</div>
-              <div className="overflow-x-auto rounded-lg border border-line">
-                <table className="num w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-line bg-raised/50 text-[11px] uppercase tracking-wider text-ink-3">
-                      <th scope="col" className="px-3 py-2 text-left font-medium">Asset</th>
-                      <th scope="col" className="px-3 py-2 text-right font-medium">Last close</th>
-                      <th scope="col" className="px-3 py-2 text-left font-medium">Verdict</th>
-                      <th scope="col" className="px-3 py-2 text-right font-medium">Long</th>
-                      <th scope="col" className="px-3 py-2 text-right font-medium">Short</th>
-                      <th scope="col" className="px-3 py-2 text-left font-medium">Nearest trigger</th>
-                    </tr>
-                  </thead>
-                  <tbody>
+              <div className="mb-1.5 text-xs font-semibold text-secondary-foreground">All assets, closest to an entry first</div>
+              <div className="rounded-lg border border-border">
+                <Table className="num">
+                  <TableHeader>
+                    <TableRow className="bg-muted/50 text-[11px] uppercase tracking-wider hover:bg-muted/50">
+                      <TableHead>Asset</TableHead>
+                      <TableHead className="text-right">Last close</TableHead>
+                      <TableHead>Verdict</TableHead>
+                      <TableHead className="text-right">Long</TableHead>
+                      <TableHead className="text-right">Short</TableHead>
+                      <TableHead>Nearest trigger</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
                     {ranked.map(({ key, forecast: f }) => {
                       const asset = snapshot?.assets.find((a) => a.key === key);
                       return (
-                        <tr key={key} className="border-b border-line/70 last:border-b-0">
-                          <th scope="row" className="whitespace-nowrap px-3 py-1.5 text-left font-normal text-ink">
+                        <TableRow key={key}>
+                          <TableHead scope="row" className="font-normal text-foreground">
                             {asset?.label ?? key}
-                            {asset?.primary && <span className="ml-1.5 text-[11px] text-ink-3">(traded)</span>}
-                          </th>
-                          <td className="px-3 py-1.5 text-right text-ink-2">{fmtPrice(f.lastClose)}</td>
-                          <td className="px-3 py-1.5">
+                            {asset?.primary && <span className="ml-1.5 text-[11px] text-muted-foreground">(traded)</span>}
+                          </TableHead>
+                          <TableCell className="text-right text-secondary-foreground">{fmtPrice(f.lastClose)}</TableCell>
+                          <TableCell>
                             <Pill tone={VERDICT_TONE[f.verdict]}>{f.verdict}</Pill>
-                          </td>
-                          <td className="px-3 py-1.5 text-right text-ink-2">{tableReadiness(f.long)}</td>
-                          <td className="px-3 py-1.5 text-right text-ink-2">{tableReadiness(f.short)}</td>
-                          <td className="whitespace-nowrap px-3 py-1.5 text-ink-2">{nearest(f)}</td>
-                        </tr>
+                          </TableCell>
+                          <TableCell className="text-right text-secondary-foreground">{tableReadiness(f.long)}</TableCell>
+                          <TableCell className="text-right text-secondary-foreground">{tableReadiness(f.short)}</TableCell>
+                          <TableCell className="text-secondary-foreground">{nearest(f)}</TableCell>
+                        </TableRow>
                       );
                     })}
-                  </tbody>
-                </table>
+                  </TableBody>
+                </Table>
               </div>
             </div>
           )}
 
-          <p className="text-[11px] leading-relaxed text-ink-3">
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
             Trigger prices are solved on the strategy's own rules: the next candle is simulated opening at the last close and closing at
             each candidate price, then bisected to the exact close where the rule turns true. Fills assume the following open matches that
             close, slipped by the backtester's own rule ({settings.slippagePct}% fixed
@@ -423,6 +423,7 @@ export default function NextEntryForecast({ className, genome, settings, snapsho
           </p>
         </div>
       )}
-    </section>
+      </CardContent>
+    </Card>
   );
 }

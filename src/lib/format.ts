@@ -104,6 +104,6 @@ export function fmtDuration(ms: number): string {
 
 /** Tailwind text colour for a signed value (profit / loss / neutral). */
 export function toneClass(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) return 'text-ink-2';
+  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) return 'text-secondary-foreground';
   return value > 0 ? 'text-up' : 'text-down';
 }

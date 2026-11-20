@@ -1,16 +1,30 @@
 /**
  * Top action bar (sticky): the brand, the primary "1-Click Run" button that launches a scan with the
- * active preset, Stop, the compact trial-budget meter of the selected data window, the "Reset Runs &
- * Clear Cache" button (with a confirmation that spells out what a reset does to multiple-testing
- * tracking) and the four-step workflow indicator.
+ * active preset, Stop, the trial-budget meter of the selected data window (Progress + Badge, with an
+ * Alert banner once the budget degrades significance or is spent), the "Reset Runs & Clear Cache"
+ * button with its Dialog confirmation, and the four-step workflow indicator.
  */
 
 import { Activity, Loader2, Play, RotateCcw, Square, TriangleAlert } from 'lucide-react';
-import { useEffect, useId, useRef, useState } from 'react';
-import { fmtInt, fmtNum } from '../lib/format';
-import type { BudgetStatus } from '../lib/trialLedger';
-import { BUDGET_EXTENSION, type EngineStatus } from '../types/trading';
-import { cx } from './ui';
+import { useState } from 'react';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { Progress } from '@/components/ui/progress';
+import { fmtInt, fmtNum } from '@/lib/format';
+import type { BudgetStatus } from '@/lib/trialLedger';
+import { cn } from '@/lib/utils';
+import { BUDGET_EXTENSION, type EngineStatus } from '@/types/trading';
 
 interface TopActionBarProps {
   status: EngineStatus;
@@ -29,11 +43,11 @@ interface TopActionBarProps {
   stage: number;
 }
 
-const BUDGET_TONE: Record<BudgetStatus['level'], { label: string; text: string; bar: string }> = {
-  fresh: { label: 'Fresh data', text: 'text-up', bar: 'bg-accent' },
-  degrading: { label: 'Significance degrading', text: 'text-warn', bar: 'bg-warn' },
-  critical: { label: 'Nearly spent', text: 'text-down', bar: 'bg-down' },
-  exhausted: { label: 'Budget spent', text: 'text-down', bar: 'bg-down' },
+const BUDGET_TONE: Record<BudgetStatus['level'], { label: string; badge: string; bar: string }> = {
+  fresh: { label: 'Fresh data', badge: 'border-up/35 bg-up/10 text-up', bar: '' },
+  degrading: { label: 'Significance degrading', badge: 'border-warn/35 bg-warn/10 text-warn', bar: '*:data-[slot=progress-indicator]:bg-warn' },
+  critical: { label: 'Nearly spent', badge: 'border-down/35 bg-down/10 text-down', bar: '*:data-[slot=progress-indicator]:bg-down' },
+  exhausted: { label: 'Budget spent', badge: 'border-down/35 bg-down/10 text-down', bar: '*:data-[slot=progress-indicator]:bg-down' },
 };
 
 const STEPS = [
@@ -44,16 +58,8 @@ const STEPS = [
 ];
 
 /** Compact trial-budget meter: trials used on the selected data window across every run and session. */
-function TrialBudgetMeter({
-  budget,
-  onExtend,
-}: {
-  budget: TopActionBarProps['budget'];
-  onExtend: () => void;
-}): JSX.Element {
-  if (!budget) {
-    return <div className="text-xs text-ink-3">Trial budget: pick valid assets</div>;
-  }
+function TrialBudgetMeter({ budget }: { budget: TopActionBarProps['budget'] }): JSX.Element {
+  if (!budget) return <div className="text-xs text-muted-foreground">Trial budget: pick valid assets</div>;
   const { status, estimated } = budget;
   const tone = BUDGET_TONE[status.level];
   const title =
@@ -62,196 +68,169 @@ function TrialBudgetMeter({
     `${fmtNum(status.luckSharpe)} by chance alone.${status.extensions > 0 ? ` Extended ${status.extensions}× – significance is degraded.` : ''}` +
     (estimated ? ' (Estimated until the data is downloaded.)' : '');
   return (
-    <div className="flex min-w-0 items-center gap-2" title={title}>
-      <div className="min-w-[150px]">
-        <div className="flex items-baseline justify-between gap-2 text-[11px]">
-          <span className="font-medium uppercase tracking-wider text-ink-3">Trial budget</span>
-          <span className={cx('truncate font-semibold', tone.text)}>{tone.label}</span>
-        </div>
-        <div
-          className="mt-1 h-1.5 overflow-hidden rounded-full bg-accent/15"
-          role="progressbar"
-          aria-label="Trial budget used on this data window"
-          aria-valuemin={0}
-          aria-valuemax={status.limit}
-          aria-valuenow={status.used}
-        >
-          <div className={cx('h-full rounded-full transition-[width] duration-150 ease-linear', tone.bar)} style={{ width: `${status.share * 100}%` }} />
-        </div>
-        <div className="num mt-0.5 text-[11px] text-ink-3">
-          <span className="font-semibold text-ink-2">{fmtInt(status.used)}</span> / {fmtInt(status.limit)} trials
-          {status.extensions > 0 ? ` · extended ${status.extensions}×` : ''}
-        </div>
+    <div className="min-w-[170px]" title={title}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Trial budget</span>
+        <Badge variant="outline" className={cn('h-4 rounded-md px-1.5 text-[10.5px]', tone.badge)}>
+          {tone.label}
+        </Badge>
       </div>
-      {status.level === 'exhausted' && (
-        <button
-          type="button"
-          onClick={onExtend}
-          title={`Allow ${BUDGET_EXTENSION.toLocaleString('en-US')} more trials on this data window. Earlier trials keep counting, so the luck hurdle keeps rising.`}
-          className="inline-flex h-8 shrink-0 items-center rounded-md border border-warn/60 px-2 text-xs font-semibold text-warn transition-colors hover:bg-warn/15"
-        >
-          Extend +{fmtInt(BUDGET_EXTENSION)}
-        </button>
-      )}
+      <Progress value={Math.min(100, status.share * 100)} aria-label="Trial budget used on this data window" className={cn('mt-1.5 h-1.5', tone.bar)} />
+      <div className="num mt-0.5 text-[11px] text-muted-foreground">
+        <span className="font-semibold text-secondary-foreground">{fmtInt(status.used)}</span> / {fmtInt(status.limit)} trials
+        {status.extensions > 0 ? ` · extended ${status.extensions}×` : ''}
+      </div>
     </div>
   );
 }
 
-/** Confirmation dialog of the reset: what it clears and what that does to multiple-testing tracking. */
-function ResetDialog({ onCancel, onConfirm, running }: { onCancel: () => void; onConfirm: () => void; running: boolean }): JSX.Element {
-  const titleId = useId();
-  const textId = useId();
-  const cancelRef = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    cancelRef.current?.focus();
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onCancel]);
+/** Banner under the bar once the data window's budget is degrading significance, nearly spent or spent. */
+function BudgetAlert({ budget, onExtend }: { budget: TopActionBarProps['budget']; onExtend: () => void }): JSX.Element | null {
+  if (!budget || budget.status.level === 'fresh') return null;
+  const { status } = budget;
+  const spent = status.level === 'exhausted';
+  const severe = spent || status.level === 'critical';
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-base/70 p-4 backdrop-blur-sm" onMouseDown={onCancel}>
-      <div
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        aria-describedby={textId}
-        onMouseDown={(event) => event.stopPropagation()}
-        className="w-full max-w-md rounded-xl border border-line-strong bg-panel p-5 shadow-2xl"
-      >
-        <div className="flex items-start gap-3">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-warn/15 text-warn">
-            <TriangleAlert size={18} />
-          </span>
-          <div className="min-w-0">
-            <h2 id={titleId} className="text-base font-semibold text-ink">
-              Reset runs and clear the cache?
-            </h2>
-            <div id={textId} className="mt-1.5 space-y-2 text-sm text-ink-2">
-              <p>
-                {running ? 'The running scan is stopped and ' : ''}Every cached strategy, the leaderboard, the elite kept across restarts, the
-                trial and restart counters and the holdout reveal log are deleted from this browser.
-              </p>
-              <p className="rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs text-warn">
-                Clearing the history resets multiple-testing tracking: earlier trials stop raising the luck hurdle of the deflated Sharpe, and
-                holdouts you have already seen will look untouched again. Only reset when you start genuinely new research.
-              </p>
-              <p className="text-xs text-ink-3">Your settings and saved tickers are kept.</p>
-            </div>
-          </div>
-        </div>
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            ref={cancelRef}
-            type="button"
-            onClick={onCancel}
-            className="inline-flex h-9 items-center rounded-lg border border-line px-4 text-sm text-ink-2 transition-colors hover:bg-hover hover:text-ink"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-down/90 px-4 text-sm font-semibold text-white transition-colors hover:bg-down"
-          >
-            <RotateCcw size={14} /> Reset everything
-          </button>
-        </div>
-      </div>
-    </div>
+    <Alert className={cn('mt-2.5', severe ? 'border-down/40 bg-down/10 text-down' : 'border-warn/40 bg-warn/10 text-warn')}>
+      <TriangleAlert />
+      <AlertTitle>
+        {spent
+          ? 'The trial budget of this data window is spent.'
+          : status.level === 'critical'
+            ? 'The trial budget of this data window is nearly spent.'
+            : 'Multiple-testing significance is degrading on this data window.'}
+      </AlertTitle>
+      <AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-2 text-current">
+        <span className="min-w-0 flex-1">
+          {fmtInt(status.used)} of {fmtInt(status.limit)} evaluations have been made on these symbols and dates. Every extra trial raises the luck
+          hurdle (now Sharpe ≈ {fmtNum(status.luckSharpe)}).{' '}
+          {spent ? 'Pick other assets or another period, or extend the budget knowingly.' : 'Consider fresh data for new research.'}
+        </span>
+        {spent && (
+          <Button size="sm" variant="outline" onClick={onExtend} className="border-current bg-transparent text-current">
+            Extend +{fmtInt(BUDGET_EXTENSION)} trials
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
   );
 }
 
-export default function TopActionBar({
-  status,
-  presetTitle,
-  onRun,
-  onStop,
-  runBlocked,
-  budget,
-  onExtendBudget,
-  onReset,
-  stage,
-}: TopActionBarProps): JSX.Element {
-  const [confirming, setConfirming] = useState(false);
+/** "Reset Runs & Clear Cache" with its Dialog: what it clears and what that does to multiple-testing tracking. */
+function ResetButton({ running, onReset }: { running: boolean; onReset: () => void }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button
+          variant="outline"
+          size="lg"
+          title="Stop any scan and delete every cached run, strategy and trial / holdout record from this browser"
+          className="hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive"
+        >
+          <RotateCcw /> Reset Runs &amp; Clear Cache
+        </Button>
+      </DialogTrigger>
+      <DialogContent role="alertdialog" className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <TriangleAlert className="size-5 text-warn" /> Reset runs and clear the cache?
+          </DialogTitle>
+          <DialogDescription>
+            {running ? 'The running scan is stopped and ' : ''}Every cached strategy, the leaderboard, the elite kept across restarts, the trial and
+            restart counters and the holdout reveal log are deleted from this browser.
+          </DialogDescription>
+        </DialogHeader>
+        <Alert className="border-warn/40 bg-warn/10 text-warn">
+          <TriangleAlert />
+          <AlertDescription className="text-current">
+            Clearing the history resets multiple-testing tracking: earlier trials stop raising the luck hurdle of the deflated Sharpe, and holdouts
+            you have already seen will look untouched again. Only reset when you start genuinely new research.
+          </AlertDescription>
+        </Alert>
+        <p className="text-xs text-muted-foreground">Your settings and saved tickers are kept.</p>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="outline">Cancel</Button>
+          </DialogClose>
+          <Button
+            variant="destructive"
+            onClick={() => {
+              setOpen(false);
+              onReset();
+            }}
+          >
+            <RotateCcw /> Reset everything
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export default function TopActionBar({ status, presetTitle, onRun, onStop, runBlocked, budget, onExtendBudget, onReset, stage }: TopActionBarProps): JSX.Element {
   const busy = status === 'loading' || status === 'optimizing';
   return (
-    <header className="sticky top-0 z-30 -mx-4 border-b border-line bg-base/90 px-4 py-2.5 backdrop-blur sm:-mx-6 sm:px-6">
+    <header className="sticky top-0 z-30 -mx-4 border-b border-border bg-background/90 px-4 py-2.5 backdrop-blur sm:-mx-6 sm:px-6">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
         <div className="flex items-center gap-2.5">
-          <div className="grid h-9 w-9 place-items-center rounded-lg border border-accent/40 bg-accent/15 text-accent-strong">
-            <Activity size={18} />
+          <div className="grid size-9 place-items-center rounded-lg border border-primary/40 bg-primary/15 text-primary">
+            <Activity className="size-[18px]" />
           </div>
           <div className="leading-tight">
-            <h1 className="text-base font-semibold text-ink">StrategyFinder</h1>
-            <p className="hidden text-[11px] text-ink-3 2xl:block">Discover, stress-test and export robust strategies</p>
+            <h1 className="text-base font-semibold text-foreground">StrategyFinder</h1>
+            <p className="hidden text-[11px] text-muted-foreground 2xl:block">Discover, stress-test and export robust strategies</p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           {busy ? (
-            <button
-              type="button"
-              onClick={onStop}
-              className="inline-flex h-10 items-center gap-2 rounded-lg border border-down/50 bg-down/10 px-4 text-sm font-semibold text-down transition-colors hover:bg-down/20"
-            >
-              {status === 'loading' ? <Loader2 size={15} className="animate-spin" /> : <Square size={13} fill="currentColor" />}
+            <Button variant="destructive" size="lg" onClick={onStop} className="h-10 px-4">
+              {status === 'loading' ? <Loader2 className="animate-spin" /> : <Square className="fill-current" />}
               {status === 'loading' ? 'Loading data… Stop' : 'Stop scan'}
-            </button>
+            </Button>
           ) : (
-            <button
-              type="button"
+            <Button
+              size="lg"
               onClick={onRun}
               disabled={runBlocked !== null}
               title={runBlocked ?? `Start a discovery scan with ${presetTitle ? `the "${presetTitle}" preset` : 'the current custom settings'}`}
-              className="inline-flex h-10 items-center gap-2 rounded-lg bg-accent px-5 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(90,156,236,0.4)] transition-colors hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60"
+              className="h-10 px-5 font-semibold"
             >
-              <Play size={15} fill="currentColor" /> 1-Click Run
-            </button>
+              <Play className="fill-current" /> 1-Click Run
+            </Button>
           )}
-          <span className="max-w-[220px] truncate text-xs text-ink-3" title={presetTitle ?? 'Custom settings'}>
+          <span className="max-w-[220px] truncate text-xs text-muted-foreground" title={presetTitle ?? 'Custom settings'}>
             {presetTitle ? (
               <>
-                Preset: <span className="text-ink-2">{presetTitle}</span>
+                Preset: <span className="text-secondary-foreground">{presetTitle}</span>
               </>
             ) : (
-              <span className="text-ink-2">Custom settings</span>
+              <span className="text-secondary-foreground">Custom settings</span>
             )}
           </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <TrialBudgetMeter budget={budget} onExtend={onExtendBudget} />
-          <button
-            type="button"
-            onClick={() => setConfirming(true)}
-            title="Stop any scan and delete every cached run, strategy and trial / holdout record from this browser"
-            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-line px-3 text-xs font-semibold text-ink-2 transition-colors hover:border-down/50 hover:bg-down/10 hover:text-down"
-          >
-            <RotateCcw size={13} /> Reset Runs &amp; Clear Cache
-          </button>
+          <TrialBudgetMeter budget={budget} />
+          <ResetButton running={busy} onReset={onReset} />
         </div>
 
         <nav aria-label="Workflow" className="flex flex-wrap items-center gap-1 lg:ml-auto">
           {STEPS.map((step, index) => (
             <span key={step.n} className="inline-flex items-center gap-1">
-              <a
-                href={`#${step.target}`}
-                aria-current={stage === step.n ? 'step' : undefined}
-                className={cx(
-                  'inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs transition-colors',
-                  stage === step.n
-                    ? 'border-accent/60 bg-accent/15 font-semibold text-ink'
-                    : stage > step.n
-                      ? 'border-line text-ink-2 hover:text-ink'
-                      : 'border-line text-ink-3 hover:text-ink-2',
-                )}
+              <Button
+                asChild
+                size="sm"
+                variant="ghost"
+                className={cn('rounded-full border', stage === step.n ? 'border-primary/60 bg-primary/15 font-semibold text-foreground' : 'border-border text-muted-foreground')}
               >
-                <span className="num">{step.n}</span> {step.label}
-              </a>
+                <a href={`#${step.target}`} aria-current={stage === step.n ? 'step' : undefined}>
+                  <span className="num">{step.n}</span> {step.label}
+                </a>
+              </Button>
               {index < STEPS.length - 1 && (
-                <span aria-hidden="true" className="text-ink-3">
+                <span aria-hidden="true" className="text-muted-foreground">
                   ›
                 </span>
               )}
@@ -259,16 +238,7 @@ export default function TopActionBar({
           ))}
         </nav>
       </div>
-      {confirming && (
-        <ResetDialog
-          running={busy}
-          onCancel={() => setConfirming(false)}
-          onConfirm={() => {
-            setConfirming(false);
-            onReset();
-          }}
-        />
-      )}
+      <BudgetAlert budget={budget} onExtend={onExtendBudget} />
     </header>
   );
 }

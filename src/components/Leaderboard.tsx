@@ -1,6 +1,7 @@
 /**
- * Step 3 – the live, sortable ranked leaderboard. Clicking a row opens the strategy in the
- * Strategy Workbench below; ticking up to three rows compares them side by side.
+ * Step 3 – the live, sortable ranked leaderboard: a shadcn Table with status Badges (Robust /
+ * Marginal / Overfit risk) and Tooltip explanations on every column header. Clicking a row opens
+ * the strategy in the Strategy Workbench below; ticking up to three rows compares them side by side.
  *
  * The default order is the run's rank: strategies passing every robustness gate first, then the
  * rest by composite fitness. Risk-adjusted, selection-bias-aware figures lead (sparkline, deflated
@@ -11,11 +12,17 @@
 
 import { ChevronDown, ChevronsUpDown, ChevronUp, Columns3, Lock } from 'lucide-react';
 import { useMemo, useState, type ReactNode } from 'react';
-import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '../engine/describe';
-import { MAX_PARAMETERS } from '../engine/genome';
-import { fmtInt, fmtNum, fmtPct, fmtUsd } from '../lib/format';
-import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type TradeGates, type Verdict } from '../types/trading';
-import { cx, Panel, Pill, Sparkline, StepHeader } from './ui';
+import { Button } from '@/components/ui/button';
+import { CardHeader } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { judgedFolds } from '@/engine/backtester';
+import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '@/engine/describe';
+import { MAX_PARAMETERS } from '@/engine/genome';
+import { fmtInt, fmtNum, fmtPct, fmtUsd } from '@/lib/format';
+import { cn } from '@/lib/utils';
+import { LEADERBOARD_SIZE, type EngineStatus, type StrategyResult, type TradeGates, type Verdict } from '@/types/trading';
+import { InfoTip, Panel, Pill, Sparkline, StepHeader, type PillTone } from './common';
 
 /** Strategies that can be compared at once. */
 export const MAX_COMPARE = 3;
@@ -41,6 +48,7 @@ type SortKey =
   | 'stress'
   | 'params'
   | 'gates'
+  | 'folds'
   | 'dsr'
   | 'valSharpe'
   | 'sortino'
@@ -85,7 +93,7 @@ interface Column {
 }
 
 export function VerdictPill({ verdict }: { verdict: Verdict | null }): JSX.Element {
-  if (verdict === null) return <span className="text-[11px] text-ink-3">pending</span>;
+  if (verdict === null) return <span className="text-[11px] text-muted-foreground">pending</span>;
   return <Pill tone={verdict === 'Robust' ? 'up' : verdict === 'Fragile' ? 'warn' : 'down'}>{verdict}</Pill>;
 }
 
@@ -93,6 +101,22 @@ export function VerdictPill({ verdict }: { verdict: Verdict | null }): JSX.Eleme
 function gatesPassed(strategy: StrategyResult): number {
   const r = strategy.robust;
   return r ? [r.validation, r.folds, r.neighbours, r.significance].filter(Boolean).length : 0;
+}
+
+/** Search-period status: Robust (every gate), Marginal (one gate short) or Overfit risk (two or more short). */
+function robustStatus(strategy: StrategyResult): { label: string; tone: PillTone } | null {
+  if (!strategy.robust) return null;
+  const passed = gatesPassed(strategy);
+  if (strategy.robust.passed) return { label: 'Robust', tone: 'up' };
+  return passed === 3 ? { label: 'Marginal', tone: 'warn' } : { label: 'Overfit risk', tone: 'down' };
+}
+
+/** Profitable folds among the folds the strategy is judged on (flat folds set aside, as in the fold gate). */
+function foldTally(strategy: StrategyResult): { profitable: number; judged: number } | null {
+  const folds = strategy.folds;
+  if (!folds || folds.length === 0) return null;
+  const judged = judgedFolds(folds);
+  return { profitable: judged.filter((k) => folds[k].roi > 0).length, judged: judged.length };
 }
 
 const COLUMNS: Column[] = [
@@ -105,9 +129,9 @@ const COLUMNS: Column[] = [
     firstDir: 'asc',
     render: (row) => (
       <div className="flex items-center gap-1.5">
-        <span className={cx('num font-semibold', row.rank === 1 ? 'text-accent-strong' : 'text-ink-2')}>#{row.rank}</span>
+        <span className={cn('num font-semibold', row.rank === 1 ? 'text-primary' : 'text-secondary-foreground')}>#{row.rank}</span>
         {row.locked && (
-          <span title="Locked: this strategy's holdout has been revealed" className="text-accent-strong">
+          <span title="Locked: this strategy's holdout has been revealed" className="text-primary">
             <Lock size={12} aria-label="Locked" />
           </span>
         )}
@@ -123,22 +147,38 @@ const COLUMNS: Column[] = [
   },
   {
     key: 'gates',
-    label: 'Checks',
-    title: 'Robustness gates passed on the search period: validation, fold consistency, neighbour stability, significance (trades + DSR ≥ 50%)',
+    label: 'Status',
+    title:
+      'Robustness gates on the search period – validation, fold consistency, neighbour stability, significance (trades + DSR ≥ 50%). Robust: all 4 pass · Marginal: 3 of 4 · Overfit risk: 2 or fewer.',
     align: 'left',
     value: ({ strategy }) => gatesPassed(strategy),
     render: ({ strategy }) => {
       const r = strategy.robust;
-      if (!r) return <span className="text-ink-3">–</span>;
-      const failed = [
-        !r.validation && 'validation',
-        !r.folds && 'folds',
-        !r.neighbours && 'neighbours',
-        !r.significance && 'significance',
-      ].filter(Boolean);
+      const status = robustStatus(strategy);
+      if (!r || !status) return <span className="text-muted-foreground">–</span>;
+      const failed = [!r.validation && 'validation', !r.folds && 'folds', !r.neighbours && 'neighbours', !r.significance && 'significance'].filter(Boolean);
       return (
-        <span title={r.passed ? 'Passes every robustness gate on the search period' : `Fails: ${failed.join(', ')}`}>
-          <Pill tone={r.passed ? 'up' : 'neutral'}>{r.passed ? 'All 4 ✓' : `${gatesPassed(strategy)}/4`}</Pill>
+        <Pill tone={status.tone} title={r.passed ? 'Passes every robustness gate on the search period' : `${gatesPassed(strategy)}/4 gates · fails: ${failed.join(', ')}`}>
+          {status.label}
+        </Pill>
+      );
+    },
+  },
+  {
+    key: 'folds',
+    label: 'Fold consistency',
+    title: 'Profitable time slices of the search period, out of the slices the strategy traded in (flat slices set aside). 3 of 5 are needed, none losing more than 35%.',
+    align: 'right',
+    value: ({ strategy }) => {
+      const tally = foldTally(strategy);
+      return tally ? tally.profitable / Math.max(1, tally.judged) : -1;
+    },
+    render: ({ strategy }) => {
+      const tally = foldTally(strategy);
+      if (!tally) return <span className="text-muted-foreground">–</span>;
+      return (
+        <span className={cn('font-semibold', strategy.robust?.folds ? 'text-up' : 'text-secondary-foreground')}>
+          {tally.profitable}/{tally.judged}
         </span>
       );
     },
@@ -156,7 +196,7 @@ const COLUMNS: Column[] = [
           <Pill tone="bench">{strategy.genome.archetype === 'TREND' ? 'Trend' : 'Mean rev.'}</Pill>
           {strategy.genome.shortEntry !== null && <Pill tone="accent">{strategy.genome.shortRegime ? 'Asym. L/S' : 'L/S'}</Pill>}
         </div>
-        <div className="num mt-1 truncate text-[11px] text-ink-3" title={groupFormula(strategy.genome.longEntry)}>
+        <div className="num mt-1 truncate text-[11px] text-muted-foreground" title={groupFormula(strategy.genome.longEntry)}>
           {groupFormula(strategy.genome.longEntry)}
         </div>
       </div>
@@ -169,27 +209,27 @@ const COLUMNS: Column[] = [
     align: 'right',
     value: ({ strategy }) => strategy.dsr,
     render: ({ strategy }) => (
-      <span className={cx('font-semibold', strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-ink-2')}>
+      <span className={cn('font-semibold', strategy.dsr >= 0.95 ? 'text-up' : strategy.dsr >= 0.5 ? 'text-warn' : 'text-secondary-foreground')}>
         {fmtPct(strategy.dsr * 100, false, 0)}
       </span>
     ),
   },
   {
     key: 'stress',
-    label: 'Stress test',
+    label: 'Monte Carlo · DD95',
     title:
       'Monte Carlo: 500 replays of the trades with 10% skipped, the order shuffled and random slippage shocks. Share of replays that end in profit, and the 95th-percentile worst drawdown.',
     align: 'right',
     value: ({ strategy }) => strategy.monteCarlo?.probProfit ?? -1,
     render: ({ strategy }) => {
       const mc = strategy.monteCarlo;
-      if (!mc) return <span className="text-ink-3">–</span>;
+      if (!mc) return <span className="text-muted-foreground">–</span>;
       return (
         <span className="inline-flex flex-col items-end leading-tight">
-          <span className={cx('font-semibold', mc.passed ? 'text-up' : mc.probProfit >= 0.6 ? 'text-warn' : 'text-down')}>
+          <span className={cn('font-semibold', mc.passed ? 'text-up' : mc.probProfit >= 0.6 ? 'text-warn' : 'text-down')}>
             {fmtPct(mc.probProfit * 100, false, 0)}
           </span>
-          <span className="text-[10.5px] text-ink-3">DD95 {fmtPct(mc.drawdownP95, false, 0)}</span>
+          <span className="text-[10.5px] text-muted-foreground">DD95 {fmtPct(mc.drawdownP95, false, 0)}</span>
         </span>
       );
     },
@@ -200,7 +240,7 @@ const COLUMNS: Column[] = [
     title: 'Annualised Sharpe ratio on the validation segment (the input to the deflated Sharpe)',
     align: 'right',
     value: ({ strategy }) => strategy.validation.sharpe,
-    render: ({ strategy }) => <span className="text-ink">{fmtNum(strategy.validation.sharpe)}</span>,
+    render: ({ strategy }) => <span className="text-foreground">{fmtNum(strategy.validation.sharpe)}</span>,
   },
   {
     key: 'sharpe',
@@ -209,7 +249,7 @@ const COLUMNS: Column[] = [
     title: 'Annualised Sharpe ratio over train + validation (risk-free rate 0)',
     align: 'right',
     value: ({ strategy }) => strategy.search.sharpe,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.sharpe)}</span>,
+    render: ({ strategy }) => <span className="text-secondary-foreground">{fmtNum(strategy.search.sharpe)}</span>,
   },
   {
     key: 'sortino',
@@ -217,7 +257,7 @@ const COLUMNS: Column[] = [
     title: 'Annualised Sortino ratio over train + validation',
     align: 'right',
     value: ({ strategy }) => strategy.search.sortino,
-    render: ({ strategy }) => <span className="text-ink-2">{fmtNum(strategy.search.sortino)}</span>,
+    render: ({ strategy }) => <span className="text-secondary-foreground">{fmtNum(strategy.search.sortino)}</span>,
   },
   {
     key: 'maxDrawdown',
@@ -226,7 +266,7 @@ const COLUMNS: Column[] = [
     align: 'right',
     value: ({ strategy }) => strategy.search.maxDrawdown,
     firstDir: 'asc',
-    render: ({ strategy }) => <span className="text-ink-2">{fmtPct(strategy.search.maxDrawdown)}</span>,
+    render: ({ strategy }) => <span className="text-secondary-foreground">{fmtPct(strategy.search.maxDrawdown)}</span>,
   },
   {
     key: 'trades',
@@ -235,8 +275,8 @@ const COLUMNS: Column[] = [
     align: 'right',
     value: ({ strategy }) => strategy.search.trades,
     render: ({ strategy }) => (
-      <span className="text-ink-2">
-        {fmtInt(strategy.search.trades)} <span className="text-ink-3">({fmtInt(strategy.validation.trades)})</span>
+      <span className="text-secondary-foreground">
+        {fmtInt(strategy.search.trades)} <span className="text-muted-foreground">({fmtInt(strategy.validation.trades)})</span>
       </span>
     ),
   },
@@ -246,7 +286,7 @@ const COLUMNS: Column[] = [
     label: 'Win Rate (%)',
     align: 'right',
     value: ({ strategy }) => strategy.search.winRate,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.search.winRate)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtPct(strategy.search.winRate)}</span>,
   },
   {
     key: 'profitFactor',
@@ -255,7 +295,7 @@ const COLUMNS: Column[] = [
     title: 'Gross profit ÷ gross loss',
     align: 'right',
     value: ({ strategy }) => strategy.search.profitFactor,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.search.profitFactor)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtNum(strategy.search.profitFactor)}</span>,
   },
   {
     key: 'roi',
@@ -264,7 +304,7 @@ const COLUMNS: Column[] = [
     title: 'Return on starting capital over train + validation – the data the search optimised on, so it is biased upwards',
     align: 'right',
     value: ({ strategy }) => strategy.search.roi,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.search.roi, true)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtPct(strategy.search.roi, true)}</span>,
   },
   {
     key: 'netPnl',
@@ -273,7 +313,7 @@ const COLUMNS: Column[] = [
     title: 'Net profit after fees, slippage and financing over train + validation',
     align: 'right',
     value: ({ strategy }) => strategy.search.netPnl,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtUsd(strategy.search.netPnl, true)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtUsd(strategy.search.netPnl, true)}</span>,
   },
   {
     key: 'alpha',
@@ -282,7 +322,7 @@ const COLUMNS: Column[] = [
     title: 'Strategy ROI minus Buy & Hold ROI over train + validation, in percentage points. Not risk-adjusted, so it is not alpha.',
     align: 'right',
     value: ({ strategy }) => strategy.alpha,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtPct(strategy.alpha, true)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtPct(strategy.alpha, true)}</span>,
   },
   {
     key: 'mode',
@@ -295,7 +335,7 @@ const COLUMNS: Column[] = [
       <div className="flex items-center gap-1.5 whitespace-nowrap">
         <Pill tone={strategy.genome.exit.mode === 'static' ? 'neutral' : 'accent'}>{exitModeLabel(strategy.genome)}</Pill>
         {exitTags(strategy.genome).length > 0 && (
-          <span className="text-[11px] text-ink-3">{exitTags(strategy.genome).join(' · ')}</span>
+          <span className="text-[11px] text-muted-foreground">{exitTags(strategy.genome).join(' · ')}</span>
         )}
       </div>
     ),
@@ -308,7 +348,7 @@ const COLUMNS: Column[] = [
     align: 'right',
     value: ({ strategy }) => strategy.params,
     firstDir: 'asc',
-    render: ({ strategy }) => <span className="text-ink-2">{strategy.params}</span>,
+    render: ({ strategy }) => <span className="text-secondary-foreground">{strategy.params}</span>,
   },
   {
     key: 'verdict',
@@ -327,7 +367,7 @@ const COLUMNS: Column[] = [
       'Composite fitness: 1.5 × the median-fold risk-adjusted return (Sortino / Calmar) + expectancy × trade frequency − a drawdown guard beyond 25%, blended 30% towards the one-step parameter neighbours when they are worse. The deflated Sharpe is a gate, not part of the score.',
     align: 'right',
     value: ({ strategy }) => strategy.fitness,
-    render: ({ strategy }) => <span className="text-ink-3">{fmtNum(strategy.fitness)}</span>,
+    render: ({ strategy }) => <span className="text-muted-foreground">{fmtNum(strategy.fitness)}</span>,
   },
 ];
 
@@ -379,36 +419,34 @@ export default function Leaderboard({
 
   return (
     <Panel className="overflow-hidden">
-      <div className="border-b border-line px-4 py-3">
+      <CardHeader className="border-b px-4 py-3">
         <StepHeader
           step={3}
           title={`Ranked leaderboard · ${strategies.length} / ${LEADERBOARD_SIZE}`}
           hint="Robust strategies first, then by composite fitness. Returns are in-sample. Click a row to open it in the workbench; tick up to three to compare."
         >
-          <button
-            type="button"
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => setAllColumns((on) => !on)}
             aria-pressed={allColumns}
-            className={cx(
-              'inline-flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors',
-              allColumns ? 'border-accent/50 bg-accent/10 text-accent-strong' : 'border-line text-ink-2 hover:bg-hover hover:text-ink',
-            )}
+            className={cn(allColumns && 'border-primary/50 bg-primary/10 text-primary')}
           >
-            <Columns3 size={13} /> {allColumns ? 'Key columns' : 'All columns'}
-          </button>
+            <Columns3 /> {allColumns ? 'Key columns' : 'All columns'}
+          </Button>
         </StepHeader>
-      </div>
+      </CardHeader>
 
       {strategies.length === 0 ? (
         <div className="px-4 py-14 text-center">
-          <p className="text-sm text-ink-2">
+          <p className="text-sm text-secondary-foreground">
             {status === 'optimizing' || status === 'loading'
               ? 'Searching for strategies that clear the minimum-trade gates…'
               : status === 'converged' || status === 'stopped'
                 ? 'No strategy cleared the minimum-trade gates.'
                 : 'No strategies yet.'}
           </p>
-          <p className="mt-1 text-xs text-ink-3">
+          <p className="mt-1 text-xs text-muted-foreground">
             {status === 'optimizing' || status === 'loading'
               ? gateText
                 ? `Only strategies with ${gateText} can be listed.`
@@ -419,110 +457,86 @@ export default function Leaderboard({
           </p>
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="num w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-line bg-raised/40">
-                <th scope="col" className="w-8 pl-4 pr-1 py-2 text-left align-bottom text-[11px] font-medium uppercase tracking-wide text-ink-3" title={`Tick up to ${MAX_COMPARE} strategies to compare them side by side`}>
-                  Cmp
-                </th>
-                {columns.map((column) => {
-                  const sortable = column.value !== undefined;
-                  const active = sortable && sort.key === column.key;
-                  return (
-                    <th
-                      key={column.key}
-                      scope="col"
-                      title={column.title}
-                      aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
-                      className={cx(
-                        'px-2.5 py-2 align-bottom text-[11px] font-medium uppercase leading-tight tracking-wide last:pr-4',
-                        column.align === 'right' ? 'max-w-[104px] text-right' : 'whitespace-nowrap text-left',
-                        active ? 'text-ink' : 'text-ink-3',
-                      )}
-                    >
-                      {sortable ? (
-                        <button
-                          type="button"
-                          onClick={() => toggleSort(column)}
-                          className={cx(
-                            'inline-flex items-end gap-1 uppercase tracking-wide transition-colors hover:text-ink',
-                            column.align === 'right' && 'flex-row-reverse text-right',
-                          )}
-                        >
-                          {column.label}
-                          {active ? (
-                            sort.dir === 'asc' ? (
-                              <ChevronUp size={12} className="shrink-0" />
-                            ) : (
-                              <ChevronDown size={12} className="shrink-0" />
-                            )
-                          ) : (
-                            <ChevronsUpDown size={12} className="shrink-0 opacity-40" />
-                          )}
-                        </button>
-                      ) : (
-                        column.label
-                      )}
-                    </th>
-                  );
-                })}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => {
-                const selected = row.strategy.id === selectedId;
-                const compared = compareIds.includes(row.strategy.id);
-                const compareFull = !compared && compareIds.length >= MAX_COMPARE;
+        <Table className="num">
+          <TableHeader>
+            <TableRow className="bg-muted/40 hover:bg-muted/40">
+              <TableHead className="w-8 pl-4 text-[11px] uppercase tracking-wide">
+                <InfoTip tip={`Tick up to ${MAX_COMPARE} strategies to compare them side by side`}>Cmp</InfoTip>
+              </TableHead>
+              {columns.map((column) => {
+                const sortable = column.value !== undefined;
+                const active = sortable && sort.key === column.key;
+                const label = column.title ? <InfoTip tip={column.title}>{column.label}</InfoTip> : column.label;
                 return (
-                  <tr
-                    key={row.strategy.id}
-                    tabIndex={0}
-                    aria-selected={selected}
-                    aria-label={`Rank ${row.rank}, strategy ${row.strategy.id}. Open in the workbench`}
-                    onClick={() => onSelect(row.strategy)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        onSelect(row.strategy);
-                      }
-                    }}
-                    className={cx(
-                      'cursor-pointer border-b border-line/70 transition-colors last:border-b-0 focus-visible:outline-none',
-                      selected
-                        ? 'bg-accent/10 shadow-[inset_3px_0_0_0_var(--color-accent)]'
-                        : 'hover:bg-hover/70 focus-visible:bg-hover/70',
+                  <TableHead
+                    key={column.key}
+                    aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
+                    className={cn(
+                      'h-auto py-2 align-bottom text-[11px] font-medium uppercase leading-tight tracking-wide last:pr-4',
+                      column.align === 'right' ? 'max-w-[120px] text-right' : 'text-left',
+                      active ? 'text-foreground' : 'text-muted-foreground',
                     )}
                   >
-                    <td className="w-8 pl-4 pr-1 align-middle" onClick={(event) => event.stopPropagation()}>
-                      <input
-                        type="checkbox"
-                        checked={compared}
-                        disabled={compareFull}
-                        onChange={() => onToggleCompare(row.strategy)}
-                        onKeyDown={(event) => event.stopPropagation()}
-                        aria-label={`Compare strategy ${row.strategy.id}`}
-                        title={compareFull ? `At most ${MAX_COMPARE} strategies can be compared` : 'Compare side by side'}
-                        className="h-3.5 w-3.5 cursor-pointer accent-[var(--color-accent)] disabled:cursor-not-allowed"
-                      />
-                    </td>
-                    {columns.map((column) => (
-                      <td
-                        key={column.key}
-                        className={cx(
-                          'px-2.5 py-2 align-middle last:pr-4',
-                          column.align === 'right' ? 'whitespace-nowrap text-right' : 'text-left',
-                        )}
-                      >
-                        {column.render(row)}
-                      </td>
-                    ))}
-                  </tr>
+                    <span className={cn('inline-flex items-end gap-1', column.align === 'right' && 'flex-row-reverse')}>
+                      {sortable ? (
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => toggleSort(column)}
+                          aria-label={`Sort by ${column.label}`}
+                          className={cn('shrink-0', !active && 'opacity-50')}
+                        >
+                          {active ? sort.dir === 'asc' ? <ChevronUp /> : <ChevronDown /> : <ChevronsUpDown />}
+                        </Button>
+                      ) : null}
+                      <span className="whitespace-normal">{label}</span>
+                    </span>
+                  </TableHead>
                 );
               })}
-            </tbody>
-          </table>
-        </div>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => {
+              const selected = row.strategy.id === selectedId;
+              const compared = compareIds.includes(row.strategy.id);
+              const compareFull = !compared && compareIds.length >= MAX_COMPARE;
+              return (
+                <TableRow
+                  key={row.strategy.id}
+                  tabIndex={0}
+                  data-state={selected ? 'selected' : undefined}
+                  aria-selected={selected}
+                  aria-label={`Rank ${row.rank}, strategy ${row.strategy.id}. Open in the workbench`}
+                  onClick={() => onSelect(row.strategy)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onSelect(row.strategy);
+                    }
+                  }}
+                  className={cn('cursor-pointer focus-visible:bg-accent focus-visible:outline-none', selected && 'bg-primary/10 shadow-[inset_3px_0_0_0_var(--primary)]')}
+                >
+                  <TableCell className="w-8 pl-4" onClick={(event) => event.stopPropagation()}>
+                    <Checkbox
+                      checked={compared}
+                      disabled={compareFull}
+                      onCheckedChange={() => onToggleCompare(row.strategy)}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      aria-label={`Compare strategy ${row.strategy.id}`}
+                      title={compareFull ? `At most ${MAX_COMPARE} strategies can be compared` : 'Compare side by side'}
+                    />
+                  </TableCell>
+                  {columns.map((column) => (
+                    <TableCell key={column.key} className={cn('py-2 last:pr-4', column.align === 'right' ? 'text-right' : 'whitespace-normal text-left')}>
+                      {column.render(row)}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
       )}
     </Panel>
   );
