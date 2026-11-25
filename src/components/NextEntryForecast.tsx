@@ -142,6 +142,20 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
           </p>
           <dl className="mt-2 divide-y divide-border/60 border-t border-border/60">
             <PriceRow label="Signal trigger price" value={fmtPrice(triggerPrice)} hint="Close of the next candle needed to fire the entry rule" />
+            {forecast.nonPriceBlockers.length > 0 && (
+              <div className="py-1.5 text-xs">
+                <div className="flex items-center gap-1.5 font-medium text-warn">
+                  <TriangleAlert className="size-3.5 shrink-0" /> Also needs (price alone cannot do it)
+                </div>
+                <ul className="mt-1 space-y-0.5 text-muted-foreground">
+                  {forecast.nonPriceBlockers.map((blocker) => (
+                    <li key={blocker.formula}>
+                      <span className="num text-secondary-foreground">{blocker.formula}</span> – {blocker.detail}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <PriceRow
               label="Estimated fill"
               value={fmtPrice(forecast.fillPrice)}
@@ -164,6 +178,15 @@ function SideCard({ forecast, lastClose }: { forecast: SideForecast; lastClose: 
         </>
       ) : (
         <p className="text-sm text-muted-foreground">{forecast.reason ?? 'No trigger price on the next candle.'}</p>
+      )}
+      {!showPrices && forecast.nonPriceBlockers.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-xs text-warn">
+          {forecast.nonPriceBlockers.map((blocker) => (
+            <li key={blocker.formula}>
+              {blocker.formula}: {blocker.detail}
+            </li>
+          ))}
+        </ul>
       )}
       {showPrices && forecast.reason && <p className="mt-2 text-xs text-muted-foreground">{forecast.reason}</p>}
       {forecast.conflict && (
@@ -337,6 +360,13 @@ export default function NextEntryForecast({ className, genome, settings, snapsho
                   <dd className="text-foreground">
                     {forecast.position.signalExitPrice === null ? 'None in range' : fmtPrice(forecast.position.signalExitPrice)}
                     {forecast.position.signalExitSource && <span className="text-muted-foreground"> ({forecast.position.signalExitSource})</span>}
+                  </dd>
+                </div>
+                <div title="The stop after the next candle closes at the last price: breakeven lock and trailing ratchet applied from the current state">
+                  <dt className="text-muted-foreground">Stop after next close</dt>
+                  <dd className="text-foreground">
+                    {fmtPrice(forecast.position.projectedStop)}
+                    <span className="text-muted-foreground"> ({forecast.position.stopState === 'breakeven' ? 'breakeven locked' : forecast.position.stopState})</span>
                   </dd>
                 </div>
                 <div>

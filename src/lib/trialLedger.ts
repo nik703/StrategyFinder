@@ -4,7 +4,8 @@
  * The deflated Sharpe ratio only protects against luck if it knows how
  * many strategies were really tried on the data. A run that started from zero every time would let
  * a user run the optimiser ten times and pick the luckiest run. So every run records its trials
- * here – count, mean and spread of their annualised Sharpe ratios – in localStorage, keyed by the
+ * here – count, mean and spread of their annualised Sharpe ratios – in the IndexedDB ledger store
+ * (see `storage.ts`; mirrored in memory, so every read here is synchronous), keyed by the
  * symbols and the dates of the SEARCH period (train + validation). A later run whose search period
  * overlaps an earlier one (on a shared symbol, by at least half of the shorter window) inherits
  * those trials: they raise its selection-bias hurdle and count against the window's budget of
@@ -15,6 +16,7 @@
 
 import { splitFor } from '../engine/backtester';
 import { expectedMaxSharpe, RunningStats } from './stats';
+import { deleteLedgerRecords, LEGACY_KEYS, ledgerRecords, putLedgerRecords, registerLegacyMigration, type LedgerRecord } from './storage';
 import {
   INTERVAL_MS,
   RANGE_DAYS,
@@ -27,10 +29,8 @@ import {
   type TrialStats,
 } from '../types/trading';
 
-const STORAGE_KEY = 'strategyfinder.trialLedger.v1';
-const EXTENSIONS_KEY = 'strategyfinder.budgetExtensions.v1';
-/** Every localStorage key of the trial ledger (cleared by "Reset Runs & Clear Cache"). */
-export const TRIAL_LEDGER_KEYS: readonly string[] = [STORAGE_KEY, EXTENSIONS_KEY];
+/** Legacy localStorage keys of the trial ledger (migrated into IndexedDB on first load). */
+export const TRIAL_LEDGER_KEYS: readonly string[] = [LEGACY_KEYS.trials, LEGACY_KEYS.extensions];
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365.25 * DAY_MS;
 /** Oldest records are dropped beyond this many. */
@@ -100,10 +100,14 @@ export function priorTrials(window: TrialWindow, excludeRunId: string | null = n
 /** Create or update this run's record. Called as the run progresses, so a reload mid-run keeps its trials. */
 export function recordRunTrials(window: TrialWindow, runId: string, stats: TrialStats, hypothesis: string | null, now: number = Date.now()): void {
   if (!(stats.count > 0)) return;
-  const all = readAll().filter((record) => record.runId !== runId);
-  all.push({ ...window, symbols: normaliseSymbols(window.symbols), runId, hypothesis, updatedAt: now, count: stats.count, mean: stats.mean, m2: stats.m2 });
-  persist(all.slice(-MAX_RECORDS));
+  const record: TrialRecord = { ...window, symbols: normaliseSymbols(window.symbols), runId, hypothesis, updatedAt: now, count: stats.count, mean: stats.mean, m2: stats.m2 };
+  putLedgerRecords([trialEntry(record)]);
+  // Oldest records beyond the cap are dropped.
+  const all = readAll().sort((a, b) => a.updatedAt - b.updatedAt);
+  if (all.length > MAX_RECORDS) deleteLedgerRecords(all.slice(0, all.length - MAX_RECORDS).map((r) => `trials:${r.runId}`));
 }
+
+const trialEntry = (record: TrialRecord): LedgerRecord<TrialRecord> => ({ id: `trials:${record.runId}`, kind: 'trials', data: record });
 
 /** A user's explicit decision to search a data window beyond its budget. */
 interface BudgetExtension extends TrialWindow {
@@ -111,10 +115,11 @@ interface BudgetExtension extends TrialWindow {
 }
 
 function readExtensions(): BudgetExtension[] {
-  try {
-    const raw = window.localStorage.getItem(EXTENSIONS_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) return [];
+  return validExtensions(ledgerRecords<unknown>('extension').map((record) => record.data));
+}
+
+function validExtensions(parsed: unknown[]): BudgetExtension[] {
+  {
     return parsed.filter(
       (e): e is BudgetExtension =>
         typeof e === 'object' &&
@@ -124,8 +129,6 @@ function readExtensions(): BudgetExtension[] {
         typeof (e as BudgetExtension).end === 'number' &&
         (e as BudgetExtension).end > (e as BudgetExtension).start,
     );
-  } catch {
-    return [];
   }
 }
 
@@ -141,14 +144,16 @@ export function windowBudget(window: TrialWindow): number {
 
 /** Record that the user chose to extend this window's budget by `BUDGET_EXTENSION` trials. */
 export function extendWindowBudget(win: TrialWindow, now: number = Date.now()): void {
-  const all = readExtensions();
-  all.push({ symbols: normaliseSymbols(win.symbols), interval: win.interval, start: win.start, end: win.end, at: now });
-  try {
-    window.localStorage.setItem(EXTENSIONS_KEY, JSON.stringify(all.slice(-MAX_RECORDS)));
-  } catch {
-    // Storage unavailable – the extension lasts for this page only via the caller's state.
-  }
+  const extension: BudgetExtension = { symbols: normaliseSymbols(win.symbols), interval: win.interval, start: win.start, end: win.end, at: now };
+  putLedgerRecords([extensionEntry(extension)]);
 }
+
+let extensionSerial = 0;
+const extensionEntry = (extension: BudgetExtension): LedgerRecord<BudgetExtension> => ({
+  id: `extension:${extension.at}:${extension.symbols.join('+')}:${extension.start}:${extensionSerial++}`,
+  kind: 'extension',
+  data: extension,
+});
 
 export type BudgetLevel = 'fresh' | 'degrading' | 'critical' | 'exhausted';
 
@@ -208,27 +213,32 @@ function isRecord(value: unknown): value is TrialRecord {
 }
 
 function readAll(): TrialRecord[] {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isRecord).map((record) => ({
-      ...record,
-      interval: record.interval in INTERVAL_MS ? record.interval : '1d',
-      hypothesis: typeof record.hypothesis === 'string' ? record.hypothesis : null,
-      updatedAt: typeof record.updatedAt === 'number' ? record.updatedAt : 0,
-      count: Math.floor(record.count),
-      m2: Math.max(0, record.m2),
-    }));
-  } catch {
-    return []; // private mode, blocked storage or corrupt data: behave as if nothing was recorded
-  }
+  return normaliseRecords(ledgerRecords<unknown>('trials').map((record) => record.data));
 }
 
-function persist(records: TrialRecord[]): void {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
-  } catch {
-    // Storage unavailable – the budget simply will not persist.
-  }
+function normaliseRecords(parsed: unknown[]): TrialRecord[] {
+  return parsed.filter(isRecord).map((record) => ({
+    ...record,
+    interval: record.interval in INTERVAL_MS ? record.interval : '1d',
+    hypothesis: typeof record.hypothesis === 'string' ? record.hypothesis : null,
+    updatedAt: typeof record.updatedAt === 'number' ? record.updatedAt : 0,
+    count: Math.floor(record.count),
+    m2: Math.max(0, record.m2),
+  }));
 }
+
+/** Legacy localStorage keys → ledger records (run once by `initStorage`). */
+registerLegacyMigration((storage) => {
+  const parse = (key: string): unknown[] => {
+    try {
+      const parsed: unknown = JSON.parse(storage.getItem(key) ?? '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  return [
+    ...normaliseRecords(parse(LEGACY_KEYS.trials)).map(trialEntry),
+    ...validExtensions(parse(LEGACY_KEYS.extensions)).map(extensionEntry),
+  ];
+});

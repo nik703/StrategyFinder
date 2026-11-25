@@ -2,7 +2,8 @@
  * Top action bar (sticky): the brand, the primary "1-Click Run" button that launches a scan with the
  * active preset, Stop, the trial-budget meter of the selected data window (Progress + Badge, with an
  * Alert banner once the budget degrades significance or is spent), the "Reset Runs & Clear Cache"
- * button with its Dialog confirmation, and the four-step workflow indicator.
+ * button with its Dialog confirmation, the Export / Import Snapshot (.json) controls, and the four-step
+ * workflow indicator.
  */
 
 import { Activity, Loader2, Play, RotateCcw, Square, TriangleAlert } from 'lucide-react';
@@ -21,6 +22,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
+import SnapshotDialogs from '@/components/SnapshotDialogs';
 import { fmtInt, fmtNum } from '@/lib/format';
 import type { BudgetStatus } from '@/lib/trialLedger';
 import { cn } from '@/lib/utils';
@@ -39,6 +41,8 @@ interface TopActionBarProps {
   onExtendBudget: () => void;
   /** Wipe every run, cached strategy and trial / holdout record (asked for confirmation first). */
   onReset: () => void;
+  /** A snapshot was imported: re-read the trial ledger and holdout log. */
+  onSnapshotImported: () => void;
   /** Current step of the guided workflow (1–4). */
   stage: number;
 }
@@ -137,8 +141,9 @@ function ResetButton({ running, onReset }: { running: boolean; onReset: () => vo
             <TriangleAlert className="size-5 text-warn" /> Reset runs and clear the cache?
           </DialogTitle>
           <DialogDescription>
-            {running ? 'The running scan is stopped and ' : ''}Every cached strategy, the leaderboard, the elite kept across restarts, the trial and
-            restart counters and the holdout reveal log are deleted from this browser.
+            {running ? 'Every pooled worker is stopped at once, pending work is dropped and ' : ''}Every cached strategy, the leaderboard, the elite kept
+            across restarts, the trial and restart counters, the holdout reveal log, the saved runs and the cached candles are deleted from this
+            browser.
           </DialogDescription>
         </DialogHeader>
         <Alert className="border-warn/40 bg-warn/10 text-warn">
@@ -148,7 +153,7 @@ function ResetButton({ running, onReset }: { running: boolean; onReset: () => vo
             you have already seen will look untouched again. Only reset when you start genuinely new research.
           </AlertDescription>
         </Alert>
-        <p className="text-xs text-muted-foreground">Your settings and saved tickers are kept.</p>
+        <p className="text-xs text-muted-foreground">Your settings and saved tickers are kept. Export a snapshot first if you may want the history back.</p>
         <DialogFooter>
           <DialogClose asChild>
             <Button variant="outline">Cancel</Button>
@@ -168,7 +173,18 @@ function ResetButton({ running, onReset }: { running: boolean; onReset: () => vo
   );
 }
 
-export default function TopActionBar({ status, presetTitle, onRun, onStop, runBlocked, budget, onExtendBudget, onReset, stage }: TopActionBarProps): JSX.Element {
+export default function TopActionBar({
+  status,
+  presetTitle,
+  onRun,
+  onStop,
+  runBlocked,
+  budget,
+  onExtendBudget,
+  onReset,
+  onSnapshotImported,
+  stage,
+}: TopActionBarProps): JSX.Element {
   const busy = status === 'loading' || status === 'optimizing';
   return (
     <header className="sticky top-0 z-30 -mx-4 border-b border-border bg-background/90 px-4 py-2.5 backdrop-blur sm:-mx-6 sm:px-6">
@@ -214,6 +230,7 @@ export default function TopActionBar({ status, presetTitle, onRun, onStop, runBl
         <div className="flex flex-wrap items-center gap-3">
           <TrialBudgetMeter budget={budget} />
           <ResetButton running={busy} onReset={onReset} />
+          <SnapshotDialogs onImported={onSnapshotImported} />
         </div>
 
         <nav aria-label="Workflow" className="flex flex-wrap items-center gap-1 lg:ml-auto">

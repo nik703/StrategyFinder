@@ -93,15 +93,16 @@ export const PRESETS: readonly Preset[] = [
   {
     id: 'intraday-scalp-15m',
     title: 'Intraday Scalp (15m)',
-    tagline: 'Fade short-term extremes inside quiet ranges on the two most liquid crypto pairs, both directions.',
+    tagline: 'Fade short-term extremes inside quiet ranges on the two most liquid crypto pairs – shorts only inside a bear regime.',
     icon: 'zap',
-    facts: ['BTC · ETH pool', '15m candles · 1 year', 'Mirrored L/S + funding', '0.05% fee + ATR slippage'],
+    facts: ['BTC · ETH pool', '15m candles · 1 year', 'Asymmetric L/S + funding', '0.05% fee + ATR slippage'],
     patch: {
       assetMode: 'pool',
       pool: 'BTC-USD, ETH-USD',
       interval: '15m',
       range: '1y',
-      tradeMode: 'long-short',
+      // Quick-start presets never mirror the long rules into shorts in every regime.
+      tradeMode: 'asymmetric',
       hypothesis: 'RANGE_REVERSION',
       feePct: 0.05,
       slippagePct: 0.02,

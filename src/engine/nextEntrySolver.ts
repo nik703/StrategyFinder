@@ -19,12 +19,13 @@
 
 import { BacktestWorkspace, evaluateCondition, evaluateGroup, fillSlippage, resolveOperands, runBacktest } from './backtester';
 import { conditionOperands, conditionFormula } from './describe';
+import { exitSpec } from './strategyAst';
 import { conditionRole } from './genome';
 import { IndicatorCache } from './indicators';
 import { allowsShorts, type BacktestSettings, type CmpOp, type Condition, type OHLCV, type RuleGroup, type StrategyGenome } from '../types/trading';
 
 /** Trailing candles used when probing the next bar (enough for every 200-bar lookback to converge). */
-export const SOLVER_WINDOW = 2000;
+export const SOLVER_WINDOW = Number.POSITIVE_INFINITY;
 /** Grid points across the scan range (odd, so the last close is a grid point). */
 export const SCAN_POINTS = 241;
 /** Bisection steps after the grid scan. */
@@ -100,6 +101,12 @@ export interface SideForecast {
   /** Breakeven lock: the price at +1R that moves the stop to the entry (null without a lock). */
   breakevenAt: number | null;
   blockers: Blocker[];
+  /**
+   * Conditions no next-candle close can change – a lagging filter (ADX, a slow average, volume), a
+   * squeeze that is not on yet, a time-stop cooldown – reported alongside the trigger price: the
+   * trigger alone is not enough while any of them stands.
+   */
+  nonPriceBlockers: Blocker[];
   /** Why the side cannot enter (unreachable / disabled / holding). */
   reason: string | null;
   /** Another rule that would suppress the entry at the trigger price. */
@@ -128,6 +135,14 @@ export interface PositionForecast {
   breakevenAt: number | null;
   /** True once the breakeven lock has moved the stop to the entry price. */
   breakevenLocked: boolean;
+  /**
+   * The stop after the NEXT candle closes, if it closes at the last close (a flat candle): the
+   * engine's own update order applied to the carried state – breakeven lock first, then the
+   * trailing ratchet behind the best price since entry, never moving against the trade.
+   */
+  projectedStop: number | null;
+  /** How the stop is managed right now. */
+  stopState: 'fixed' | 'trailing' | 'breakeven';
   /** Next-candle close that would trigger an indicator exit or a reversal, with its source. */
   signalExitPrice: number | null;
   signalExitSource: string | null;
@@ -148,6 +163,72 @@ export interface NextEntryForecast {
   verdict: Verdict;
   /** Notes about assumptions that affect the forecast. */
   notes: string[];
+}
+
+/**
+ * The complete path-dependent state at the last closed candle, carried into the hypothetical next
+ * candle by the solver. Indicator state (EMAs, Wilder averages, Supertrend, squeeze on / off) is
+ * exact because the probe recomputes every indicator over the full history; the backtest state below
+ * comes from the engine's own run over that history.
+ */
+export interface SolverState {
+  /** The open position with its trailing-stop anchor, breakeven status and age, or null when flat. */
+  position: (NonNullable<BacktestWorkspace['openPosition']> & { barsHeld: number }) | null;
+  /** The time stop closes the position at the next open; that open cannot re-enter the same side (cooldown). */
+  timeStopAtNextOpen: boolean;
+  /** Consecutive closed candles each squeeze condition's Bollinger-inside-Keltner state has been on (by formula). */
+  squeezeRun: Map<string, number>;
+}
+
+/** Consecutive candles up to `last` on which Bollinger(period, 2) sat inside Keltner(period, mult). */
+function squeezeRunLength(ind: IndicatorCache, period: number, mult: number, last: number): number {
+  const bbU = ind.bbUpper(period, 2);
+  const bbL = ind.bbLower(period, 2);
+  const kcU = ind.kcUpper(period, mult);
+  const kcL = ind.kcLower(period, mult);
+  let run = 0;
+  for (let i = last; i >= 0 && bbU[i] < kcU[i] && bbL[i] > kcL[i]; i--) run++;
+  return run;
+}
+
+/** The state vector of `genome` at the last closed candle of `data` (see `SolverState`). */
+export function solverState(full: IndicatorCache, ws: BacktestWorkspace, genome: StrategyGenome): SolverState {
+  const n = full.n;
+  const open = ws.openPosition;
+  const position = open ? { ...open, barsHeld: n - open.entryBar } : null;
+  const maxBars = exitSpec(genome).timeStop;
+  const squeezeRun = new Map<string, number>();
+  for (const group of [genome.longEntry, genome.shortEntry]) {
+    for (const c of group?.conditions ?? []) {
+      if (c.ind === 'SQUEEZE') squeezeRun.set(conditionFormula(c), squeezeRunLength(full, c.period, c.mult, n - 1));
+    }
+  }
+  return { position, timeStopAtNextOpen: position !== null && maxBars !== null && position.barsHeld >= maxBars, squeezeRun };
+}
+
+/**
+ * The stop after a next candle with this `high` / `low` and ATR `atrNext` closes, from the carried
+ * state – the backtester's order: breakeven lock (+R reached) first, then the trailing ratchet behind
+ * the best price since entry; the stop never moves against the trade. Assumes the stop itself is not
+ * hit by that candle.
+ */
+export function projectStop(state: SolverState, genome: StrategyGenome, high: number, low: number, atrNext: number): { stop: number; locked: boolean } | null {
+  const p = state.position;
+  if (!p) return null;
+  const spec = exitSpec(genome);
+  let stop = p.stop;
+  let locked = p.breakevenLocked;
+  const dir = p.dir;
+  if (spec.breakevenR !== null && !locked && p.risk > 0 && (dir === 1 ? high >= p.entryPrice + spec.breakevenR * p.risk : low <= p.entryPrice - spec.breakevenR * p.risk)) {
+    locked = true;
+    if (dir === 1 ? p.entryPrice > stop : p.entryPrice < stop) stop = p.entryPrice;
+  }
+  if (spec.trailing !== null && atrNext === atrNext) {
+    const extreme = dir === 1 ? Math.max(p.extreme, high) : Math.min(p.extreme, low);
+    const next = dir === 1 ? extreme - spec.trailing.mult * atrNext : extreme + spec.trailing.mult * atrNext;
+    if (dir === 1 ? next > stop : next < stop) stop = next;
+  }
+  return { stop, locked };
 }
 
 export interface SolverInput {
@@ -624,6 +705,8 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
   const ws = new BacktestWorkspace(n);
   runBacktest(full, genome, settings, ws);
   const open = ws.openPosition;
+  // The full state vector at the last close, carried into every hypothetical next candle.
+  const state = solverState(full, ws, genome);
 
   const lastSignal = (group: RuleGroup | null): boolean => {
     if (!group) return false;
@@ -674,6 +757,7 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       trailAtrMult: null,
       breakevenAt: null,
       blockers: [],
+      nonPriceBlockers: [],
       reason: null,
       conflict: null,
       conditions: [],
@@ -692,6 +776,24 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
     const conditions = checkConditions(group, full, last, atr, scan, false);
     base.conditions = conditions;
     const dir = side === 'long' ? 1 : -1;
+    // Conditions whose truth is the same at every next close in range are not price-driven: report
+    // the false ones next to the trigger price.
+    conditions.forEach((check, i) => {
+      const first = scan.truth[0]?.[i] ?? false;
+      if (first || !scan.truth.every((row) => row[i] === first)) return;
+      const c = group.conditions[i];
+      const detail =
+        c.ind === 'SQUEEZE'
+          ? `Squeeze not on: Bollinger(${c.period}, 2) must sit inside Keltner(${c.period}, ${c.mult}) before it can release – on for ${state.squeezeRun.get(check.formula) ?? 0} closed candles`
+          : `${blockerDetail(check)} – no next-candle close can change it`;
+      base.nonPriceBlockers.push({ formula: check.formula, detail });
+    });
+    if (state.timeStopAtNextOpen && state.position && state.position.dir === dir) {
+      base.nonPriceBlockers.push({
+        formula: 'Time-stop cooldown',
+        detail: 'The time stop closes this position at the next open, and that open cannot re-enter the same side',
+      });
+    }
     const opposite = side === 'long' ? genome.shortEntry : genome.longEntry;
     const ownExit = side === 'long' ? longExit : shortExit;
     const signalNow = side === 'long' ? longNow : shortNow;
@@ -783,7 +885,11 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
     const timeStopIn = maxBars === null ? null : Math.max(0, maxBars - barsHeld);
     let exitAtNextOpen: string | null = null;
     if (timeStopIn === 0) exitAtNextOpen = `Time stop: ${maxBars} candles in the trade.`;
-    else if (dir === 1 && shortsEnabled && shortNow) exitAtNextOpen = 'The short entry fired: reverse at the next open.';
+    // A trailing ratchet or breakeven lock can leave the stop beyond the last close: a next candle
+    // that opens where the last one closed is stopped out at its open.
+    else if (Number.isFinite(open.stop) && (dir === 1 ? open.stop >= lastClose : open.stop <= lastClose)) {
+      exitAtNextOpen = `The stop (${open.stop.toPrecision(6)}) is already ${dir === 1 ? 'above' : 'below'} the last close: it fills at the next open unless the price opens ${dir === 1 ? 'above' : 'below'} it.`;
+    } else if (dir === 1 && shortsEnabled && shortNow) exitAtNextOpen = 'The short entry fired: reverse at the next open.';
     else if (dir === -1 && longNow) exitAtNextOpen = 'The long entry fired: reverse at the next open.';
     else if (dir === 1 && longExitNow) exitAtNextOpen = 'The exit signal fired: close at the next open.';
     else if (dir === -1 && shortExitNow) exitAtNextOpen = 'The exit signal fired: close at the next open.';
@@ -809,6 +915,11 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
     }
 
     const breakeven = genome.exit.breakeven === true;
+    const spec = exitSpec(genome);
+    // The stop after a flat next candle at the last close, from the carried state (trailing anchor, lock).
+    const flat = probe.cache(lastClose);
+    const atrNext = flat.atr(spec.trailing?.period ?? (spec.stop.kind === 'atr' ? spec.stop.period : 14))[probe.at];
+    const projected = projectStop(state, genome, lastClose, lastClose, atrNext);
     position = {
       dir: side,
       entryTime: data.t[open.entryBar],
@@ -823,6 +934,8 @@ export function solveNextEntry(input: SolverInput): NextEntryForecast {
       signalExitSource,
       breakevenAt: breakeven && !open.breakevenLocked && open.risk > 0 ? open.entryPrice + dir * open.risk : null,
       breakevenLocked: breakeven && open.breakevenLocked,
+      projectedStop: projected ? projected.stop : null,
+      stopState: open.breakevenLocked ? 'breakeven' : spec.trailing !== null ? 'trailing' : 'fixed',
     };
   }
 

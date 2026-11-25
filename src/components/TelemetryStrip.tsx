@@ -89,11 +89,21 @@ function ScanProgress({ telemetry, maxEvaluations, robustTarget }: { telemetry: 
   const reached = robustTarget > 0 && robustFound >= robustTarget;
   const stages: FunnelStage[] = [
     { label: 'Scored', title: 'Candidate strategies backtested on the search period (train + validation).', value: funnel.scored, of: funnel.scored, muted: true },
-    { label: 'Enough trades', title: 'Cleared the timeframe-scaled minimum-trade gates – fewer trades cannot be told apart from luck.', value: funnel.trades, of: funnel.scored },
-    { label: 'Profitable out of sample', title: 'Validation Sharpe above 0.3 and a positive validation profit after every cost.', value: funnel.validation, of: funnel.scored },
-    { label: 'Consistent over time', title: '3 of 5 time slices profitable (flat slices set aside) and none with a drawdown beyond 35%.', value: funnel.folds, of: funnel.scored },
-    { label: 'Beats luck', title: 'Deflated Sharpe of 50% or more: beats the best a random walk is expected to show after this many trials.', value: funnel.dsr, of: funnel.scored },
-    { label: 'Stable neighbours', title: 'Nearby parameter settings keep a positive median profit per trade (checked for promising candidates only).', value: funnel.neighbours, of: funnel.neighboursChecked },
+    {
+      label: '1 · Sample & folds',
+      title:
+        'Gate 1: enough effective independent trades (correlated, overlapping trades across a basket count once), a positive median-fold Sortino/Calmar and no time slice with a drawdown beyond 35%.',
+      value: funnel.sample,
+      of: funnel.scored,
+    },
+    { label: '2 · Beats luck', title: 'Gate 2: deflated Sharpe of 50% or more – beats the best a random walk is expected to show after this many trials.', value: funnel.dsr, of: funnel.scored },
+    {
+      label: '3 · Stress & stability',
+      title:
+        'Gate 3 (second tier, top 20 contenders only): the Monte Carlo stress test holds and nearby parameter settings keep a positive median profit per trade.',
+      value: funnel.stress,
+      of: funnel.stressChecked,
+    },
   ];
   return (
     <CardContent className="px-4 py-3">

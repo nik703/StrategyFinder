@@ -7,6 +7,7 @@ import {
   windowsOverlap,
   type HoldoutWindow,
 } from '../src/lib/holdoutLog';
+import { initStorage, resetStorageForTests } from '../src/lib/storage';
 import { INTERVAL_MS, RANGE_DAYS } from '../src/types/trading';
 
 /** In-memory stand-in for window.localStorage (persists across "page loads" within a test). */
@@ -28,7 +29,10 @@ class MemoryStorage {
 
 const storage = new MemoryStorage();
 (globalThis as unknown as { window: { localStorage: MemoryStorage } }).window = { localStorage: storage };
-beforeEach(() => storage.clear());
+beforeEach(() => {
+  storage.clear();
+  resetStorageForTests();
+});
 
 const DAY = 86_400_000;
 const END = Date.UTC(2026, 10, 15);
@@ -79,8 +83,10 @@ describe('holdout log', () => {
     expect(windowsOverlap(a, { ...a, start: 9, end: 20 })).toBe(true);
   });
 
-  it('counts every reveal and migrates the old end-date-keyed log', () => {
+  it('counts every reveal and migrates the old end-date-keyed log into IndexedDB on first load', async () => {
     storage.setItem('strategyfinder.holdoutViews.v1', JSON.stringify({ 'BTC-USD+ETH-USD|1d|5y|2026-11-14': 3, garbage: 'x' }));
+    // The first load (no IndexedDB here: the in-memory store) migrates the legacy localStorage key.
+    expect((await initStorage(null)).migrated).toBe(1);
     const window5y = holdoutWindowFor(['BTC-USD'], '1d', dailyTimes('5y'));
     expect(priorRevealCount(window5y)).toBe(3);
     expect(storage.getItem('strategyfinder.holdoutViews.v1')).toBeNull();
@@ -88,11 +94,15 @@ describe('holdout log', () => {
     expect(priorRevealCount(window5y)).toBe(4);
   });
 
-  it('survives corrupt or unavailable storage', () => {
-    storage.setItem('strategyfinder.holdoutReveals.v2', '{not json');
+  it('drops corrupt legacy logs during the migration', async () => {
     const w = holdoutWindowFor(['BTC-USD'], '1d', dailyTimes('1y'));
+    storage.setItem('strategyfinder.holdoutReveals.v2', '{not json');
+    expect((await initStorage(null)).migrated).toBe(0);
     expect(priorRevealCount(w)).toBe(0);
+    expect(storage.getItem('strategyfinder.holdoutReveals.v2')).toBeNull();
+    resetStorageForTests();
     storage.setItem('strategyfinder.holdoutReveals.v2', JSON.stringify([{ symbols: 'BTC-USD', start: 1, end: 0 }, null]));
+    expect((await initStorage(null)).migrated).toBe(0);
     expect(priorRevealCount(w)).toBe(0);
   });
 });

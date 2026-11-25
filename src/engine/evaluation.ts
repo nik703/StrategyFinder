@@ -13,16 +13,13 @@ import {
   barsPerYear,
   benchmarkSearch,
   combineFitness,
+  designEffects,
   expectancy,
   median,
-  neighbourhoodMedian,
   passesFoldGate,
   passesTradeGates,
-  passesValidationGate,
   ROBUST_MIN_DSR,
-  ROBUST_MIN_VALIDATION_SHARPE,
   evaluateSearch,
-  plateauFitness,
   splitFor,
   tradeGatesFor,
   tradeLogHash,
@@ -33,7 +30,19 @@ import {
 import { stepNeighbours, type GenomeLimits } from './genome';
 import { IndicatorCache } from './indicators';
 import { deflatedSharpeAgainst } from '../lib/stats';
-import type { BacktestSettings, ChartAxis, NamedDataset, OHLCV, RobustChecks, StrategyGenome, TradeGates } from '../types/trading';
+import {
+  MIN_BORROW_PCT_YEAR,
+  MIN_FUNDING_PCT_8H,
+  MIN_SLIPPAGE_ATR_MULT,
+  type BacktestSettings,
+  type ChartAxis,
+  type MonteCarloSummary,
+  type NamedDataset,
+  type OHLCV,
+  type RobustChecks,
+  type StrategyGenome,
+  type TradeGates,
+} from '../types/trading';
 
 /** Minimum number of candles required for a meaningful three-way split. */
 export const MIN_BARS = 150;
@@ -56,6 +65,11 @@ export interface Asset {
 export interface AssetScore {
   base: number;
   metrics: SearchMetrics;
+  /**
+   * Pooled runs only: in-market flag of every search-period bar of the PRIMARY asset's time axis
+   * (the basket's common clock), for the effective number of independent bets.
+   */
+  inMarket?: Uint8Array;
 }
 
 /** What scoring needs: the run's assets (primary first), the settings and the current selection-bias hurdle. */
@@ -72,6 +86,13 @@ export interface EvalContext {
   gates: TradeGates;
   /** True for a multi-asset run: every asset is traded with the same rules and the trade gates apply to the pooled trades. */
   pooled: boolean;
+  /**
+   * Pooled runs: for every asset, its bar index at each search-period bar of the primary asset's
+   * time axis (−1 where the asset has no candle at that time).
+   */
+  alignment: Int32Array[];
+  /** Pooled runs: correlation of bar returns between every pair of assets over the common search period. */
+  correlation: number[][];
 }
 
 /**
@@ -192,7 +213,9 @@ export function scoreAssets(
   for (let a = 0; a < ctx.assets.length; a++) {
     const asset = ctx.assets[a];
     const metrics = evaluateSearch(asset.ind, genome, ctx.settings, asset.ws, asset.split, asset.periodsPerYear);
-    scores.push({ base: assetBaseScore(metrics, asset.periodsPerYear), metrics });
+    const score: AssetScore = { base: assetBaseScore(metrics, asset.periodsPerYear), metrics };
+    if (ctx.pooled) score.inMarket = inMarketOnAxis(ctx, a);
+    scores.push(score);
     if (a === 0 && dedupe) {
       tradeHash = tradeLogHash(asset.ws, asset.split.holdoutStart);
       if (metrics.search.trades === 0) return { scores, complete: false, tradeHash, skip: 'inactive' };
@@ -209,21 +232,55 @@ export function tradesPerYear(ctx: EvalContext, a: number, metrics: SearchMetric
   return years > 0 ? metrics.search.trades / years : 0;
 }
 
+/** In-market flags of asset `a`'s last backtest, on the primary asset's search-period time axis. */
+function inMarketOnAxis(ctx: EvalContext, a: number): Uint8Array {
+  const asset = ctx.assets[a];
+  const map = ctx.alignment[a];
+  const out = new Uint8Array(map.length);
+  const limit = asset.split.holdoutStart;
+  const flags = asset.ws.inMarket;
+  for (let i = 0; i < map.length; i++) {
+    const k = map[i];
+    if (k >= 0 && k < limit) out[i] = flags[k];
+  }
+  return out;
+}
+
+/** The sample a strategy is gated on, raw and effective. */
+export interface Sample {
+  /** Effective train + validation trades (independent bets): the trade gates use these. */
+  trades: number;
+  validationTrades: number;
+  tradesPerYear: number;
+  /** Trades actually opened (summed over the assets of a pooled run). */
+  rawTrades: number;
+  rawValidationTrades: number;
+}
+
 /**
  * The sample a strategy is gated on: the primary asset's trades, or – in a pooled multi-asset run –
- * the trades summed over every asset.
+ * the trades of every asset, each divided by its design effect (overlap with correlated assets'
+ * trades, see `designEffects`), i.e. the effective number of independent bets.
  */
-export function sampleOf(ctx: EvalContext, scores: AssetScore[]): { trades: number; validationTrades: number; tradesPerYear: number } {
-  let trades = 0;
-  let validationTrades = 0;
-  let perYear = 0;
+export function sampleOf(ctx: EvalContext, scores: AssetScore[]): Sample {
   const counted = ctx.pooled ? scores : scores.slice(0, 1);
+  const design =
+    ctx.pooled && counted.every((score) => score.inMarket)
+      ? designEffects(
+          counted.map((score) => ({ trades: score.metrics.search.trades, inMarket: score.inMarket as Uint8Array })),
+          (a, b) => ctx.correlation[a]?.[b] ?? 0,
+        )
+      : counted.map(() => 1);
+  const out: Sample = { trades: 0, validationTrades: 0, tradesPerYear: 0, rawTrades: 0, rawValidationTrades: 0 };
   counted.forEach((score, a) => {
-    trades += score.metrics.search.trades;
-    validationTrades += score.metrics.validation.trades;
-    perYear += tradesPerYear(ctx, a, score.metrics);
+    const d = design[a];
+    out.rawTrades += score.metrics.search.trades;
+    out.rawValidationTrades += score.metrics.validation.trades;
+    out.trades += score.metrics.search.trades / d;
+    out.validationTrades += score.metrics.validation.trades / d;
+    out.tradesPerYear += tradesPerYear(ctx, a, score.metrics) / d;
   });
-  return { trades, validationTrades, tradesPerYear: perYear };
+  return out;
 }
 
 /**
@@ -252,49 +309,38 @@ export function scoreNeighbours(ctx: EvalContext, genome: StrategyGenome): Neigh
   }));
 }
 
-/**
- * Rank fitness: the candidate's own fitness blended towards the median fitness of its one-step
- * neighbours when they are worse (see `plateauFitness`). Returns the point fitness, the neighbour
- * median and the deflated Sharpe as well.
- */
-export function rankFitness(
-  ctx: EvalContext,
-  scores: AssetScore[],
-  neighbours: readonly NeighbourScore[] | null,
-): { fitness: number; point: number; neighbourMedian: number | null; dsr: number } {
-  const { fitness: point, dsr } = fitnessOf(ctx, scores);
-  if (neighbours === null || neighbours.length === 0) return { fitness: point, point, neighbourMedian: null, dsr };
-  const values = neighbours.map((nb) => fitnessOf(ctx, nb.scores).fitness);
-  return { fitness: plateauFitness(point, values), point, neighbourMedian: neighbourhoodMedian(point, values), dsr };
+/** Gate-3 inputs, computed in the second evaluation tier for the top contenders only. */
+export interface StressInputs {
+  monteCarlo: MonteCarloSummary | null;
+  /** Median expectancy per trade of the one-step neighbours (pooled over the assets in a pooled run). */
+  neighbourExpectancy: number | null;
 }
 
-/**
- * The robustness gates of a fully scored candidate (see `RobustChecks`). In a pooled run the
- * validation gate uses the median asset's Sharpe and the pooled net profit, the fold gate must hold
- * on two thirds of the assets, and the neighbours' expectancy is pooled.
- * `neighbours` null means "not checked yet": the neighbourhood gate then fails.
- */
-export function robustChecks(
-  ctx: EvalContext,
-  scores: AssetScore[],
-  dsr: number,
-  neighbours: readonly NeighbourScore[] | null,
-): RobustChecks {
-  const assets = ctx.pooled ? scores : scores.slice(0, 1);
-  const validation = ctx.pooled
-    ? median(assets.map((score) => score.metrics.validation.sharpe)) > ROBUST_MIN_VALIDATION_SHARPE &&
-      assets.reduce((sum, score) => sum + score.metrics.validation.netPnl, 0) > 0
-    : passesValidationGate(assets[0].metrics.validation);
-  const folds = assets.filter((score) => passesFoldGate(score.metrics.folds)).length >= Math.ceil((2 / 3) * assets.length - 1e-9);
+/** Median expectancy per trade over a strategy's one-step neighbours (null without neighbours). */
+export function neighbourExpectancy(ctx: EvalContext, neighbours: readonly NeighbourScore[]): number | null {
+  if (neighbours.length === 0) return null;
   const pooledExpectancy = (list: AssetScore[]): number => {
     if (!ctx.pooled) return expectancy(list[0].metrics.search);
     const trades = list.reduce((sum, score) => sum + score.metrics.search.trades, 0);
     return trades > 0 ? list.reduce((sum, score) => sum + score.metrics.search.netPnl, 0) / trades : 0;
   };
-  const neighbourhood =
-    neighbours !== null && neighbours.length > 0 && median(neighbours.map((nb) => pooledExpectancy(nb.scores))) > 0;
-  const significance = passesTradeGates({ ...sampleOf(ctx, scores), gates: ctx.gates }) && dsr >= ROBUST_MIN_DSR;
-  return { validation, folds, neighbours: neighbourhood, significance, passed: validation && folds && neighbourhood && significance };
+  return median(neighbours.map((nb) => pooledExpectancy(nb.scores)));
+}
+
+/**
+ * The three robustness gates of a fully scored candidate (see `RobustChecks`). In a pooled run the
+ * fold half of gate 1 must hold on two thirds of the assets and the sample is the effective number
+ * of independent bets. `stress` null means "not through the second tier yet": gate 3 is then open
+ * (null) and the strategy cannot pass.
+ */
+export function robustChecks(ctx: EvalContext, scores: AssetScore[], dsr: number, stress: StressInputs | null): RobustChecks {
+  const assets = ctx.pooled ? scores : scores.slice(0, 1);
+  const folds = assets.filter((score) => passesFoldGate(score.metrics.folds)).length >= Math.ceil((2 / 3) * assets.length - 1e-9);
+  const sample = folds && passesTradeGates({ ...sampleOf(ctx, scores), gates: ctx.gates });
+  const significance = dsr >= ROBUST_MIN_DSR;
+  const stressed =
+    stress === null ? null : stress.monteCarlo !== null && stress.monteCarlo.passed && stress.neighbourExpectancy !== null && stress.neighbourExpectancy > 0;
+  return { sample, dsr: significance, stress: stressed, passed: sample && significance && stressed === true };
 }
 
 /** Outcome of evaluating one candidate during the search. */
@@ -306,47 +352,108 @@ export interface CandidateResult {
   tradeHash: string | null;
   /** Set when the candidate was not scored at all (it is then not a trial). */
   skip: SkipReason | null;
-  /** Rank fitness: `pointFitness` blended with the neighbourhood (equal to it when no neighbours were scored). */
+  /** Fitness (see `combineFitness`); it does not depend on the neighbourhood or the trial count. */
   fitness: number;
-  /** Fitness of the exact parameter values. */
-  pointFitness: number;
   dsr: number;
-  /** One-grid-step neighbours – scored only for candidates whose point fitness beats `floor`. */
-  neighbours: NeighbourScore[] | null;
   /** Primary-asset equity curve on the chart axis (search period only) – only for candidates that beat `floor`. */
   curve: Float32Array | null;
 }
 
 /**
- * Evaluate one candidate against the frozen hurdle in `ctx` and the leaderboard floor.
- *
- * Every asset is scored – the robustness gates are not fitness-based, so a candidate that cannot
- * make the leaderboard may still be a robust strategy. Candidates whose own fitness beats the floor
- * – the only ones that can enter the leaderboard – also have their one-grid-step parameter
- * neighbourhood backtested, and are ranked by their fitness blended with the neighbours' median
- * (`plateauFitness`). The blend only ever lowers a score, so candidates that cannot beat the floor
- * on their own need no neighbours.
+ * FIRST evaluation tier – what the evolutionary loop runs on every candidate, on the pooled
+ * evaluator workers: one backtest per asset with the single-pass multi-fold metrics, the fitness and
+ * the deflated Sharpe against the frozen hurdle. Nothing expensive: the one-step neighbourhood grid
+ * and the Monte Carlo stress test are the SECOND tier, run by the optimiser only on the top
+ * contenders (see `optimizer.worker.ts`). Candidates whose fitness beats the leaderboard floor also
+ * return their sampled equity curve.
  */
 export function evaluateCandidate(ctx: EvalContext, genome: StrategyGenome, floor: number): CandidateResult {
   const { scores, complete, tradeHash, skip } = scoreAssets(ctx, genome, true);
-  if (!complete) return { scores, complete, tradeHash, skip, fitness: -Infinity, pointFitness: -Infinity, dsr: 0, neighbours: null, curve: null };
-  const { fitness: point, dsr } = fitnessOf(ctx, scores);
-  if (!(point > floor) || point <= UNFIT) {
-    return { scores, complete, tradeHash, skip, fitness: point, pointFitness: point, dsr, neighbours: null, curve: null };
+  if (!complete) return { scores, complete, tradeHash, skip, fitness: -Infinity, dsr: 0, curve: null };
+  const { fitness, dsr } = fitnessOf(ctx, scores);
+  // The primary asset was backtested first, so its curve must be sampled before nothing else ran on it:
+  // with several assets the primary workspace is untouched by the later assets' backtests.
+  const curve = fitness > floor && fitness > UNFIT ? sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos) : null;
+  return { scores, complete, tradeHash, skip, fitness, dsr, curve };
+}
+
+/** Index of each of `t`'s bars at the times of `axis` (−1 where `t` has no candle at that time). */
+function alignTo(axis: Float64Array, length: number, t: Float64Array): Int32Array {
+  const out = new Int32Array(length).fill(-1);
+  let k = 0;
+  for (let i = 0; i < length; i++) {
+    while (k < t.length && t[k] < axis[i]) k++;
+    if (k < t.length && t[k] === axis[i]) out[i] = k;
   }
-  // Sample the curve BEFORE the neighbours' backtests overwrite the primary workspace.
-  const curve = sampleCurve(ctx.assets[0].ws.equity, ctx.axis, ctx.axis.holdoutPos);
-  const neighbours = scoreNeighbours(ctx, genome);
-  const { fitness } = rankFitness(ctx, scores, neighbours);
-  return { scores, complete, tradeHash, skip, fitness, pointFitness: point, dsr, neighbours, curve: fitness > floor ? curve : null };
+  return out;
+}
+
+/** Correlation of two assets' close-to-close returns over the bars both have (0 when too few). */
+function returnCorrelation(axisLength: number, a: { map: Int32Array; c: Float64Array }, b: { map: Int32Array; c: Float64Array }): number {
+  let n = 0;
+  let sa = 0;
+  let sb = 0;
+  let saa = 0;
+  let sbb = 0;
+  let sab = 0;
+  for (let i = 1; i < axisLength; i++) {
+    const a0 = a.map[i - 1];
+    const a1 = a.map[i];
+    const b0 = b.map[i - 1];
+    const b1 = b.map[i];
+    if (a0 < 0 || a1 < 0 || b0 < 0 || b1 < 0) continue;
+    const ra = a.c[a1] / a.c[a0] - 1;
+    const rb = b.c[b1] / b.c[b0] - 1;
+    n++;
+    sa += ra;
+    sb += rb;
+    saa += ra * ra;
+    sbb += rb * rb;
+    sab += ra * rb;
+  }
+  if (n < 30) return 0;
+  const cov = sab / n - (sa / n) * (sb / n);
+  const va = saa / n - (sa / n) ** 2;
+  const vb = sbb / n - (sb / n) ** 2;
+  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : 0;
+}
+
+/**
+ * The settings a search, analysis or forecast really runs with: the execution-realism floors of
+ * `MIN_SLIPPAGE_ATR_MULT` / `MIN_FUNDING_PCT_8H` / `MIN_BORROW_PCT_YEAR` applied, so volatility-scaled
+ * slippage and short financing can never be switched off. `barMs` is the candle length (financing is
+ * charged per candle). A Long/Short run that carries neither funding nor borrow is charged the
+ * borrow floor (shorts are never free).
+ */
+export function enforceRealism(settings: BacktestSettings, barMs: number): BacktestSettings {
+  const out: BacktestSettings = { ...settings, slippageAtrMult: Math.max(MIN_SLIPPAGE_ATR_MULT, settings.slippageAtrMult ?? 0) };
+  if (settings.tradeMode !== 'long-only') {
+    const fundingFloor = MIN_FUNDING_PCT_8H * (barMs / (8 * 3_600_000));
+    const borrowFloor = MIN_BORROW_PCT_YEAR * (barMs / (365.25 * 86_400_000));
+    const funding = settings.fundingPctPerBar ?? 0;
+    const borrow = settings.borrowPctPerBar ?? 0;
+    if (funding > 0) out.fundingPctPerBar = Math.max(funding, fundingFloor);
+    else out.borrowPctPerBar = Math.max(borrow, borrowFloor);
+  }
+  return out;
 }
 
 /** Build a scoring context from raw datasets (the primary asset first). */
-export function createContext(datasets: NamedDataset[], settings: BacktestSettings, budgetBytes: number): EvalContext {
+export function createContext(datasets: NamedDataset[], rawSettings: BacktestSettings, budgetBytes: number): EvalContext {
   if (datasets.length === 0) throw new Error('No market data was supplied.');
+  const settings = enforceRealism(rawSettings, medianBarMs(datasets[0].data.t));
   const perAsset = budgetBytes / datasets.length;
   const assets = datasets.map((dataset) => buildAsset(dataset, settings, perAsset));
   const primary = assets[0];
+  const pooled = assets.length > 1;
+  // The basket's common clock: the primary asset's search-period candles.
+  const axisLength = primary.split.holdoutStart;
+  const alignment = pooled ? assets.map((asset) => alignTo(primary.data.t, axisLength, asset.data.t)) : [];
+  const correlation = assets.map((_, a) =>
+    assets.map((__, b) =>
+      !pooled ? 0 : a === b ? 1 : returnCorrelation(axisLength, { map: alignment[a], c: assets[a].data.c }, { map: alignment[b], c: assets[b].data.c }),
+    ),
+  );
   return {
     assets,
     settings,
@@ -355,8 +462,11 @@ export function createContext(datasets: NamedDataset[], settings: BacktestSettin
     hurdle: 0,
     knownTrades: new Set(),
     gates: tradeGatesFor(primary.split, primary.periodsPerYear),
-    // Several assets are always one pooled sample: the same rules on each, the trade gates on the total.
-    pooled: assets.length > 1,
+    // Several assets are always one pooled sample: the same rules on each, the trade gates on the
+    // effective number of independent bets.
+    pooled,
+    alignment,
+    correlation,
   };
 }
 

@@ -2,8 +2,9 @@
  * Holdout log.
  *
  * A holdout is only unseen once. Every time the user locks a strategy and
- * reveals its holdout, the holdout's symbols and DATE WINDOW are recorded in
- * localStorage, so the log survives page reloads and browser restarts.
+ * reveals its holdout, the holdout's symbols and DATE WINDOW are recorded in the
+ * IndexedDB ledger store (see `storage.ts`), so the log survives page reloads and
+ * browser restarts, and travels with an exported snapshot.
  *
  * A later run counts as having seen its holdout before when an earlier reveal
  * shares at least one symbol AND its date window overlaps. The log is therefore
@@ -13,13 +14,11 @@
  */
 
 import { splitFor } from '../engine/backtester';
+import { LEGACY_KEYS, ledgerRecords, putLedgerRecords, registerLegacyMigration, type LedgerRecord } from './storage';
 import { INTERVAL_MS, RANGE_DAYS, type HistoryRange, type Interval } from '../types/trading';
 
-const STORAGE_KEY = 'strategyfinder.holdoutReveals.v2';
-/** Pre-v2 log: reveal counts keyed by `symbols|interval|range|endDate`. Migrated on first read. */
-const LEGACY_KEY = 'strategyfinder.holdoutViews.v1';
-/** Every localStorage key of the holdout log (cleared by "Reset Runs & Clear Cache"). */
-export const HOLDOUT_LOG_KEYS: readonly string[] = [STORAGE_KEY, LEGACY_KEY];
+/** Legacy localStorage keys of the holdout log (migrated into IndexedDB on first load). */
+export const HOLDOUT_LOG_KEYS: readonly string[] = [LEGACY_KEYS.holdouts, LEGACY_KEYS.holdoutsV1];
 const DAY_MS = 86_400_000;
 
 /** The market period a run's holdout covers. */
@@ -74,11 +73,16 @@ export function priorRevealCount(window: HoldoutWindow): number {
 
 /** Record one reveal of `window` and return the updated log. */
 export function recordHoldoutReveal(window: HoldoutWindow, strategyId: string | null, now: number = Date.now()): HoldoutReveal[] {
-  const all = readAll();
-  all.push({ ...window, symbols: normaliseSymbols(window.symbols), revealedAt: now, strategyId, views: 1 });
-  persist(all);
-  return all;
+  putLedgerRecords([revealEntry({ ...window, symbols: normaliseSymbols(window.symbols), revealedAt: now, strategyId, views: 1 })]);
+  return readAll();
 }
+
+let revealSerial = 0;
+const revealEntry = (reveal: HoldoutReveal): LedgerRecord<HoldoutReveal> => ({
+  id: `holdout:${reveal.revealedAt}:${reveal.strategyId ?? '-'}:${reveal.symbols.join('+')}:${reveal.start}:${revealSerial++}`,
+  kind: 'holdout',
+  data: reveal,
+});
 
 /* -------------------------------------------------------------------------- */
 
@@ -100,47 +104,34 @@ function isReveal(value: unknown): value is HoldoutReveal {
 }
 
 function readAll(): HoldoutReveal[] {
-  let entries: HoldoutReveal[] = [];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) {
-      entries = parsed.filter(isReveal).map((entry) => ({
-        ...entry,
-        interval: entry.interval in INTERVAL_MS ? entry.interval : '1d',
-        strategyId: typeof entry.strategyId === 'string' ? entry.strategyId : null,
-        views: typeof entry.views === 'number' && entry.views > 0 ? Math.floor(entry.views) : 1,
-      }));
-    }
-  } catch {
-    return []; // private mode, blocked storage or corrupt data: behave as if nothing was recorded
-  }
-  const migrated = migrateLegacy();
-  if (migrated.length > 0) {
-    entries = [...entries, ...migrated];
-    persist(entries);
-  }
-  return entries;
+  return normaliseReveals(ledgerRecords<unknown>('holdout').map((record) => record.data));
 }
 
-function persist(entries: HoldoutReveal[]): void {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  } catch {
-    // Storage unavailable – the warning simply will not persist.
-  }
+function normaliseReveals(parsed: unknown[]): HoldoutReveal[] {
+  return parsed.filter(isReveal).map((entry) => ({
+    ...entry,
+    interval: entry.interval in INTERVAL_MS ? entry.interval : '1d',
+    strategyId: typeof entry.strategyId === 'string' ? entry.strategyId : null,
+    views: typeof entry.views === 'number' && entry.views > 0 ? Math.floor(entry.views) : 1,
+  }));
 }
 
 /**
- * The v1 log only kept `symbols|interval|range|endDate → count`. The holdout was the last 20% of
- * the range, so its window can be reconstructed closely enough for overlap checks.
+ * Legacy localStorage → ledger records (run once by `initStorage`): the v2 log as is, and the v1
+ * log, which only kept `symbols|interval|range|endDate → count`. The holdout was the last 20% of the
+ * range, so its window can be reconstructed closely enough for overlap checks.
  */
-function migrateLegacy(): HoldoutReveal[] {
+registerLegacyMigration((storage) => {
+  const out: HoldoutReveal[] = [];
   try {
-    const raw = window.localStorage.getItem(LEGACY_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    const out: HoldoutReveal[] = [];
+    const parsed: unknown = JSON.parse(storage.getItem(LEGACY_KEYS.holdouts) ?? '[]');
+    if (Array.isArray(parsed)) out.push(...normaliseReveals(parsed));
+  } catch {
+    // corrupt v2 log: dropped
+  }
+  try {
+    const raw = storage.getItem(LEGACY_KEYS.holdoutsV1);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
     if (typeof parsed === 'object' && parsed !== null) {
       for (const [key, count] of Object.entries(parsed as Record<string, unknown>)) {
         const [symbols, interval, range, endDate] = key.split('|');
@@ -158,9 +149,8 @@ function migrateLegacy(): HoldoutReveal[] {
         });
       }
     }
-    window.localStorage.removeItem(LEGACY_KEY);
-    return out;
   } catch {
-    return [];
+    // corrupt v1 log: dropped
   }
-}
+  return out.map(revealEntry);
+});

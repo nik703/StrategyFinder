@@ -3,9 +3,11 @@
  * the next run starts from a clean slate with 0 trials.
  *
  * Persistent state removed here:
- *   • the trial ledger – every trial counted against each data window – and its budget extensions;
- *   • the holdout log – every recorded holdout reveal (current and legacy format);
- *   • any other `strategyfinder.*` key, so state written by older versions goes too.
+ *   • the IndexedDB ledger store: the trial ledger – every trial counted against each data window –
+ *     its budget extensions and the holdout log of every recorded reveal;
+ *   • the IndexedDB saved runs and the candle cache;
+ *   • any `strategyfinder.*` localStorage key except the saved tickers, so state written by older
+ *     versions goes too.
  * The saved tickers are kept: they are a preference, not run data. The App resets the in-memory
  * state (leaderboard, robust archive, elite, restart and trial counters) and terminates the workers.
  *
@@ -15,13 +17,14 @@
  */
 
 import { HOLDOUT_LOG_KEYS } from './holdoutLog';
+import { clearAllRunData } from './storage';
 import { SAVED_TICKERS_KEY } from './savedTickers';
 import { TRIAL_LEDGER_KEYS } from './trialLedger';
 
-/** Prefix of every localStorage key StrategyFinder writes. */
+/** Prefix of every localStorage key StrategyFinder writes (today only the saved tickers). */
 export const STORAGE_PREFIX = 'strategyfinder.';
 
-/** The run-state keys StrategyFinder writes today. */
+/** The run-state localStorage keys of earlier versions (migrated to IndexedDB on first load). */
 export const RUN_STATE_KEYS: readonly string[] = [...TRIAL_LEDGER_KEYS, ...HOLDOUT_LOG_KEYS];
 
 /** The part of the Web Storage API the reset needs (`length` / `key` are optional for minimal stubs). */
@@ -45,6 +48,7 @@ function browserStorage(): ResettableStorage | null {
  * keys that held data. Never throws: blocked storage simply has nothing to clear.
  */
 export function clearRunStorage(storage: ResettableStorage | null = browserStorage()): string[] {
+  clearAllRunData();
   if (!storage) return [];
   const keys = new Set(RUN_STATE_KEYS);
   try {

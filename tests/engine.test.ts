@@ -8,16 +8,15 @@ import {
   foldScore,
   judgedFolds,
   emptyMetrics,
-  DRAWDOWN_GUARD,
+  designEffects,
+  effectiveBets,
   FITNESS_WEIGHTS,
   expectancy,
+  medianFoldScore,
   passesFoldGate,
-  passesValidationGate,
   ROBUST_MIN_DSR,
-  ROBUST_MIN_VALIDATION_SHARPE,
   foldBounds,
   FOLDS,
-  plateauFitness,
   tradeLogHash,
   type SearchMetrics,
   BacktestWorkspace,
@@ -30,7 +29,6 @@ import {
   evaluateSearch,
   holdoutMetrics,
   minTradesPerYearFor,
-  STABILITY_WEIGHT,
   tradeGatesFor,
   runBacktest,
   searchMetrics,
@@ -85,6 +83,7 @@ import {
 } from '../src/engine/genome';
 import { atr, bollinger, donchian, ema, IndicatorCache, rsi, sma, stochastic, supertrend } from '../src/engine/indicators';
 import { generatePineScript } from '../src/engine/pine';
+import { createContext, fitnessOf, robustChecks, scoreAssets } from '../src/engine/evaluation';
 import { deflatedSharpe, expectedMaxSharpe, inverseNormalCdf, normalCdf, RunningStats, sharpeConfidenceInterval } from '../src/lib/stats';
 import {
   clampRange,
@@ -744,34 +743,52 @@ describe('backtester', () => {
     const m = evaluateSearch(new IndicatorCache(data), TREND, SETTINGS, new BacktestWorkspace(data.c.length), split, ppy);
     const assetScore = assetBaseScore(m, ppy);
     expect(Number.isFinite(assetScore)).toBe(true);
-    // The drawdown guard: every unit of search-period drawdown beyond 25% costs 4 points.
-    const guarded = (dd: number): SearchMetrics => ({ ...m, search: { ...m.search, maxDrawdown: dd } });
-    expect(FITNESS_WEIGHTS.drawdown).toBe(4);
-    expect(DRAWDOWN_GUARD).toBe(0.25);
-    expect(assetBaseScore(guarded(20), ppy) - assetBaseScore(guarded(45), ppy)).toBeCloseTo(4 * 0.2, 9);
-    expect(assetBaseScore(guarded(10), ppy)).toBeCloseTo(assetBaseScore(guarded(25), ppy), 12);
+    // No stacked penalties: the search-period drawdown is judged once, by gate 1's per-fold cap, not
+    // again by the fitness.
+    const withDrawdown = (dd: number): SearchMetrics => ({ ...m, search: { ...m.search, maxDrawdown: dd } });
+    expect(Object.keys(FITNESS_WEIGHTS).sort()).toEqual(['edge', 'riskAdjusted']);
+    expect(assetBaseScore(withDrawdown(10), ppy)).toBe(assetBaseScore(withDrawdown(60), ppy));
     // Raw validation return over Buy & Hold does not move the score at all.
     const moreValidationRoi = { ...m, validation: { ...m.validation, roi: m.validation.roi + 30 } };
     expect(assetBaseScore(moreValidationRoi, ppy)).toBe(assetScore);
   });
 
-  it('defines the robustness gates a strategy must all pass to count towards the scan target', () => {
+  it('defines three orthogonal robustness gates: sample + folds, deflated Sharpe, stress + stability', () => {
     const m = (over: Partial<PerformanceMetrics>): PerformanceMetrics => ({ ...emptyMetrics(), ...over });
-    // 1. Out-of-sample validation: Sharpe above 0.3 AND a net profit after costs.
-    expect(ROBUST_MIN_VALIDATION_SHARPE).toBe(0.3);
-    expect(passesValidationGate(m({ sharpe: 0.31, netPnl: 10 }))).toBe(true);
-    expect(passesValidationGate(m({ sharpe: 0.3, netPnl: 10 }))).toBe(false);
-    expect(passesValidationGate(m({ sharpe: 0.8, netPnl: -1 }))).toBe(false);
-    // 2. Folds: 3 of 5 profitable and none beyond the drawdown cap.
-    const fold = (roi: number, maxDrawdown = 5): PerformanceMetrics => m({ roi, maxDrawdown });
+    // Gate 1 (fold half): a positive median-fold Sortino / Calmar and no fold beyond the drawdown cap.
+    const fold = (r: number, maxDrawdown = 5): PerformanceMetrics => m({ roi: r, sortino: r, cagr: 5 * r, maxDrawdown, trades: 6, exposure: 30 });
     expect(passesFoldGate([fold(1), fold(2), fold(-1), fold(3), fold(-2)])).toBe(true);
+    expect(medianFoldScore([fold(1), fold(2), fold(-1), fold(3), fold(-2)])).toBeGreaterThan(0);
     expect(passesFoldGate([fold(1), fold(2), fold(-1), fold(-3), fold(-2)])).toBe(false);
-    expect(passesFoldGate([fold(1), fold(2), fold(1, 40), fold(3), fold(2)])).toBe(false);
-    // 3. Neighbourhood: median expectancy per trade.
+    expect(passesFoldGate([fold(1), fold(2), fold(1, 40), fold(3), fold(2)])).toBe(false); // one fold beyond 35%
+    // Gate 3 reads the neighbours' median expectancy per trade.
     expect(expectancy(m({ netPnl: 50, trades: 10 }))).toBe(5);
     expect(expectancy(m({ netPnl: 50, trades: 0 }))).toBe(0);
-    // 4. Significance: the deflated Sharpe must beat the random-walk hurdle (50%).
+    // Gate 2: the deflated Sharpe must beat the random-walk hurdle (50%).
     expect(ROBUST_MIN_DSR).toBe(0.5);
+  });
+
+  it('counts correlated, overlapping trades across a basket as fewer independent bets', () => {
+    const mask = (bits: number[]): Uint8Array => Uint8Array.from(bits);
+    const lockstep = mask([1, 1, 1, 1, 0, 0, 1, 1, 1, 1]);
+    // One asset: its own trades.
+    expect(effectiveBets([{ trades: 30, inMarket: lockstep }], () => 1)).toBe(30);
+    // Two perfectly correlated assets holding positions at the same time: one bet, not two.
+    expect(effectiveBets([{ trades: 30, inMarket: lockstep }, { trades: 30, inMarket: lockstep }], () => 1)).toBeCloseTo(30, 12);
+    // Uncorrelated (or negatively correlated) assets: every trade counts.
+    expect(effectiveBets([{ trades: 30, inMarket: lockstep }, { trades: 30, inMarket: lockstep }], () => 0)).toBe(60);
+    expect(effectiveBets([{ trades: 30, inMarket: lockstep }, { trades: 30, inMarket: lockstep }], () => -0.4)).toBe(60);
+    // Correlated but never in the market together: independent bets.
+    const other = mask([0, 0, 0, 0, 1, 1, 0, 0, 0, 0]);
+    expect(effectiveBets([{ trades: 30, inMarket: lockstep }, { trades: 10, inMarket: other }], () => 0.9)).toBe(40);
+    // Half overlap at correlation 0.8: design effect 1 + 0.5 × 0.8 = 1.4 for the first asset.
+    const half = mask([1, 1, 0, 0, 0, 0, 1, 1, 0, 0]);
+    const design = designEffects([{ trades: 20, inMarket: lockstep }, { trades: 20, inMarket: half }], () => 0.8);
+    expect(design[0]).toBeCloseTo(1 + (4 / 8) * 0.8, 12);
+    expect(design[1]).toBeCloseTo(1 + 1 * 0.8, 12);
+    // Four lockstep crypto majors: 4 × 25 trades count as 25 independent bets.
+    const four = Array.from({ length: 4 }, () => ({ trades: 25, inMarket: lockstep }));
+    expect(effectiveBets(four, () => 1)).toBeCloseTo(25, 12);
   });
 
   it('calibrates the minimum-trade gates to the timeframe and the length of the data', () => {
@@ -855,7 +872,8 @@ describe('backtester', () => {
     expect(assetBaseScore(withSearch(often), 365) - assetBaseScore(withSearch(rarely), 365)).toBeCloseTo(FITNESS_WEIGHTS.edge * (0.35 * 50) / 10, 9);
     // The fold gate sets flat folds aside exactly like the fitness: a regime filter that sat out two
     // folds and made money in two of the three it traded passes.
-    const fold = (roi: number, trades = 8, maxDrawdown = 5): PerformanceMetrics => m({ roi, trades, exposure: trades > 0 ? 30 : 0, maxDrawdown });
+    const fold = (roi: number, trades = 8, maxDrawdown = 5): PerformanceMetrics =>
+      m({ roi, sortino: roi, cagr: 5 * roi, trades, exposure: trades > 0 ? 30 : 0, maxDrawdown });
     const sitsOut = [fold(0, 0), fold(0, 0), fold(4), fold(-1), fold(3)];
     expect(passesFoldGate(sitsOut)).toBe(true);
     expect(judgedFolds(sitsOut)).toEqual([2, 3, 4]);
@@ -865,22 +883,22 @@ describe('backtester', () => {
     expect(passesFoldGate([fold(0, 0), fold(0, 0), fold(-2), fold(-1), fold(3)])).toBe(false);
   });
 
-  it('blends a strategy with the median of its one-step neighbours, so spikes rank below plateaus', () => {
-    expect(STABILITY_WEIGHT).toBe(0.3);
-    // An isolated spike: brilliant at its exact parameters, poor one grid step away.
-    const spike = plateauFitness(3, [0.1, -1, 0.2, 0, 0.3]);
-    // A broad plateau: slightly lower peak, but the neighbourhood holds up.
-    const plateau = plateauFitness(2.4, [2.3, 2.35, 2.4, 2.2, 2.25]);
-    expect(spike).toBeCloseTo(0.7 * 3 + 0.3 * 0.1, 12);
-    expect(plateau).toBeCloseTo(0.7 * 2.4 + 0.3 * 2.3, 12);
-    expect(plateau).toBeGreaterThan(spike);
-    // A neighbour that slips under a trade gate (UNFIT) counts as at most 3 below the strategy, so a
-    // promising combination is discounted, not discarded.
-    expect(plateauFitness(2, [UNFIT, UNFIT, 1.9])).toBeCloseTo(0.7 * 2 + 0.3 * -1, 12);
-    // Better neighbours never lift a strategy above its own fitness; no neighbours leaves it unchanged.
-    expect(plateauFitness(1, [5, 6, 7])).toBe(1);
-    expect(plateauFitness(1.5, [])).toBe(1.5);
-    expect(plateauFitness(UNFIT, [1, 2])).toBe(UNFIT);
+  it('judges parameter stability once, as half of gate 3 – never stacked onto the fitness', () => {
+    const data = dataset('ETH-USD', '4h', '1y');
+    const ctx = createContext([{ symbol: 'ETH-USD', data }], LONG_ONLY, 64 * 1024 * 1024);
+    const { scores } = scoreAssets(ctx, TREND);
+    const { fitness, dsr } = fitnessOf(ctx, scores);
+    const mc = { simulations: 500, trades: 40, probProfit: 0.9, drawdownP95: 20, medianReturn: 5, p5Return: 1, baseDrawdown: 10, passed: true };
+    // Not through the second tier yet: gate 3 is open and the strategy cannot pass.
+    expect(robustChecks(ctx, scores, dsr, null).stress).toBeNull();
+    expect(robustChecks(ctx, scores, 1, null).passed).toBe(false);
+    // Stress passes only with a passed Monte Carlo AND a positive neighbour expectancy.
+    expect(robustChecks(ctx, scores, dsr, { monteCarlo: mc, neighbourExpectancy: 3 }).stress).toBe(true);
+    expect(robustChecks(ctx, scores, dsr, { monteCarlo: mc, neighbourExpectancy: -1 }).stress).toBe(false);
+    expect(robustChecks(ctx, scores, dsr, { monteCarlo: { ...mc, passed: false }, neighbourExpectancy: 3 }).stress).toBe(false);
+    // The fitness is the same number whatever the neighbourhood or the hurdle says.
+    ctx.hurdle = 0.5;
+    expect(fitnessOf(ctx, scores).fitness).toBe(fitness);
   });
 });
 

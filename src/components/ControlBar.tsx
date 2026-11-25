@@ -18,7 +18,6 @@ import { describeAllocation, formatWeight, normalizeWeights, TICKER_PATTERN } fr
 import { HYPOTHESES } from '@/engine/genome';
 import {
   DEFAULT_BORROW_PCT_YEAR,
-  DEFAULT_FUNDING_PCT_8H,
   financingFor,
   isCrypto,
   MAX_BASKET_ASSETS,
@@ -30,6 +29,9 @@ import {
 } from '@/lib/config';
 import { cn } from '@/lib/utils';
 import {
+  MIN_BORROW_PCT_YEAR,
+  MIN_FUNDING_PCT_8H,
+  MIN_SLIPPAGE_ATR_MULT,
   HISTORY_RANGES,
   HYPOTHESIS_IDS,
   INTERVALS,
@@ -288,6 +290,7 @@ function setupSummary(config: RunConfig): string[] {
 export default function ControlBar({ config, onChange, savedTickers, onSaveTickers, onRemoveTicker, status }: ControlBarProps): JSX.Element {
   const listId = useId();
   const fundingId = useId();
+  const refreshId = useId();
   const busy = status === 'loading' || status === 'optimizing';
   const isPreset = (PRESET_TICKERS as readonly string[]).includes(config.symbol);
   // A ticker with its own chip (preset or saved) is not repeated in the free-text field.
@@ -453,13 +456,13 @@ export default function ControlBar({ config, onChange, savedTickers, onSaveTicke
             <SliderField
               label="Vol. slippage"
               value={config.slippageAtrMult}
-              min={0}
+              min={MIN_SLIPPAGE_ATR_MULT}
               max={0.2}
               step={0.01}
               format={(v) => `${v.toFixed(2)} × ATR`}
-              onChange={(slippageAtrMult) => onChange({ slippageAtrMult })}
+              onChange={(slippageAtrMult) => onChange({ slippageAtrMult: Math.max(MIN_SLIPPAGE_ATR_MULT, slippageAtrMult) })}
               disabled={busy}
-              title="Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. 0 = fixed slippage only."
+              title={`Each fill slips by the larger of the floor and this multiple of ATR(14) as a % of price, so volatile candles cost more. Always on: at least ${MIN_SLIPPAGE_ATR_MULT} × ATR.`}
             />
             <SelectField label="Position sizing" value={config.sizingMode} options={SIZING_OPTIONS} onChange={(sizingMode) => onChange({ sizingMode })} disabled={busy} triggerClassName="min-w-[180px]" />
             <SliderField
@@ -481,51 +484,49 @@ export default function ControlBar({ config, onChange, savedTickers, onSaveTicke
                 </p>
               </div>
             ) : financing === 'funding' ? (
-              <div>
+              <div title={`Long/Short crypto trades a perpetual: every open position pays funding (always charged, at least ${MIN_FUNDING_PCT_8H}% per 8 h).`}>
                 <FieldLabel htmlFor={fundingId}>Perp funding (L/S crypto)</FieldLabel>
                 <div className="flex h-9 items-center gap-2">
-                  <Switch
+                  <Input
                     id={fundingId}
-                    checked={config.fundingPct8h > 0}
+                    type="number"
+                    min={MIN_FUNDING_PCT_8H}
+                    max={1}
+                    step={0.005}
+                    value={Math.max(MIN_FUNDING_PCT_8H, config.fundingPct8h)}
                     disabled={busy}
-                    onCheckedChange={(checked) => onChange({ fundingPct8h: checked ? DEFAULT_FUNDING_PCT_8H : 0 })}
+                    aria-label="Funding rate per 8 hours (%)"
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      if (event.target.value !== '' && Number.isFinite(next) && next <= 1) onChange({ fundingPct8h: Math.max(MIN_FUNDING_PCT_8H, next) });
+                    }}
+                    className="num h-9 w-20"
                   />
-                  <Label htmlFor={fundingId} className="text-sm font-normal text-secondary-foreground">
-                    Charge funding
-                  </Label>
-                  {config.fundingPct8h > 0 && (
-                    <Input
-                      type="number"
-                      min={0.001}
-                      max={1}
-                      step={0.005}
-                      value={config.fundingPct8h}
-                      disabled={busy}
-                      aria-label="Funding rate per 8 hours (%)"
-                      onChange={(event) => {
-                        const next = Number(event.target.value);
-                        if (event.target.value !== '' && Number.isFinite(next) && next > 0 && next <= 1) onChange({ fundingPct8h: next });
-                      }}
-                      className="num h-9 w-20"
-                    />
-                  )}
-                  {config.fundingPct8h > 0 && <span className="whitespace-nowrap text-sm text-muted-foreground">% / 8h</span>}
+                  <span className="whitespace-nowrap text-sm text-muted-foreground">% / 8h</span>
                 </div>
               </div>
             ) : (
               <NumberField
                 label="Short borrow / yr"
                 suffix="%"
-                value={config.borrowPctYear}
-                min={0}
+                value={Math.max(MIN_BORROW_PCT_YEAR, config.borrowPctYear)}
+                min={MIN_BORROW_PCT_YEAR}
                 max={100}
                 step={0.25}
-                onChange={(borrowPctYear) => onChange({ borrowPctYear })}
+                onChange={(borrowPctYear) => onChange({ borrowPctYear: Math.max(MIN_BORROW_PCT_YEAR, borrowPctYear) })}
                 disabled={busy}
                 className="w-[130px]"
               />
             )}
-            {financing === 'borrow' && <p className="basis-full text-xs text-muted-foreground">Borrow fee on short stock / ETF positions (default {DEFAULT_BORROW_PCT_YEAR}% a year).</p>}
+            {financing === 'borrow' && (
+              <p className="basis-full text-xs text-muted-foreground">
+                Borrow fee on short stock / ETF positions (default {DEFAULT_BORROW_PCT_YEAR}% a year, never below {MIN_BORROW_PCT_YEAR}%).
+              </p>
+            )}
+            <p className="basis-full text-xs text-muted-foreground">
+              Always enforced by the engine: fills at the next candle&apos;s open, volatility-scaled slippage, short financing and the single-strategy
+              holdout lock.
+            </p>
           </Group>
 
           <Separator />
@@ -553,6 +554,19 @@ export default function ControlBar({ config, onChange, savedTickers, onSaveTicke
               />
             </div>
             <SelectField label="EMA / SMA lengths" value={config.maPeriods} options={MA_PERIOD_OPTIONS} onChange={(maPeriods) => onChange({ maPeriods })} disabled={busy} />
+          </Group>
+
+          <Separator />
+          <Group title="Data">
+            <div
+              className="flex items-center gap-2"
+              title="Closed candles are cached in this browser per exchange, symbol and timeframe, and later runs download only the new ones. Force a full download, e.g. after a provider revised its history."
+            >
+              <Switch id={refreshId} checked={config.forceRefreshData} disabled={busy} onCheckedChange={(checked) => onChange({ forceRefreshData: checked })} />
+              <Label htmlFor={refreshId} className="text-sm font-normal text-secondary-foreground">
+                Force Refresh Data (ignore the candle cache on the next run)
+              </Label>
+            </div>
           </Group>
         </CollapsibleContent>
       </Collapsible>

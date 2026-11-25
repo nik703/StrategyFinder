@@ -34,9 +34,8 @@ import {
   evaluateSearch,
   holdoutMetrics,
   holdoutShortfalls,
-  neighbourhoodMedian,
+  median,
   passesTradeGates,
-  ROBUST_MIN_DSR,
   runBacktest,
   segmentMetrics,
   UNFIT,
@@ -46,7 +45,7 @@ import {
   createContext,
   evaluateCandidate,
   fitnessOf,
-  rankFitness,
+  neighbourExpectancy,
   robustChecks,
   sampleCurve,
   scoreNeighbours,
@@ -55,10 +54,7 @@ import {
   type AssetScore,
   type CandidateResult,
   type EvalContext,
-  type EvaluatorBatch,
-  type EvaluatorReply,
-  type NeighbourScore,
-  type PortLike,
+  type StressInputs,
 } from '../engine/evaluation';
 import {
   countParameters,
@@ -78,6 +74,7 @@ import {
 } from '../engine/genome';
 import { expectedMaxSharpe, RunningStats } from '../lib/stats';
 import { monteCarloStress, summarise, tradesFrom, type McTrade } from '../engine/monteCarlo';
+import { BatchDispatcher } from './workerPool';
 import {
   DEFAULT_ROBUST_TARGET,
   DEFAULT_RUN_EVALUATIONS,
@@ -142,6 +139,14 @@ const CLONE_CORRELATION = 0.9;
 const ROUNDS_PER_EVALUATOR = 4;
 /** Pure random search until the leaderboard holds this many strategies. */
 const SEED_POPULATION = 10;
+/**
+ * Second evaluation tier: after every round the optimiser puts this many top contenders – strategies
+ * that cleared gates 1 and 2 first, then the leaderboard by fitness – through the expensive checks
+ * (one-step neighbourhood grid + Monte Carlo stress test). Nothing below them pays for it.
+ */
+const DEEP_EVALUATION_TOP = 20;
+/** Strategies that cleared gates 1 and 2 kept waiting for the second tier (best fitness first). */
+const MAX_CONTENDERS = 100;
 /** Evaluations a run makes before reaching its robust target may end it. */
 const MIN_TARGET_EVALUATIONS = 1_000;
 /** A candidate must beat the board's best fitness by this much to reset the restart clock. */
@@ -157,7 +162,7 @@ let activeRun = 0;
 let stopRequested = false;
 let session: Session | null = null;
 /** The live run's evaluator pool, so a `pool-failed` message can release whatever it is waiting on. */
-let activePool: EvaluatorPool | null = null;
+let activePool: BatchDispatcher | null = null;
 
 /**
  * Yield to the worker's event loop so queued `stop` / `analyze` messages can be handled.
@@ -255,8 +260,11 @@ interface Entry {
   /** Sampled equity returns, used to detect behavioural clones. */
   returns: Float32Array;
   scores: AssetScore[];
-  /** One-grid-step parameter neighbours, kept so the neighbourhood cap is re-applied whenever the hurdle moves. */
-  neighbours: NeighbourScore[];
+  /**
+   * Gate-3 inputs from the second evaluation tier (Monte Carlo + one-step neighbourhood), or null
+   * until the strategy has been among the top contenders. They do not depend on the luck hurdle.
+   */
+  stress: StressInputs | null;
 }
 
 /** A run's state. The scoring context (`assets`, primary first) is shared with the evaluator pool. */
@@ -291,6 +299,11 @@ interface Session extends EvalContext {
    * fitness ranking would push them off, and re-checked whenever the luck hurdle moves.
    */
   robust: Map<string, Entry>;
+  /**
+   * Strategies that cleared gates 1 and 2 and wait for the second tier, by fingerprint (at most
+   * `MAX_CONTENDERS`, best fitness first). The leaderboard's fitness ranking does not decide this.
+   */
+  contenders: Map<string, Entry>;
   /** How many candidates cleared each gate. */
   funnel: GateFunnel;
   /** Cross-market generalization checks the user ran, by strategy id. */
@@ -427,14 +440,21 @@ function rescoreBoard(s: Session): void {
   s.hurdleTrials = s.trials.count;
   s.hurdleVariance = s.trials.variance;
   s.hurdle = expectedMaxSharpe(s.hurdleTrials, s.hurdleVariance);
-  const entries = new Set([...s.board, ...s.robust.values()]);
+  const entries = new Set([...s.board, ...s.robust.values(), ...s.contenders.values()]);
   for (const entry of entries) {
     const { dsr } = fitnessOf(s, entry.scores);
     entry.result.dsr = dsr;
     // The deflated Sharpe falls as trials accrue: a strategy can drop out of the robust set.
-    entry.result.robust = robustChecks(s, entry.scores, dsr, entry.neighbours);
+    entry.result.robust = robustChecks(s, entry.scores, dsr, entry.stress);
   }
   for (const [key, entry] of s.robust) if (!entry.result.robust?.passed) s.robust.delete(key);
+  for (const [key, entry] of s.contenders) if (!(entry.result.robust?.sample && entry.result.robust.dsr)) s.contenders.delete(key);
+}
+
+/** Rank of a strategy's gate status: every gate passed, then gates 1 and 2, then the rest. */
+function gateRank(entry: Entry): number {
+  const r = entry.result.robust;
+  return r?.passed ? 2 : r?.sample && r.dsr ? 1 : 0;
 }
 
 /**
@@ -445,8 +465,7 @@ function rescoreBoard(s: Session): void {
 function reportedEntries(s: Session): Entry[] {
   const out = [...s.board];
   for (const entry of s.robust.values()) if (!out.includes(entry)) out.push(entry);
-  const passed = (entry: Entry): number => (entry.result.robust?.passed ? 1 : 0);
-  return out.sort((a, b) => passed(b) - passed(a) || b.result.fitness - a.result.fitness);
+  return out.sort((a, b) => gateRank(b) - gateRank(a) || b.result.fitness - a.result.fitness);
 }
 
 function searchAssetResults(s: Session, scores: AssetScore[]): AssetResult[] {
@@ -644,8 +663,9 @@ function stabilityGrid(s: Session, genome: StrategyGenome): StabilityGrid | null
  *             non-positive Sharpe.
  *   Robust  – ALL of the following hold:
  *             • deflated Sharpe of the validation segment ≥ 95%;
- *             • the search-period gates: validation, fold consistency and a stable one-step
- *               parameter neighbourhood (see `RobustChecks`);
+ *             • the three search-period gates: effective sample + median-fold return + fold
+ *               drawdown cap, deflated Sharpe, Monte Carlo stress + one-step neighbourhood
+ *               (see `RobustChecks`);
  *             • holdout Sharpe 95% confidence interval entirely above zero;
  *             • holdout Sharpe above Buy & Hold's holdout Sharpe (risk-adjusted, not raw return);
  *             • at least `gates.holdout` holdout trades (summed over the assets when pooled);
@@ -670,9 +690,12 @@ function judge(s: Session, report: RobustnessReport, result: StrategyResult): { 
   const notes: string[] = [];
   if (result.dsr < 0.95) notes.push(`Deflated Sharpe ${pct(result.dsr)} is under 95%: not distinguishable from the luckiest of the strategies tried.`);
   const gates = result.robust;
-  if (gates && !gates.validation) notes.push('Validation gate failed: the validation Sharpe is not above 0.3 with a profit after costs.');
-  if (gates && !gates.folds) notes.push('Fold gate failed: fewer than 3 of 5 search-period slices made money, or one lost more than 35%.');
-  if (gates && !gates.neighbours) notes.push('Parameter neighbourhood: the one-step neighbours do not keep a positive median profit per trade.');
+  if (gates && !gates.sample) {
+    notes.push('Gate 1 failed: too few effective independent trades, a non-positive median-fold Sortino/Calmar, or a fold beyond the 35% drawdown cap.');
+  }
+  if (gates && gates.stress === false) {
+    notes.push('Gate 3 failed: the Monte Carlo stress test or the one-step parameter neighbourhood (positive median profit per trade) did not hold.');
+  }
   // In a pooled run the holdout sample is pooled too.
   const holdoutTrades = result.sample?.holdoutTrades ?? holdout.trades;
   notes.push(...holdoutShortfalls(holdout, finalBenchmark(s).holdout, s.assets[0].periodsPerYear, s.gates.holdout, holdoutTrades));
@@ -792,62 +815,6 @@ function finalBenchmark(s: Session): BenchmarkResult {
 /*  Evaluator pool                                                            */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Client side of the evaluation pool: the main thread connects one MessagePort
- * per evaluator worker. A batch is split into contiguous chunks, one per
- * evaluator, and the results come back in the original order – so the search
- * is identical whichever thread scored a candidate.
- */
-class EvaluatorPool {
-  private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (results: CandidateResult[]) => void; reject: (error: Error) => void }>();
-
-  constructor(private ports: PortLike[]) {
-    for (const port of ports) {
-      port.onmessage = (event: MessageEvent) => {
-        const reply = event.data as EvaluatorReply;
-        const waiting = this.pending.get(reply.id);
-        if (!waiting) return;
-        this.pending.delete(reply.id);
-        if (reply.type === 'results') waiting.resolve(reply.results);
-        else waiting.reject(new Error(reply.message));
-      };
-    }
-  }
-
-  get size(): number {
-    return this.ports.length;
-  }
-
-  async evaluate(genomes: StrategyGenome[], hurdle: number, floor: number, knownTrades: string[]): Promise<CandidateResult[]> {
-    if (this.ports.length === 0) throw new Error('Evaluator pool closed.');
-    const chunk = Math.ceil(genomes.length / this.ports.length);
-    const requests: Promise<CandidateResult[]>[] = [];
-    // Every evaluator keeps a full replica of the known trade logs, so each gets the delta.
-    for (let w = 0; w < this.ports.length; w++) {
-      const id = this.nextId++;
-      const message: EvaluatorBatch = { type: 'batch', id, hurdle, floor, knownTrades, genomes: genomes.slice(w * chunk, (w + 1) * chunk) };
-      requests.push(
-        new Promise((resolve, reject) => {
-          this.pending.set(id, { resolve, reject });
-          this.ports[w].postMessage(message);
-        }),
-      );
-    }
-    return (await Promise.all(requests)).flat();
-  }
-
-  close(): void {
-    for (const port of this.ports) {
-      port.onmessage = null;
-      port.close?.();
-    }
-    this.ports = [];
-    for (const waiting of this.pending.values()) waiting.reject(new Error('Evaluator pool closed.'));
-    this.pending.clear();
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /*  Optimisation run                                                          */
 /* -------------------------------------------------------------------------- */
@@ -856,7 +823,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const { settings } = payload;
   session = null;
   activePool?.close();
-  const pool = new EvaluatorPool(payload.ports ?? []);
+  const pool = new BatchDispatcher(payload.ports ?? []);
   activePool = pool;
 
   const hypothesis = payload.hypothesis;
@@ -904,7 +871,8 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     duplicates: 0,
     inactive: 0,
     robust: new Map(),
-    funnel: { scored: 0, trades: 0, validation: 0, folds: 0, dsr: 0, neighboursChecked: 0, neighbours: 0 },
+    contenders: new Map(),
+    funnel: { scored: 0, sample: 0, dsr: 0, stressChecked: 0, stress: 0 },
     crossMarket: new Map(),
   };
   session = s;
@@ -1057,37 +1025,41 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   }
   const NOT_A_TRIAL: Outcome = { trial: false, improved: false };
 
-  /** A leaderboard / robust-archive entry for a fully scored candidate. */
+  /** A leaderboard / contender entry for a fully scored candidate (second-tier fields still empty). */
   const buildEntry = (
     genome: StrategyGenome,
     evaluated: CandidateResult,
-    fitness: number,
-    neighbours: NeighbourScore[],
     fingerprint: string,
     robust: StrategyResult['robust'],
     curve: Float32Array | null = null,
   ): Entry => {
-    const { scores, pointFitness, dsr } = evaluated;
+    const { scores, fitness, dsr } = evaluated;
     const primaryMetrics = scores[0].metrics;
     const equity = curve ?? evaluated.curve ?? primaryCurve(genome);
-    const monteCarlo = summarise(stressTest(s, genome));
-    const neighbourValues = neighbours.map((nb) => fitnessOf(s, nb.scores).fitness);
+    const sample = sampleOf(s, scores);
     return {
       niche: genomeNiche(genome),
       fingerprint,
       returns: curveReturns(equity),
       scores,
-      neighbours,
+      stress: null,
       result: {
         id: `S-${iteration}`,
         genome,
         fitness,
-        pointFitness,
-        neighbourMedian: neighbourhoodMedian(pointFitness, neighbourValues),
-        neighbourCount: neighbourValues.length,
+        pointFitness: fitness,
+        neighbourMedian: null,
+        neighbourCount: 0,
         dsr,
         params: countParameters(genome, limits),
-        sample: { ...sampleOf(s, scores), holdoutTrades: null, gates: s.gates, pooled: s.pooled },
+        sample: {
+          trades: sample.rawTrades,
+          effectiveTrades: sample.trades,
+          validationTrades: sample.rawValidationTrades,
+          holdoutTrades: null,
+          gates: s.gates,
+          pooled: s.pooled,
+        },
         robust,
         search: primaryMetrics.search,
         train: primaryMetrics.train,
@@ -1100,15 +1072,46 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
         assets: searchAssetResults(s, scores),
         robustness: null,
         verdict: null,
-        monteCarlo,
+        monteCarlo: null,
       },
     };
   };
 
+  /**
+   * SECOND evaluation tier: put the top `DEEP_EVALUATION_TOP` contenders – strategies that cleared
+   * gates 1 and 2 first, then the leaderboard by fitness – through the one-step parameter
+   * neighbourhood grid and the Monte Carlo stress test (gate 3). Each strategy goes through it once;
+   * the inputs do not depend on the luck hurdle, so only the deflated Sharpe is re-checked later.
+   */
+  const deepEvaluate = (): void => {
+    const ranked = [...new Set([...board, ...s.contenders.values()])]
+      .sort((a, b) => gateRank(b) - gateRank(a) || b.result.fitness - a.result.fitness)
+      .slice(0, DEEP_EVALUATION_TOP);
+    for (const entry of ranked) {
+      if (entry.stress !== null) continue;
+      const genome = entry.result.genome;
+      const neighbours = scoreNeighbours(s, genome);
+      const monteCarlo = summarise(stressTest(s, genome));
+      entry.stress = { monteCarlo, neighbourExpectancy: neighbourExpectancy(s, neighbours) };
+      const values = neighbours.map((nb) => fitnessOf(s, nb.scores).fitness);
+      entry.result.neighbourMedian = values.length > 0 ? median(values) : null;
+      entry.result.neighbourCount = values.length;
+      entry.result.neighbourExpectancy = entry.stress.neighbourExpectancy;
+      entry.result.monteCarlo = monteCarlo;
+      entry.result.robust = robustChecks(s, entry.scores, entry.result.dsr, entry.stress);
+      s.funnel.stressChecked++;
+      if (entry.result.robust.stress) s.funnel.stress++;
+      if (entry.result.robust.passed) {
+        s.robust.set(entry.fingerprint, entry);
+        s.contenders.delete(entry.fingerprint);
+      }
+      boardDirty = true;
+    }
+  };
+
   /** Register an evaluated candidate and insert it into the leaderboard if it qualifies. */
   const consider = (genome: StrategyGenome, evaluated: CandidateResult): Outcome => {
-    const { scores, complete, dsr, pointFitness, tradeHash, skip } = evaluated;
-    let { fitness, neighbours } = evaluated;
+    const { scores, complete, dsr, fitness, tradeHash, skip } = evaluated;
     if (skip === 'inactive') {
       s.inactive++;
       return NOT_A_TRIAL;
@@ -1129,14 +1132,11 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     const trialOnly: Outcome = { trial: true, improved: false };
     if (!complete) return trialOnly;
 
-    // Robustness funnel: which gates this candidate clears on its own (the neighbourhood comes later).
+    // Gates 1 and 2 are cheap and judged on every scored candidate; gate 3 is the second tier.
     const cheap = robustChecks(s, scores, dsr, null);
-    const funnel = s.funnel;
-    funnel.scored++;
-    if (!isUndersampled(scores)) funnel.trades++;
-    if (cheap.validation) funnel.validation++;
-    if (cheap.folds) funnel.folds++;
-    if (dsr >= ROBUST_MIN_DSR) funnel.dsr++;
+    s.funnel.scored++;
+    if (cheap.sample) s.funnel.sample++;
+    if (cheap.dsr) s.funnel.dsr++;
 
     if (fitness <= UNFIT) {
       if (isUndersampled(scores)) s.undersampled++;
@@ -1144,43 +1144,27 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
     }
     joinCyclePool(genome, fitness);
     const fingerprint = tradeHash ?? genomeSignature(genome);
-    // A candidate that clears every other gate always gets its neighbourhood checked, even when its
-    // fitness would not make the leaderboard: it may be one of the robust strategies the run is after.
-    if (cheap.validation && cheap.folds && cheap.significance && !s.robust.has(fingerprint)) {
-      if (neighbours === null) {
-        neighbours = scoreNeighbours(s, genome);
-        fitness = rankFitness(s, scores, neighbours).fitness;
+    // A candidate that clears gates 1 and 2 is a contender for the robust set whatever its fitness:
+    // it waits for the second tier even when it cannot make the leaderboard.
+    if (cheap.sample && cheap.dsr && !s.robust.has(fingerprint) && !s.contenders.has(fingerprint)) {
+      s.contenders.set(fingerprint, buildEntry(genome, evaluated, fingerprint, cheap));
+      if (s.contenders.size > MAX_CONTENDERS) {
+        let worst: Entry | null = null;
+        for (const entry of s.contenders.values()) if (worst === null || entry.result.fitness < worst.result.fitness) worst = entry;
+        if (worst) s.contenders.delete(worst.fingerprint);
       }
-      funnel.neighboursChecked++;
-      const checks = robustChecks(s, scores, dsr, neighbours);
-      if (checks.neighbours) funnel.neighbours++;
-      if (checks.passed) {
-        s.robust.set(fingerprint, buildEntry(genome, evaluated, fitness, neighbours, fingerprint, checks));
-        boardDirty = true;
-      }
-    } else if (neighbours !== null) {
-      funnel.neighboursChecked++;
-      if (robustChecks(s, scores, dsr, neighbours).neighbours) funnel.neighbours++;
     }
 
-    if (board.length >= LEADERBOARD_SIZE && pointFitness <= board[board.length - 1].result.fitness) return trialOnly;
-    if (neighbours === null) {
-      // Rare: the candidate did not beat the round's frozen floor, but the board has since shrunk.
-      // Nothing enters the board without its neighbourhood cap.
-      neighbours = scoreNeighbours(s, genome);
-      fitness = rankFitness(s, scores, neighbours).fitness;
-    }
-    const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     if (board.length >= LEADERBOARD_SIZE && fitness <= board[board.length - 1].result.fitness) return trialOnly;
-
+    const best = board.length > 0 ? board[0].result.fitness : -Infinity;
     // Identical trade logs never reach this point, so the trade-log fingerprint identifies the board entry.
     if (board.some((e) => e.fingerprint === fingerprint)) return trialOnly;
 
     // Behavioural clones: a fitter twin already on the board wins; otherwise this one replaces its twins.
     // The curve stops at the holdout boundary – nothing beyond it has been simulated.
-    const archived = s.robust.get(fingerprint);
-    const equity = archived?.result.equity ?? evaluated.curve ?? primaryCurve(genome);
-    const returns = archived?.returns ?? curveReturns(equity);
+    const existing = s.contenders.get(fingerprint) ?? s.robust.get(fingerprint);
+    const equity = existing?.result.equity ?? evaluated.curve ?? primaryCurve(genome);
+    const returns = existing?.returns ?? curveReturns(equity);
     const twins: number[] = [];
     for (let k = 0; k < board.length; k++) {
       if (correlation(returns, board[k].returns) >= CLONE_CORRELATION) twins.push(k);
@@ -1205,7 +1189,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       board.splice(nicheWorst, 1);
     }
 
-    const entry = archived ?? buildEntry(genome, evaluated, fitness, neighbours, fingerprint, robustChecks(s, scores, dsr, neighbours), equity);
+    const entry = existing ?? buildEntry(genome, evaluated, fingerprint, cheap, equity);
     let at = board.length;
     while (at > 0 && board[at - 1].result.fitness < fitness) at--;
     board.splice(at, 0, entry);
@@ -1255,6 +1239,7 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
   const finish = (reason: StopReason): void => {
     pool.close();
     // The search is over, but the holdout stays sealed: the user locks ONE strategy to reveal it.
+    deepEvaluate();
     rescoreBoard(s);
     s.finished = true;
     const strategies = reportedEntries(s).map((entry) => entry.result);
@@ -1310,6 +1295,8 @@ async function run(payload: OptimizerStartPayload, token: number): Promise<void>
       // Streamed every PROGRESS_EVERY (25) iterations.
       if (iteration % PROGRESS_EVERY === 0) postProgress();
     }
+    // Second tier for the round's top contenders, then a target check on the updated robust set.
+    deepEvaluate();
     reason ??= stopReason();
 
     const now = performance.now();

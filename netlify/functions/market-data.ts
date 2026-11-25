@@ -2,6 +2,11 @@
  * Netlify Function: market-data proxy
  *
  *   GET /.netlify/functions/market-data?symbols=BTC-USD,NVDA&interval=1d&range=2y
+ *   GET /.netlify/functions/market-data?symbols=BTC-USD&interval=4h&range=2y&since=1763769600000
+ *
+ * `since` (optional, ms) asks for an incremental update: Binance pages start at that open time
+ * instead of the start of the range, and an empty result is a valid answer (no new closed candle
+ * yet). Yahoo always returns the whole range – its adjusted prices can change retroactively.
  *
  * Fetches historical OHLCV candles and returns clean, CORS-enabled JSON.
  *   • Crypto pairs (BASE-USD / BASE-USDT) → Binance public market-data API
@@ -199,9 +204,11 @@ async function fetchBinance(
   interval: Interval,
   range: HistoryRange,
   now: number,
+  since: number | null = null,
 ): Promise<CandleSeries> {
   const step = INTERVAL_MS[interval];
-  const start = Math.floor((now - RANGE_DAYS[range] * DAY_MS) / step) * step;
+  const rangeStart = Math.floor((now - RANGE_DAYS[range] * DAY_MS) / step) * step;
+  const start = since !== null ? Math.max(rangeStart, Math.floor(since / step) * step) : rangeStart;
   const pageSpan = BINANCE_PAGE * step;
   const pageStarts: number[] = [];
   for (let from = start; from < now; from += pageSpan) pageStarts.push(from);
@@ -232,7 +239,8 @@ async function fetchBinance(
       candles.push({ t: openTime, o, h, l, c, v: Number.isFinite(v) ? v : 0 });
     }
   }
-  if (candles.length === 0) throw new UpstreamError(`Binance returned no candles for ${pair}`);
+  // An incremental request may legitimately find no new closed candle.
+  if (candles.length === 0 && since === null) throw new UpstreamError(`Binance returned no candles for ${pair}`);
   return toSeries(symbol, 'binance', sortAndDedupe(candles), pair);
 }
 
@@ -334,11 +342,11 @@ async function fetchYahoo(symbol: string, interval: Interval, range: HistoryRang
 /*  Routing                                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function fetchSymbol(symbol: string, interval: Interval, range: HistoryRange, now: number): Promise<CandleSeries> {
+async function fetchSymbol(symbol: string, interval: Interval, range: HistoryRange, now: number, since: number | null = null): Promise<CandleSeries> {
   const pair = toBinancePair(symbol);
   if (pair === null) return fetchYahoo(symbol, interval, range, now);
   try {
-    return await fetchBinance(symbol, pair, interval, range, now);
+    return await fetchBinance(symbol, pair, interval, range, now, since);
   } catch (binanceError) {
     // Yahoo quotes crypto as BASE-USD.
     const yahooSymbol = symbol.includes('-') ? symbol.replace(/-(USDT|USDC)$/, '-USD') : `${symbol.slice(0, -4)}-USD`;
@@ -373,6 +381,8 @@ export default async function handler(request: Request, _context?: Context): Pro
   const symbols = parseSymbols(params.get('symbols') ?? params.get('symbol') ?? '');
   const interval = params.get('interval') ?? '1d';
   const range = params.get('range') ?? '1y';
+  const sinceRaw = params.get('since');
+  const since = sinceRaw !== null && /^\d{10,14}$/.test(sinceRaw) ? Number(sinceRaw) : null;
 
   if (symbols.length === 0) return json(400, { error: 'Missing required query parameter "symbols".' });
   if (symbols.length > MAX_SYMBOLS) return json(400, { error: `At most ${MAX_SYMBOLS} symbols per request.` });
@@ -390,7 +400,7 @@ export default async function handler(request: Request, _context?: Context): Pro
   await Promise.all(
     symbols.map(async (symbol) => {
       try {
-        body.series[symbol] = await fetchSymbol(symbol, interval, range, now);
+        body.series[symbol] = await fetchSymbol(symbol, interval, range, now, since);
       } catch (error) {
         body.errors[symbol] = error instanceof Error ? error.message : 'Unknown upstream error';
       }
