@@ -25,7 +25,6 @@
 
 import {
   allowsShorts,
-  SLOPE_LAG,
   TRAIN_FRACTION,
   VALIDATION_FRACTION,
   type BacktestSettings,
@@ -37,6 +36,7 @@ import {
 } from '../types/trading';
 import { sharpeConfidenceInterval } from '../lib/stats';
 import type { IndicatorCache } from './indicators';
+import { compileCondition, exitSpec, seriesKey, type SeriesNode } from './strategyAst';
 
 /* -------------------------------------------------------------------------- */
 /*  Signal evaluation                                                         */
@@ -49,71 +49,87 @@ interface Operands {
   level: number;
 }
 
-/** Resolve a condition into `left <op> right` operands. */
-export function resolveOperands(c: Condition, ind: IndicatorCache): Operands {
-  switch (c.ind) {
-    case 'RSI':
-      return { left: ind.rsi(c.period), right: null, level: c.level };
-    case 'MACD':
-      switch (c.variant) {
-        case 'signal':
-          return { left: ind.macdLine(c.fast, c.slow), right: ind.macdSignal(c.fast, c.slow, c.signal), level: 0 };
-        case 'zero':
-          return { left: ind.macdLine(c.fast, c.slow), right: null, level: 0 };
-        case 'hist':
-          return {
-            left: ind.macdHist(c.fast, c.slow, c.signal),
-            right: ind.macdHistPrev(c.fast, c.slow, c.signal),
-            level: 0,
-          };
-      }
-      break;
-    case 'PRICE_MA':
-      return { left: ind.data.c, right: ind.ma(c.maType, c.period), level: 0 };
-    case 'MA_CROSS':
-      return { left: ind.ma(c.fastType, c.fastPeriod), right: ind.ma(c.slowType, c.slowPeriod), level: 0 };
-    case 'BB':
-      switch (c.variant) {
-        case 'pctb':
-          return { left: ind.bbPercentB(c.period, c.mult), right: null, level: c.level };
-        case 'bandwidth':
-          return { left: ind.bbBandwidth(c.period, c.mult), right: null, level: c.level };
+/** Values of a strategy-AST series node on every candle (memoised by the indicator cache). */
+export function evaluateSeries(node: SeriesNode, ind: IndicatorCache): Float64Array {
+  switch (node.k) {
+    case 'price':
+      return ind.data[node.field === 'close' ? 'c' : node.field === 'high' ? 'h' : node.field === 'low' ? 'l' : node.field === 'open' ? 'o' : 'v'];
+    case 'const':
+      return ind.derived(seriesKey(node), () => new Float64Array(ind.n).fill(node.value));
+    case 'lag': {
+      const of = node.of;
+      if (of.k === 'ma') return ind.maLagged(of.type, of.period, node.bars);
+      if (of.k === 'macd' && of.part === 'hist' && node.bars === 1) return ind.macdHistPrev(of.fast, of.slow, of.signal);
+      return ind.derived(seriesKey(node), () => {
+        const src = evaluateSeries(of, ind);
+        const out = new Float64Array(ind.n).fill(NaN);
+        for (let i = node.bars; i < ind.n; i++) out[i] = src[i - node.bars];
+        return out;
+      });
+    }
+    case 'ma':
+      return ind.ma(node.type, node.period);
+    case 'rsi':
+      return ind.rsi(node.period);
+    case 'macd':
+      return node.part === 'line'
+        ? ind.macdLine(node.fast, node.slow)
+        : node.part === 'signal'
+          ? ind.macdSignal(node.fast, node.slow, node.signal)
+          : ind.macdHist(node.fast, node.slow, node.signal);
+    case 'bb':
+      switch (node.part) {
         case 'upper':
-          return { left: ind.data.c, right: ind.bbUpper(c.period, c.mult), level: 0 };
+          return ind.bbUpper(node.period, node.mult);
         case 'lower':
-          return { left: ind.data.c, right: ind.bbLower(c.period, c.mult), level: 0 };
+          return ind.bbLower(node.period, node.mult);
+        case 'pctb':
+          return ind.bbPercentB(node.period, node.mult);
+        case 'width':
+          return ind.bbBandwidth(node.period, node.mult);
+        case 'basis':
+          return ind.sma(node.period);
       }
       break;
-    case 'ATR':
-      return { left: ind.atrPercent(c.period), right: null, level: c.level };
-    case 'STOCH':
-      return c.variant === 'level'
-        ? { left: ind.stochK(c.kPeriod, c.smooth), right: null, level: c.level }
-        : { left: ind.stochK(c.kPeriod, c.smooth), right: ind.stochD(c.kPeriod, c.smooth, c.dPeriod), level: 0 };
-    case 'ADX':
-      return c.variant === 'strength'
-        ? { left: ind.adx(c.period), right: null, level: c.level }
-        : { left: ind.plusDI(c.period), right: ind.minusDI(c.period), level: 0 };
-    case 'VOLUME':
-      return { left: ind.volumeRatio(c.period), right: null, level: c.level };
-    case 'SUPERTREND':
-      return { left: ind.data.c, right: ind.supertrend(c.period, c.mult), level: 0 };
-    case 'CCI':
-      return { left: ind.cci(c.period), right: null, level: c.level };
-    case 'DONCHIAN':
-      return { left: ind.data.c, right: c.variant === 'upper' ? ind.donchianUpper(c.period) : ind.donchianLower(c.period), level: 0 };
-    case 'MA_SLOPE':
-      return { left: ind.ma(c.maType, c.period), right: ind.maLagged(c.maType, c.period, SLOPE_LAG), level: 0 };
-    case 'KELTNER':
-      return { left: ind.data.c, right: c.variant === 'upper' ? ind.kcUpper(c.period, c.mult) : ind.kcLower(c.period, c.mult), level: 0 };
-    case 'SQUEEZE':
-      return { left: ind.squeeze(c.period, c.mult), right: null, level: c.level };
-    case 'RANGE_EXP':
-      return { left: ind.rangeExp(c.period, c.mult), right: null, level: c.level };
-    case 'PULLBACK':
-      return { left: ind.pullback(c.maType, c.period), right: null, level: c.level };
+    case 'atr':
+      return ind.atr(node.period);
+    case 'atrPct':
+      return ind.atrPercent(node.period);
+    case 'stoch':
+      return node.part === 'k' ? ind.stochK(node.kPeriod, node.smooth) : ind.stochD(node.kPeriod, node.smooth, node.dPeriod);
+    case 'dmi':
+      return node.part === 'adx' ? ind.adx(node.period) : node.part === 'plus' ? ind.plusDI(node.period) : ind.minusDI(node.period);
+    case 'volRatio':
+      return ind.volumeRatio(node.period);
+    case 'supertrend':
+      return ind.supertrend(node.period, node.mult);
+    case 'cci':
+      return ind.cci(node.period);
+    case 'donchian':
+      return node.part === 'upper' ? ind.donchianUpper(node.period) : ind.donchianLower(node.period);
+    case 'keltner':
+      return node.part === 'upper' ? ind.kcUpper(node.period, node.mult) : ind.kcLower(node.period, node.mult);
+    case 'squeeze':
+      return ind.squeeze(node.period, node.mult);
+    case 'rangeExp':
+      return ind.rangeExp(node.period, node.mult);
+    case 'pullback':
+      return ind.pullback(node.type, node.period);
   }
-  throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
+  throw new Error(`Unsupported series node: ${JSON.stringify(node)}`);
+}
+
+/**
+ * Resolve a condition into `left <op> right` operands through its strategy-AST form (see
+ * `strategyAst.ts`) – the same nodes the Pine exporter emits.
+ */
+export function resolveOperands(c: Condition, ind: IndicatorCache): Operands {
+  const { left, right } = compileCondition(c);
+  return {
+    left: evaluateSeries(left, ind),
+    right: right.k === 'const' ? null : evaluateSeries(right, ind),
+    level: right.k === 'const' ? right.value : 0,
+  };
 }
 
 /**
@@ -219,6 +235,18 @@ export function evaluateGroup(
  * thousands of backtests, so nothing is allocated inside the hot loop.
  */
 export class BacktestWorkspace {
+  /**
+   * Optional per-candle record of the open position's stop, target and fill price after each close
+   * (NaN while flat) – off by default; `recordLevels()` switches it on (parity tests, diagnostics).
+   */
+  levels: { stop: Float64Array; target: Float64Array; entry: Float64Array; dir: Int8Array } | null = null;
+
+  /** Record the open position's levels after every close in `levels`. */
+  recordLevels(): this {
+    this.levels = { stop: new Float64Array(this.n), target: new Float64Array(this.n), entry: new Float64Array(this.n), dir: new Int8Array(this.n) };
+    return this;
+  }
+
   readonly goLong: Uint8Array;
   readonly goShort: Uint8Array;
   readonly exitLong: Uint8Array;
@@ -260,6 +288,8 @@ export class BacktestWorkspace {
     risk: number;
     /** True once the breakeven lock has moved the stop to the entry price. */
     breakevenLocked: boolean;
+    /** Best price since entry (highest high of a long, lowest low of a short) – the trailing stop's anchor. */
+    extreme: number;
   } | null = null;
   /** In-market flag per bar (1 when a position is open at the close). */
   readonly inMarket: Uint8Array;
@@ -336,7 +366,10 @@ export function runBacktest(
     return scaled > slip ? scaled : slip;
   };
   const exit = genome.exit;
-  const dynamic = exit.mode === 'dynamic';
+  // Stop, target, trailing stop, breakeven lock and time stop come from the strategy AST's exit spec –
+  // the same spec the Pine exporter emits.
+  const spec = exitSpec(genome);
+  const dynamic = spec.stop.kind === 'atr';
   const allowShort = allowsShorts(settings.tradeMode) && genome.shortEntry !== null;
 
   const { goLong, goShort, exitLong, exitShort, scratch, equity: eq, equityLow: eqLow, inMarket } = ws;
@@ -367,14 +400,24 @@ export function runBacktest(
   }
 
   /* ---- 2. Exit and sizing parameters -------------------------------------- */
-  const atr = exit.mode === 'dynamic' ? ind.atr(exit.atrPeriod) : null;
-  const slPct = exit.mode === 'static' ? exit.stopLossPct / 100 : 0;
-  const tpPct = exit.mode === 'static' ? exit.takeProfitPct / 100 : 0;
-  const slMult = exit.mode === 'dynamic' ? exit.stopAtrMult : 0;
-  const tpMult = exit.mode === 'dynamic' && exit.takeProfitAtrMult !== null ? exit.takeProfitAtrMult : 0;
-  const trailing = exit.mode === 'dynamic' && exit.trailing;
-  const breakeven = exit.breakeven === true;
-  const maxBars = genome.maxBarsInTrade ?? 0;
+  const atr = spec.stop.kind === 'atr' ? ind.atr(spec.stop.period) : null;
+  const slPct = spec.stop.kind === 'percent' ? spec.stop.pct / 100 : 0;
+  const tpPct = spec.target?.kind === 'percent' ? spec.target.pct / 100 : 0;
+  const slMult = spec.stop.kind === 'atr' ? spec.stop.mult : 0;
+  const tpMult = spec.target?.kind === 'atr' ? spec.target.mult : 0;
+  const trailing = spec.trailing !== null;
+  const trailMult = spec.trailing?.mult ?? 0;
+  const trailAtr = spec.trailing !== null ? ind.atr(spec.trailing.period) : null;
+  const breakevenR = spec.breakevenR ?? 0;
+  const breakeven = spec.breakevenR !== null;
+  const maxBars = spec.timeStop ?? 0;
+  const levels = ws.levels;
+  if (levels) {
+    levels.stop.fill(NaN, 0, n);
+    levels.target.fill(NaN, 0, n);
+    levels.entry.fill(NaN, 0, n);
+    levels.dir.fill(0, 0, n);
+  }
   const riskSizing = settings.sizing.mode === 'risk';
   const riskFrac = settings.sizing.riskPct / 100;
   const compounding = settings.sizing.compounding;
@@ -525,21 +568,21 @@ export function runBacktest(
         if (adverse < worst) worst = adverse;
         if (adverse < tradeLow) tradeLow = adverse;
         /* -- 3d. Breakeven lock and trailing ATR stop, updated after the candle has closed -- */
-        if (breakeven && !locked && risk > 0 && (pos === 1 ? h >= entryPrice + risk : l <= entryPrice - risk)) {
+        if (breakeven && !locked && risk > 0 && (pos === 1 ? h >= entryPrice + breakevenR * risk : l <= entryPrice - breakevenR * risk)) {
           // +1R reached: from the next candle on the trade can no longer turn into a full loss.
           locked = true;
           if (pos === 1 ? entryPrice > stop : entryPrice < stop) stop = entryPrice;
         }
-        if (trailing && atr !== null) {
-          const a = atr[i];
+        if (trailing && trailAtr !== null) {
+          const a = trailAtr[i];
           if (a === a) {
             if (pos === 1) {
               if (h > extreme) extreme = h;
-              const next = extreme - slMult * a;
+              const next = extreme - trailMult * a;
               if (next > stop) stop = next;
             } else {
               if (l < extreme) extreme = l;
-              const next = extreme + slMult * a;
+              const next = extreme + trailMult * a;
               if (next < stop) stop = next;
             }
           }
@@ -562,6 +605,13 @@ export function runBacktest(
       busted = true;
     }
     eq[i] = mark;
+    if (levels && pos !== 0) {
+      // The levels in force after this candle has closed (what the next candle's orders use).
+      levels.stop[i] = stop;
+      levels.target[i] = target;
+      levels.entry[i] = entryPrice;
+      levels.dir[i] = pos;
+    }
     if (worst < 0) worst = 0;
     eqLow[i] = worst < mark ? worst : mark;
     inMarket[i] = pos !== 0 ? 1 : 0;
@@ -569,7 +619,7 @@ export function runBacktest(
 
   /* ---- 4. Liquidate whatever is still open at the final close ------------ */
   ws.openPosition =
-    pos !== 0 && n > 0 ? { dir: pos === 1 ? 1 : -1, entryBar, entryPrice, stop, target, risk, breakevenLocked: locked } : null;
+    pos !== 0 && n > 0 ? { dir: pos === 1 ? 1 : -1, entryBar, entryPrice, stop, target, risk, breakevenLocked: locked, extreme } : null;
   if (pos !== 0 && n > 0) {
     const last = n - 1;
     // Market order on the final close: candle `last` has closed, so its own ATR is known.
@@ -1289,10 +1339,13 @@ export function foldsNeeded(judged: number): number {
   return Math.ceil((CONSISTENT_FOLDS / FOLDS) * judged - 1e-9);
 }
 
-/** Weights of the three parts of the per-asset score (see `assetBaseScore`). */
-export const FITNESS_WEIGHTS = { riskAdjusted: 1.5, edge: 1, drawdown: 4 } as const;
-/** Search-period drawdown (intrabar, as a fraction) beyond which the drawdown guard starts to cost. */
-export const DRAWDOWN_GUARD = 0.25;
+/** Weights of the two parts of the per-asset score (see `assetBaseScore`). */
+export const FITNESS_WEIGHTS = { riskAdjusted: 1.5, edge: 1 } as const;
+
+/** Median over the judged folds of the fold score (½ Sortino / 1.5 + ½ Calmar – see `foldScore`). */
+export function medianFoldScore(folds: readonly PerformanceMetrics[]): number {
+  return median(judgedFolds(folds).map((k) => foldScore(folds[k])));
+}
 
 /**
  * Per-asset score – the single source of truth for ranking strategies (higher is better):
@@ -1301,75 +1354,42 @@ export const DRAWDOWN_GUARD = 0.25;
  *           ½ Sortino / 1.5 + ½ Calmar (see `foldScore`)
  *   + 1.0 × expectancy × trade frequency: the R-expectancy of the search period times its trades
  *           per year, in units of 10 R a year, clamped to [−1.5, 3] (see `edgeRate`)
- *   − 4.0 × every unit of search-period drawdown beyond 25% (a smooth guard against the blow-ups
- *           the median of five folds cannot see)
  *
- * A fold in which the strategy never held a position is FLAT: when it was active in at least 3
- * folds, flat folds are left out of the median. Parameter-neighbourhood stability is applied on top
- * by `plateauFitness`. Statistical significance – the deflated Sharpe ratio – is a GATE, not part of
- * the score (see `RobustChecks`): the score never depends on how many strategies were tried, so it
- * stays fixed for the whole run and the search does not hill-climb the validation Sharpe. Nothing
- * here rewards raw return over Buy & Hold.
+ * Nothing else is stacked on top: drawdown is judged once, by the per-fold drawdown cap of gate 1;
+ * parameter stability once, by the neighbourhood half of gate 3; significance once, by the deflated
+ * Sharpe of gate 2. The score never depends on how many strategies were tried, so it stays fixed for
+ * the whole run and the search does not hill-climb the validation Sharpe. Nothing here rewards raw
+ * return over Buy & Hold.
  */
 export function assetBaseScore(m: SearchMetrics, periodsPerYear: number): number {
-  const riskAdjusted = median(judgedFolds(m.folds).map((k) => foldScore(m.folds[k])));
+  const riskAdjusted = medianFoldScore(m.folds);
   const edge = clampTo(edgeRate(m.search, periodsPerYear) / EDGE_SCALE, -1.5, 3);
-  const drawdown = Math.max(0, m.search.maxDrawdown / 100 - DRAWDOWN_GUARD);
-  return FITNESS_WEIGHTS.riskAdjusted * riskAdjusted + FITNESS_WEIGHTS.edge * edge - FITNESS_WEIGHTS.drawdown * drawdown;
+  return FITNESS_WEIGHTS.riskAdjusted * riskAdjusted + FITNESS_WEIGHTS.edge * edge;
 }
 
 export interface FitnessInputs {
   /** One `assetBaseScore` per asset, the primary asset first. */
   assetScores: number[];
-  /** Train + Validation trades: the primary asset's, or the total over a pooled run. */
+  /** Effective train + validation trades: the primary asset's, or the pooled effective bets (see `effectiveBets`). */
   trades: number;
-  /** Validation trades, counted like `trades`. */
+  /** Effective validation trades, counted like `trades`. */
   validationTrades: number;
-  /** Trades per year of the search period, counted like `trades`. */
+  /** Effective trades per year of the search period, counted like `trades`. */
   tradesPerYear: number;
   /** The minimum-trade gates of the run's data (see `tradeGatesFor`). */
   gates: TradeGates;
 }
 
 /**
- * Point fitness of a strategy: UNFIT (disqualified) below the minimum-trade gates, otherwise the
- * MEDIAN of its per-asset scores – one asset, or every asset of a pooled run, so one lucky asset
- * cannot carry the pool. Complexity is capped by the genome (at most `MAX_PARAMETERS` tunable
- * values), not penalised here.
+ * Fitness of a strategy: UNFIT (disqualified) below the minimum-trade gates, otherwise the MEDIAN of
+ * its per-asset scores – one asset, or every asset of a pooled run, so one lucky asset cannot carry
+ * the pool. Complexity is capped by the genome (at most `MAX_PARAMETERS` tunable values), not
+ * penalised here.
  */
 export function combineFitness(f: FitnessInputs): number {
   if (f.assetScores.length === 0 || !passesTradeGates(f)) return UNFIT;
   const score = median(f.assetScores);
   return Number.isFinite(score) ? score : UNFIT;
-}
-
-/** Weight of the neighbourhood in the rank fitness of a strategy that sits above its neighbours. */
-export const STABILITY_WEIGHT = 0.3;
-/** A neighbour counts as at worst this far below the strategy itself (a disqualified neighbour is not −1000). */
-const NEIGHBOUR_SPAN = 3;
-
-/**
- * Rank fitness after the parameter-neighbourhood check: a proportional blend of the strategy's own
- * fitness (70%) and the MEDIAN fitness of its one-grid-step neighbours (30%) when the neighbours
- * are worse; the strategy's own fitness when they are as good or better. A plateau keeps its
- * score, a spike loses 30% of its lead over its neighbourhood – enough to rank plateaus first,
- * not so much that a promising new rule combination is discarded the moment one neighbour slips
- * under a trade gate (neighbours count as at most `NEIGHBOUR_SPAN` below the strategy). The blend
- * never lifts a score, so it never lifts a strategy over the leaderboard floor.
- */
-export function plateauFitness(point: number, neighbours: readonly number[]): number {
-  const m = neighbourhoodMedian(point, neighbours);
-  if (m === null || point <= UNFIT) return point;
-  return m < point ? (1 - STABILITY_WEIGHT) * point + STABILITY_WEIGHT * m : point;
-}
-
-/**
- * The neighbourhood's median fitness exactly as `plateauFitness` uses it: every neighbour counted as
- * at worst `NEIGHBOUR_SPAN` below the strategy. Null without neighbours.
- */
-export function neighbourhoodMedian(point: number, neighbours: readonly number[]): number | null {
-  if (neighbours.length === 0) return null;
-  return median(neighbours.map((value) => Math.max(value, point - NEIGHBOUR_SPAN)));
 }
 
 /** True when a strategy clears every hard minimum-trade gate. */
@@ -1378,32 +1398,79 @@ export function passesTradeGates(f: Pick<FitnessInputs, 'trades' | 'validationTr
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Robustness gates (search period only – see `RobustChecks`)                */
+/*  Effective number of independent bets (pooled baskets)                     */
 /* -------------------------------------------------------------------------- */
 
-/** Validation Sharpe a robust strategy must exceed. */
-export const ROBUST_MIN_VALIDATION_SHARPE = 0.3;
-/**
- * Deflated Sharpe a robust strategy must reach: 50% means the validation Sharpe beats the Sharpe the
- * luckiest of that many skill-less (random-walk) strategies is expected to show.
- */
-export const ROBUST_MIN_DSR = 0.5;
-
-/** Out-of-sample validation pass: Sharpe above 0.3 and a net profit after every cost. */
-export function passesValidationGate(validation: PerformanceMetrics): boolean {
-  return validation.sharpe > ROBUST_MIN_VALIDATION_SHARPE && validation.netPnl > 0;
+/** One asset's contribution to a pooled sample. */
+export interface BetSample {
+  /** Trades opened over the counted period. */
+  trades: number;
+  /** In-market flag of every bar of the counted period, on the basket's common time axis. */
+  inMarket: Uint8Array;
 }
 
 /**
- * Multi-fold consistency: 3 of 5 folds profitable – counted over the folds the strategy was active
- * in, the same folds the fitness takes its median over (see `judgedFolds`) – and no fold beyond the
- * drawdown cap.
+ * Effective number of independent bets of a pooled basket. Trades on correlated assets that are open
+ * at the same time are largely one bet: a broad sell-off stops out BTC, ETH and SOL together. Each
+ * asset's trades are divided by its design effect
+ *
+ *   d_a = 1 + Σ_{b ≠ a} overlap(a, b) · max(0, ρ(a, b))
+ *
+ * where overlap(a, b) is the share of a's in-market bars during which b also held a position and
+ * ρ(a, b) the correlation of the two assets' bar returns. Independent or never-overlapping assets
+ * keep their full count; two perfectly correlated assets trading in lockstep count as one. The
+ * result is used for the trade gates, so a basket cannot buy statistical confidence by repeating one
+ * bet on several correlated markets. A single asset returns its own trade count.
+ */
+export function effectiveBets(samples: readonly BetSample[], correlation: (a: number, b: number) => number): number {
+  const design = designEffects(samples, correlation);
+  return samples.reduce((sum, sample, a) => sum + sample.trades / design[a], 0);
+}
+
+/** The design effect d_a of every asset of a pooled sample (see `effectiveBets`); 1 for a single asset. */
+export function designEffects(samples: readonly BetSample[], correlation: (a: number, b: number) => number): number[] {
+  const out: number[] = [];
+  for (let a = 0; a < samples.length; a++) {
+    const own = samples[a];
+    let held = 0;
+    for (let i = 0; i < own.inMarket.length; i++) held += own.inMarket[i];
+    let design = 1;
+    if (held > 0) {
+      for (let b = 0; b < samples.length; b++) {
+        if (b === a) continue;
+        const rho = correlation(a, b);
+        if (!(rho > 0)) continue;
+        const other = samples[b].inMarket;
+        let both = 0;
+        const n = Math.min(own.inMarket.length, other.length);
+        for (let i = 0; i < n; i++) both += own.inMarket[i] & other[i];
+        design += (both / held) * rho;
+      }
+    }
+    out.push(design);
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Robustness gates (search period only – see `RobustChecks`)                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Deflated Sharpe a robust strategy must reach (gate 2): 50% means the validation Sharpe beats the
+ * Sharpe the luckiest of that many skill-less (random-walk) strategies is expected to show.
+ */
+export const ROBUST_MIN_DSR = 0.5;
+
+/**
+ * Fold half of gate 1: a positive median-fold risk-adjusted return over the judged folds (the same
+ * folds the fitness takes its median over – flat folds of a regime filter set aside) and no fold
+ * beyond the drawdown cap. With five judged folds a positive median means at least three folds
+ * earned a positive risk-adjusted return, so consistency is not counted twice.
  */
 export function passesFoldGate(folds: readonly PerformanceMetrics[]): boolean {
   if (folds.length === 0) return false;
-  const judged = judgedFolds(folds);
-  const profitable = judged.filter((k) => folds[k].roi > 0).length;
-  return profitable >= foldsNeeded(judged.length) && folds.every((fold) => fold.maxDrawdown <= 100 * CATASTROPHIC_FOLD_DRAWDOWN);
+  return medianFoldScore(folds) > 0 && folds.every((fold) => fold.maxDrawdown <= 100 * CATASTROPHIC_FOLD_DRAWDOWN);
 }
 
 /** Net profit per trade (0 without trades). */

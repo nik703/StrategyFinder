@@ -566,6 +566,11 @@ export class IndicatorCache {
     return value;
   }
 
+  /** Memoise a series derived from others (used by the strategy AST for generic lags). */
+  derived(key: string, compute: () => Float64Array): Float64Array {
+    return this.memo(`derived:${key}`, compute);
+  }
+
   private memo(key: string, compute: () => Float64Array): Float64Array {
     return this.read(key) ?? this.write(key, compute());
   }

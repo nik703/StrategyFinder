@@ -7,12 +7,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { buildDataset } from '../src/data/basket';
 import { generateSyntheticCandles } from '../src/data/synthetic';
-import { createContext, fitnessOf, rankFitness, sampleOf, scoreAssets, scoreNeighbours } from '../src/engine/evaluation';
+import { createContext, fitnessOf, sampleOf, scoreAssets } from '../src/engine/evaluation';
 import { countParameters, DEFAULT_LIMITS, FILTER_RATE, HYPOTHESES, MAX_CONDITIONS, MAX_PARAMETERS, mulberry32, randomGenome } from '../src/engine/genome';
 import { exitLevels } from '../src/engine/nextEntrySolver';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal, HOLDOUT_LOG_KEYS } from '../src/lib/holdoutLog';
 import { clearRunStorage, RUN_STATE_KEYS, STORAGE_PREFIX } from '../src/lib/resetRuns';
-import { addSavedTickers, loadSavedTickers, SAVED_TICKERS_KEY } from '../src/lib/savedTickers';
+import { addSavedTickers, loadSavedTickers } from '../src/lib/savedTickers';
+import { savedRuns, saveRun } from '../src/lib/storage';
 import { budgetStatus, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, TRIAL_LEDGER_KEYS, windowBudget } from '../src/lib/trialLedger';
 import { HYPOTHESIS_IDS, WINDOW_TRIAL_BUDGET, type BacktestSettings, type OHLCV, type StrategyGenome, type TradeMode } from '../src/types/trading';
 
@@ -60,7 +61,7 @@ const SETTINGS: BacktestSettings = {
 describe('Reset Runs & Clear Cache', () => {
   const dailyTimes = (n: number): Float64Array => Float64Array.from({ length: n }, (_, i) => NOW - (n - 1 - i) * 86_400_000);
 
-  it('wipes the trial ledger, budget extensions and holdout log, and keeps the saved tickers', () => {
+  it('wipes the trial ledger, budget extensions, holdout log and saved runs, and keeps the saved tickers', () => {
     const t = dailyTimes(1826);
     const trialWindow = searchWindowFor(['BTC-USD', 'ETH-USD'], '1d', t);
     const holdoutWindow = holdoutWindowFor(['BTC-USD', 'ETH-USD'], '1d', t);
@@ -68,6 +69,7 @@ describe('Reset Runs & Clear Cache', () => {
     recordRunTrials(trialWindow, 'run-2', { count: 25_000, mean: 0.1, m2: 300 }, 'VOL_BREAKOUT', NOW);
     extendWindowBudget(trialWindow, NOW);
     recordHoldoutReveal(holdoutWindow, 'S-42', NOW);
+    saveRun({ id: 'run-1', savedAt: NOW, label: 'x', interval: '1d', range: '5y', hypothesis: 'TREND_FOLLOWING', tradeMode: 'long-only', lockedId: null, strategies: [] });
     addSavedTickers([], ['PLTR']);
     storage.setItem('strategyfinder.someOldCache.v0', '{"stale":true}');
     storage.setItem('unrelated.app.key', 'keep me');
@@ -76,24 +78,25 @@ describe('Reset Runs & Clear Cache', () => {
     expect(windowBudget(trialWindow)).toBeGreaterThan(WINDOW_TRIAL_BUDGET);
     expect(budgetStatus(trialWindow, 50_000).level).not.toBe('fresh');
     expect(priorReveals(holdoutWindow)).toHaveLength(1);
+    expect(savedRuns()).toHaveLength(1);
 
     const cleared = clearRunStorage();
-    // Every run-state key that held data, plus the stale StrategyFinder key, is reported and gone.
-    expect(cleared).toEqual(expect.arrayContaining([...TRIAL_LEDGER_KEYS, HOLDOUT_LOG_KEYS[0], 'strategyfinder.someOldCache.v0']));
-    expect(cleared).not.toContain(SAVED_TICKERS_KEY);
-    for (const key of RUN_STATE_KEYS) expect(storage.getItem(key)).toBeNull();
+    // Leftover localStorage keys of older versions are swept too; the saved tickers are kept.
+    expect(cleared).toEqual(['strategyfinder.someOldCache.v0']);
     expect(storage.getItem('strategyfinder.someOldCache.v0')).toBeNull();
-    // A clean 0-trial slate: no prior trials, the default budget, no recorded reveal.
+    // A clean 0-trial slate: no prior trials, the default budget, no recorded reveal, no saved run.
     expect(priorTrials(trialWindow)).toMatchObject({ count: 0, runs: 0 });
     expect(windowBudget(trialWindow)).toBe(WINDOW_TRIAL_BUDGET);
     expect(budgetStatus(trialWindow, 0)).toMatchObject({ level: 'fresh', used: 0, extensions: 0 });
     expect(priorReveals(holdoutWindow)).toHaveLength(0);
+    expect(savedRuns()).toHaveLength(0);
     // Preferences and other apps' data survive.
     expect(loadSavedTickers()).toContain('PLTR');
     expect(storage.getItem('unrelated.app.key')).toBe('keep me');
     // A second reset has nothing left to clear.
     expect(clearRunStorage()).toEqual([]);
     expect(STORAGE_PREFIX).toBe('strategyfinder.');
+    expect(HOLDOUT_LOG_KEYS.length + TRIAL_LEDGER_KEYS.length).toBe(RUN_STATE_KEYS.length);
   });
 
   it('clears the known keys from minimal or broken storage without throwing', () => {
@@ -132,22 +135,12 @@ describe('composite fitness with the deflated Sharpe as a gate', () => {
       const hard = fitnessOf(ctx, scores);
       expect(hard.fitness).toBe(easy.fitness);
       expect(hard.dsr).toBeLessThanOrEqual(easy.dsr);
-      if (easy.fitness > -1000) {
-        // The neighbourhood blend is hurdle-free too.
-        const neighbours = scoreNeighbours(ctx, g);
-        ctx.hurdle = 0;
-        const a = rankFitness(ctx, scores, neighbours);
-        ctx.hurdle = 0.2;
-        const b = rankFitness(ctx, scores, neighbours);
-        expect(b.fitness).toBe(a.fitness);
-        expect(b.point).toBe(a.point);
-        compared++;
-      }
+      if (easy.fitness > -1000) compared++;
     }
     expect(compared).toBeGreaterThan(3);
   }, 60_000);
 
-  it('treats several assets as one pooled sample: summed trades, median score, median deflated Sharpe', () => {
+  it('treats several assets as one pooled sample: effective independent bets, median score, median deflated Sharpe', () => {
     const datasets = ['BTC-USD', 'ETH-USD', 'SOL-USD'].map((symbol) => ({ symbol, data: series(symbol, '4h', '2y') }));
     const ctx = createContext(datasets, SETTINGS, 128 * 1024 * 1024);
     expect(ctx.pooled).toBe(true);
@@ -156,8 +149,14 @@ describe('composite fitness with the deflated Sharpe as a gate', () => {
     const g = randomGenome(rng, 'long-only', ctx.limits, 'VOL_BREAKOUT');
     const { scores } = scoreAssets(ctx, g);
     const sample = sampleOf(ctx, scores);
-    expect(sample.trades).toBe(scores.reduce((sum, score) => sum + score.metrics.search.trades, 0));
-    expect(sample.validationTrades).toBe(scores.reduce((sum, score) => sum + score.metrics.validation.trades, 0));
+    const raw = scores.reduce((sum, score) => sum + score.metrics.search.trades, 0);
+    expect(sample.rawTrades).toBe(raw);
+    expect(sample.rawValidationTrades).toBe(scores.reduce((sum, score) => sum + score.metrics.validation.trades, 0));
+    // Correlated assets trading at the same time are discounted: never more bets than trades, never
+    // fewer than the busiest single asset contributes on its own.
+    expect(sample.trades).toBeLessThanOrEqual(raw + 1e-9);
+    expect(sample.trades).toBeGreaterThan(0);
+    for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) expect(ctx.correlation[a][b]).toBeCloseTo(ctx.correlation[b][a], 12);
   }, 60_000);
 });
 

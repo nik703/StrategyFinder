@@ -1,6 +1,7 @@
 /** UI-level run configuration and the immutable context captured when a run starts. */
 
 import { normalizeWeights, TICKER_PATTERN } from '../data/basket';
+import { enforceRealism } from '../engine/evaluation';
 import type { HoldoutWindow } from './holdoutLog';
 import { PRESETS } from './presets';
 import type { TrialWindow } from './trialLedger';
@@ -66,6 +67,8 @@ export interface RunConfig {
   borrowPctYear: number;
   /** Fine-tune EMA / SMA lengths over every integer, or only the coarse grid. */
   maPeriods: MaPeriodSearch;
+  /** Ignore the IndexedDB candle cache and download the whole range on the next run. */
+  forceRefreshData: boolean;
 }
 
 /** Most assets an asset pool may hold. */
@@ -120,6 +123,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   borrowPctYear: DEFAULT_BORROW_PCT_YEAR,
   // Every EMA / SMA length is tried; the plateau check still looks a ×√2 step away (see genome.ts).
   maPeriods: 'integer',
+  forceRefreshData: false,
   ...PRESETS[0].patch,
 };
 
@@ -203,10 +207,15 @@ export function financingFor(config: RunConfig): Financing {
 
 const MS_PER_YEAR = 365.25 * 86_400_000;
 
+/**
+ * Engine settings for a run. The execution-realism floors (`enforceRealism`) are applied here, so the
+ * search, the analysis, the Next Entry forecast and the Pine export all use the same realistic costs
+ * – and the engine applies them again when it builds a search context.
+ */
 export function settingsFrom(config: RunConfig): BacktestSettings {
   const financing = financingFor(config);
   const barMs = INTERVAL_MS[config.interval];
-  return {
+  return enforceRealism({
     initialCapital: config.capital,
     feePct: config.feePct,
     slippagePct: config.slippagePct,
@@ -221,7 +230,7 @@ export function settingsFrom(config: RunConfig): BacktestSettings {
     fundingPctPerBar: financing === 'funding' ? config.fundingPct8h * (barMs / (8 * 3_600_000)) : 0,
     borrowPctPerBar: financing === 'borrow' ? config.borrowPctYear * (barMs / MS_PER_YEAR) : 0,
     maPeriods: config.maPeriods,
-  };
+  }, barMs);
 }
 
 /** Everything about a run that must not change when the user edits the controls afterwards. */

@@ -16,7 +16,7 @@ import { Button } from '@/components/ui/button';
 import { CardHeader } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { judgedFolds } from '@/engine/backtester';
+import { judgedFolds, passesFoldGate } from '@/engine/backtester';
 import { exitModeLabel, exitTags, groupFormula, indicatorBadges } from '@/engine/describe';
 import { MAX_PARAMETERS } from '@/engine/genome';
 import { fmtInt, fmtNum, fmtPct, fmtUsd } from '@/lib/format';
@@ -97,10 +97,10 @@ export function VerdictPill({ verdict }: { verdict: Verdict | null }): JSX.Eleme
   return <Pill tone={verdict === 'Robust' ? 'up' : verdict === 'Fragile' ? 'warn' : 'down'}>{verdict}</Pill>;
 }
 
-/** Number of robustness gates a strategy passes (0–4). */
+/** Number of robustness gates a strategy passes (0–3). */
 function gatesPassed(strategy: StrategyResult): number {
   const r = strategy.robust;
-  return r ? [r.validation, r.folds, r.neighbours, r.significance].filter(Boolean).length : 0;
+  return r ? [r.sample, r.dsr, r.stress === true].filter(Boolean).length : 0;
 }
 
 /** Search-period status: Robust (every gate), Marginal (one gate short) or Overfit risk (two or more short). */
@@ -108,7 +108,7 @@ function robustStatus(strategy: StrategyResult): { label: string; tone: PillTone
   if (!strategy.robust) return null;
   const passed = gatesPassed(strategy);
   if (strategy.robust.passed) return { label: 'Robust', tone: 'up' };
-  return passed === 3 ? { label: 'Marginal', tone: 'warn' } : { label: 'Overfit risk', tone: 'down' };
+  return passed === 2 ? { label: 'Marginal', tone: 'warn' } : { label: 'Overfit risk', tone: 'down' };
 }
 
 /** Profitable folds among the folds the strategy is judged on (flat folds set aside, as in the fold gate). */
@@ -149,16 +149,16 @@ const COLUMNS: Column[] = [
     key: 'gates',
     label: 'Status',
     title:
-      'Robustness gates on the search period – validation, fold consistency, neighbour stability, significance (trades + DSR ≥ 50%). Robust: all 4 pass · Marginal: 3 of 4 · Overfit risk: 2 or fewer.',
+      'Three robustness gates on the search period – 1 effective sample + median-fold return + fold drawdown cap · 2 deflated Sharpe ≥ 50% · 3 Monte Carlo stress + neighbour stability (top 20 only). Robust: all 3 pass · Marginal: 2 of 3 · Overfit risk: 1 or none.',
     align: 'left',
     value: ({ strategy }) => gatesPassed(strategy),
     render: ({ strategy }) => {
       const r = strategy.robust;
       const status = robustStatus(strategy);
       if (!r || !status) return <span className="text-muted-foreground">–</span>;
-      const failed = [!r.validation && 'validation', !r.folds && 'folds', !r.neighbours && 'neighbours', !r.significance && 'significance'].filter(Boolean);
+      const failed = [!r.sample && 'sample', !r.dsr && 'deflated Sharpe', r.stress === false && 'stress', r.stress === null && 'stress (not checked yet)'].filter(Boolean);
       return (
-        <Pill tone={status.tone} title={r.passed ? 'Passes every robustness gate on the search period' : `${gatesPassed(strategy)}/4 gates · fails: ${failed.join(', ')}`}>
+        <Pill tone={status.tone} title={r.passed ? 'Passes every robustness gate on the search period' : `${gatesPassed(strategy)}/3 gates · open: ${failed.join(', ')}`}>
           {status.label}
         </Pill>
       );
@@ -177,7 +177,7 @@ const COLUMNS: Column[] = [
       const tally = foldTally(strategy);
       if (!tally) return <span className="text-muted-foreground">–</span>;
       return (
-        <span className={cn('font-semibold', strategy.robust?.folds ? 'text-up' : 'text-secondary-foreground')}>
+        <span className={cn('font-semibold', strategy.folds && passesFoldGate(strategy.folds) ? 'text-up' : 'text-secondary-foreground')}>
           {tally.profitable}/{tally.judged}
         </span>
       );

@@ -13,14 +13,16 @@
  *   • `use_bar_magnifier=false`, so the script runs on every TradingView plan.
  *
  * The script is plain ASCII so it survives any clipboard / editor round-trip.
+ *
+ * Rules are emitted from the strategy AST (`strategyAst.ts`) – the same compiled tree the engine
+ * executes – never from the genome directly: `pineSeries` gives every series node its one Pine form
+ * and the stop / target / trailing / breakeven / time-stop code comes from the AST's exit spec.
  */
 
-import { allowsShorts, SLOPE_LAG } from '../types/trading';
 import type {
   BacktestSettings,
   BasketComponent,
   CmpOp,
-  Condition,
   Interval,
   PerformanceMetrics,
   RuleGroup,
@@ -28,6 +30,7 @@ import type {
 } from '../types/trading';
 import { ARCHETYPE_LABEL, groupFormula } from './describe';
 import { countParameters } from './genome';
+import { compileStrategy, type ConditionNode, type SeriesNode } from './strategyAst';
 
 export interface PineContext {
   /** Dataset label, e.g. "BTC-USD" or "50% BTC-USD · 30% ETH-USD · 20% NVDA". */
@@ -82,7 +85,7 @@ function metricsLine(m: PerformanceMetrics): string {
 /* -------------------------------------------------------------------------- */
 
 /** Ordered, de-duplicated set of indicator declarations. */
-class Declarations {
+export class Declarations {
   private readonly lines = new Map<string, string>();
 
   add(key: string, line: string): void {
@@ -116,124 +119,128 @@ function keltnerVars(decl: Declarations, period: number, mult: number): [upper: 
   return [`kcUpper_${id}`, `kcLower_${id}`];
 }
 
-/** Declare what a condition needs and return its Pine operands. */
-function operands(c: Condition, decl: Declarations): { left: string; right: string } {
-  switch (c.ind) {
-    case 'RSI': {
-      const name = `rsi_${c.period}`;
-      decl.add(name, `${name} = ta.rsi(close, ${c.period})`);
-      return { left: name, right: String(c.level) };
+/** A number as a Pine literal: integers as written, other values with a decimal point. */
+const literal = (value: number): string => (Number.isInteger(value) ? String(value) : float(value));
+
+/**
+ * The Pine expression of a strategy-AST series node, declaring whatever it needs. This is the only
+ * place the exporter maps rules to Pine: every node kind has exactly one Pine form, mirroring the
+ * engine's `evaluateSeries`.
+ */
+export function pineSeries(node: SeriesNode, decl: Declarations): string {
+  switch (node.k) {
+    case 'price':
+      return node.field;
+    case 'const':
+      return literal(node.value);
+    case 'lag':
+      return `${pineSeries(node.of, decl)}[${node.bars}]`;
+    case 'ma':
+      return maVar(decl, node.type, node.period);
+    case 'rsi': {
+      const name = `rsi_${node.period}`;
+      decl.add(name, `${name} = ta.rsi(close, ${node.period})`);
+      return name;
     }
-    case 'MACD': {
-      const id = `${c.fast}_${c.slow}_${c.signal}`;
-      decl.add(
-        `macd_${id}`,
-        `[macdLine_${id}, macdSignal_${id}, macdHist_${id}] = ta.macd(close, ${c.fast}, ${c.slow}, ${c.signal})`,
-      );
-      if (c.variant === 'signal') return { left: `macdLine_${id}`, right: `macdSignal_${id}` };
-      if (c.variant === 'zero') return { left: `macdLine_${id}`, right: '0' };
-      return { left: `macdHist_${id}`, right: `macdHist_${id}[1]` };
+    case 'macd': {
+      const id = `${node.fast}_${node.slow}_${node.signal}`;
+      decl.add(`macd_${id}`, `[macdLine_${id}, macdSignal_${id}, macdHist_${id}] = ta.macd(close, ${node.fast}, ${node.slow}, ${node.signal})`);
+      return node.part === 'line' ? `macdLine_${id}` : node.part === 'signal' ? `macdSignal_${id}` : `macdHist_${id}`;
     }
-    case 'PRICE_MA':
-      return { left: 'close', right: maVar(decl, c.maType, c.period) };
-    case 'MA_CROSS':
-      return { left: maVar(decl, c.fastType, c.fastPeriod), right: maVar(decl, c.slowType, c.slowPeriod) };
-    case 'BB': {
-      const id = `${c.period}_${ident(c.mult)}`;
-      decl.add(`bb_${id}`, `[bbBasis_${id}, bbUpper_${id}, bbLower_${id}] = ta.bb(close, ${c.period}, ${float(c.mult)})`);
-      switch (c.variant) {
+    case 'bb': {
+      const id = `${node.period}_${ident(node.mult)}`;
+      decl.add(`bb_${id}`, `[bbBasis_${id}, bbUpper_${id}, bbLower_${id}] = ta.bb(close, ${node.period}, ${float(node.mult)})`);
+      switch (node.part) {
         case 'pctb':
           decl.add(`bbPctB_${id}`, `bbPctB_${id} = (close - bbLower_${id}) / (bbUpper_${id} - bbLower_${id})`);
-          return { left: `bbPctB_${id}`, right: float(c.level) };
-        case 'bandwidth':
+          return `bbPctB_${id}`;
+        case 'width':
           decl.add(`bbWidth_${id}`, `bbWidth_${id} = (bbUpper_${id} - bbLower_${id}) / bbBasis_${id} * 100`);
-          return { left: `bbWidth_${id}`, right: float(c.level) };
+          return `bbWidth_${id}`;
         case 'upper':
-          return { left: 'close', right: `bbUpper_${id}` };
+          return `bbUpper_${id}`;
         case 'lower':
-          return { left: 'close', right: `bbLower_${id}` };
+          return `bbLower_${id}`;
+        case 'basis':
+          return `bbBasis_${id}`;
       }
       break;
     }
-    case 'ATR': {
-      const atr = atrVar(decl, c.period);
-      const name = `atrPct_${c.period}`;
+    case 'atr':
+      return atrVar(decl, node.period);
+    case 'atrPct': {
+      const atr = atrVar(decl, node.period);
+      const name = `atrPct_${node.period}`;
       decl.add(name, `${name} = ${atr} / close * 100`);
-      return { left: name, right: float(c.level) };
+      return name;
     }
-    case 'STOCH': {
-      const k = `stochK_${c.kPeriod}_${c.smooth}`;
-      decl.add(k, `${k} = ta.sma(ta.stoch(close, high, low, ${c.kPeriod}), ${c.smooth})`);
-      if (c.variant === 'level') return { left: k, right: String(c.level) };
-      const d = `stochD_${c.kPeriod}_${c.smooth}_${c.dPeriod}`;
-      decl.add(d, `${d} = ta.sma(${k}, ${c.dPeriod})`);
-      return { left: k, right: d };
+    case 'stoch': {
+      const k = `stochK_${node.kPeriod}_${node.smooth}`;
+      decl.add(k, `${k} = ta.sma(ta.stoch(close, high, low, ${node.kPeriod}), ${node.smooth})`);
+      if (node.part === 'k') return k;
+      const d = `stochD_${node.kPeriod}_${node.smooth}_${node.dPeriod}`;
+      decl.add(d, `${d} = ta.sma(${k}, ${node.dPeriod})`);
+      return d;
     }
-    case 'ADX': {
-      const p = c.period;
+    case 'dmi': {
+      const p = node.period;
       decl.add(`dmi_${p}`, `[diPlus_${p}, diMinus_${p}, adx_${p}] = ta.dmi(${p}, ${p})`);
-      return c.variant === 'strength'
-        ? { left: `adx_${p}`, right: String(c.level) }
-        : { left: `diPlus_${p}`, right: `diMinus_${p}` };
+      return node.part === 'adx' ? `adx_${p}` : node.part === 'plus' ? `diPlus_${p}` : `diMinus_${p}`;
     }
-    case 'VOLUME': {
-      const name = `volRatio_${c.period}`;
-      decl.add(name, `${name} = volume / ta.sma(volume, ${c.period})`);
-      return { left: name, right: float(c.level) };
+    case 'volRatio': {
+      const name = `volRatio_${node.period}`;
+      decl.add(name, `${name} = volume / ta.sma(volume, ${node.period})`);
+      return name;
     }
-    case 'SUPERTREND': {
-      const id = `${c.period}_${ident(c.mult)}`;
-      decl.add(`st_${id}`, `[supertrend_${id}, supertrendDir_${id}] = ta.supertrend(${float(c.mult)}, ${c.period})`);
-      return { left: 'close', right: `supertrend_${id}` };
+    case 'supertrend': {
+      const id = `${node.period}_${ident(node.mult)}`;
+      decl.add(`st_${id}`, `[supertrend_${id}, supertrendDir_${id}] = ta.supertrend(${float(node.mult)}, ${node.period})`);
+      return `supertrend_${id}`;
     }
-    case 'CCI': {
-      const name = `cci_${c.period}`;
-      decl.add(name, `${name} = ta.cci(hlc3, ${c.period})`);
-      return { left: name, right: String(c.level) };
+    case 'cci': {
+      const name = `cci_${node.period}`;
+      decl.add(name, `${name} = ta.cci(hlc3, ${node.period})`);
+      return name;
     }
-    case 'DONCHIAN': {
+    case 'donchian': {
       // Channel of the PREVIOUS candles: the current candle is excluded, as in StrategyFinder.
-      const name = c.variant === 'upper' ? `donchianHigh_${c.period}` : `donchianLow_${c.period}`;
-      decl.add(name, c.variant === 'upper' ? `${name} = ta.highest(high, ${c.period})[1]` : `${name} = ta.lowest(low, ${c.period})[1]`);
-      return { left: 'close', right: name };
+      const name = node.part === 'upper' ? `donchianHigh_${node.period}` : `donchianLow_${node.period}`;
+      decl.add(name, node.part === 'upper' ? `${name} = ta.highest(high, ${node.period})[1]` : `${name} = ta.lowest(low, ${node.period})[1]`);
+      return name;
     }
-    case 'MA_SLOPE': {
-      const ma = maVar(decl, c.maType, c.period);
-      return { left: ma, right: `${ma}[${SLOPE_LAG}]` };
+    case 'keltner': {
+      const [upper, lower] = keltnerVars(decl, node.period, node.mult);
+      return node.part === 'upper' ? upper : lower;
     }
-    case 'KELTNER': {
-      const [upper, lower] = keltnerVars(decl, c.period, c.mult);
-      return { left: 'close', right: c.variant === 'upper' ? upper : lower };
-    }
-    case 'SQUEEZE': {
-      const id = `${c.period}_${ident(c.mult)}`;
-      const bb = `${c.period}_2`;
-      decl.add(`bb_${bb}`, `[bbBasis_${bb}, bbUpper_${bb}, bbLower_${bb}] = ta.bb(close, ${c.period}, 2.0)`);
-      const [kcUpper, kcLower] = keltnerVars(decl, c.period, c.mult);
+    case 'squeeze': {
+      const id = `${node.period}_${ident(node.mult)}`;
+      const bb = `${node.period}_2`;
+      decl.add(`bb_${bb}`, `[bbBasis_${bb}, bbUpper_${bb}, bbLower_${bb}] = ta.bb(close, ${node.period}, 2.0)`);
+      const [kcUpper, kcLower] = keltnerVars(decl, node.period, node.mult);
       decl.add(`squeezeOn_${id}`, `squeezeOn_${id} = bbUpper_${bb} < ${kcUpper} and bbLower_${bb} > ${kcLower}`);
       decl.add(
         `squeeze_${id}`,
         `squeeze_${id} = squeezeOn_${id}[1] and not squeezeOn_${id} ? (close > bbBasis_${bb} ? 1 : close < bbBasis_${bb} ? -1 : 0) : 0 // +1 release up, -1 release down`,
       );
-      return { left: `squeeze_${id}`, right: float(c.level) };
+      return `squeeze_${id}`;
     }
-    case 'RANGE_EXP': {
-      const atr = atrVar(decl, c.period);
-      const name = `rangeExp_${c.period}_${ident(c.mult)}`;
+    case 'rangeExp': {
+      const atr = atrVar(decl, node.period);
+      const name = `rangeExp_${node.period}_${ident(node.mult)}`;
       decl.add(
         name,
-        `${name} = ta.tr(true) > ${float(c.mult)} * ${atr}[1] ? (close > close[1] ? 1 : close < close[1] ? -1 : 0) : 0 // wide-range candle: +1 up, -1 down`,
+        `${name} = ta.tr(true) > ${float(node.mult)} * ${atr}[1] ? (close > close[1] ? 1 : close < close[1] ? -1 : 0) : 0 // wide-range candle: +1 up, -1 down`,
       );
-      return { left: name, right: float(c.level) };
+      return name;
     }
-    case 'PULLBACK': {
-      const ma = maVar(decl, c.maType, c.period);
+    case 'pullback': {
+      const ma = maVar(decl, node.type, node.period);
       const name = `pullback_${ma}`;
       decl.add(name, `${name} = low <= ${ma} and close > ${ma} ? 1 : high >= ${ma} and close < ${ma} ? -1 : 0 // +1 support held, -1 resistance held`);
-      return { left: name, right: float(c.level) };
+      return name;
     }
   }
-  throw new Error(`Unsupported condition: ${JSON.stringify(c)}`);
+  throw new Error(`Unsupported series node: ${JSON.stringify(node)}`);
 }
 
 function compare(op: CmpOp, left: string, right: string): string {
@@ -249,8 +256,12 @@ function compare(op: CmpOp, left: string, right: string): string {
   }
 }
 
-/** Emit `prefixCond1 = ...` lines and the combined `name = a and b` line. */
+/**
+ * Emit `prefixCond1 = ...` lines from compiled condition nodes and the combined `name = a and b`
+ * line. `group` only supplies the human-readable comment.
+ */
 function emitGroup(
+  nodes: readonly ConditionNode[],
   group: RuleGroup,
   name: string,
   prefix: string,
@@ -260,10 +271,9 @@ function emitGroup(
 ): void {
   out.push(`// ${title}: ${ascii(groupFormula(group))}`);
   const parts: string[] = [];
-  group.conditions.forEach((condition, index) => {
-    const { left, right } = operands(condition, decl);
+  nodes.forEach((node, index) => {
     const variable = `${prefix}Cond${index + 1}`;
-    out.push(`${variable} = ${compare(condition.op, left, right)}`);
+    out.push(`${variable} = ${compare(node.op, pineSeries(node.left, decl), pineSeries(node.right, decl))}`);
     parts.push(variable);
   });
   out.push(`${name} = ${parts.join(' and ')}`);
@@ -286,16 +296,19 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   const { genome } = result;
   const { exit } = genome;
   const { sizing } = ctx.settings;
-  const timeStop = genome.maxBarsInTrade;
   const { settings } = ctx;
-  const hasShorts = genome.shortEntry !== null && allowsShorts(settings.tradeMode);
+  // Everything below compiles from the strategy AST – the same tree the engine executes.
+  const ast = compileStrategy(genome, settings.tradeMode);
+  const spec = ast.exit;
+  const timeStop = spec.timeStop;
+  const hasShorts = ast.shortEntry !== null;
   const asymmetric = hasShorts && genome.shortRegime != null;
-  const dynamic = exit.mode === 'dynamic';
-  const trailing = exit.mode === 'dynamic' && exit.trailing;
-  const breakeven = exit.breakeven === true;
-  const hasTarget = exit.mode === 'static' || exit.takeProfitAtrMult !== null;
-  const hasSignalExit = exit.mode === 'dynamic' && exit.longExit !== null;
-  const hasShortSignalExit = exit.mode === 'dynamic' && hasShorts && exit.shortExit !== null;
+  const dynamic = spec.stop.kind === 'atr';
+  const trailing = spec.trailing !== null;
+  const breakeven = spec.breakevenR !== null;
+  const hasTarget = spec.target !== null;
+  const hasSignalExit = ast.longExit !== null;
+  const hasShortSignalExit = ast.shortExit !== null;
   const costPct = Number((settings.feePct + settings.slippagePct).toFixed(6));
   const label = ascii(ctx.label);
   const title = ascii(`StrategyFinder ${result.id} | ${ctx.components.length > 1 ? 'Basket' : label} ${ctx.interval}`);
@@ -303,10 +316,11 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
   const decl = new Declarations();
   const rules: string[] = [];
 
-  emitGroup(genome.longEntry, 'longEntry', 'long', 'Long entry', decl, rules);
-  if (hasShorts && genome.shortEntry) {
+  emitGroup(ast.longEntry, genome.longEntry, 'longEntry', 'long', 'Long entry', decl, rules);
+  if (ast.shortEntry && genome.shortEntry) {
     rules.push('');
     emitGroup(
+      ast.shortEntry,
       genome.shortEntry,
       'shortEntry',
       'short',
@@ -315,13 +329,13 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
       rules,
     );
   }
-  if (exit.mode === 'dynamic' && exit.longExit) {
+  if (ast.longExit && exit.mode === 'dynamic' && exit.longExit) {
     rules.push('');
-    emitGroup(exit.longExit, 'longExitSignal', 'longExit', 'Long trigger-reversal exit', decl, rules);
+    emitGroup(ast.longExit, exit.longExit, 'longExitSignal', 'longExit', 'Long trigger-reversal exit', decl, rules);
   }
-  if (exit.mode === 'dynamic' && hasShorts && exit.shortExit) {
+  if (ast.shortExit && exit.mode === 'dynamic' && exit.shortExit) {
     rules.push('');
-    emitGroup(exit.shortExit, 'shortExitSignal', 'shortExit', 'Short trigger-reversal exit', decl, rules);
+    emitGroup(ast.shortExit, exit.shortExit, 'shortExitSignal', 'shortExit', 'Short trigger-reversal exit', decl, rules);
   }
 
   const lines: string[] = [];
@@ -413,19 +427,19 @@ export function generatePineScript(result: StrategyResult, ctx: PineContext): st
     '',
     '// ---- Risk management ---------------------------------------------------------',
   );
-  if (exit.mode === 'static') {
+  if (spec.stop.kind === 'percent') {
     push(
-      `stopLossPct   = input.float(${float(exit.stopLossPct)}, "Stop loss %", minval=0.1, step=0.1, group="Risk management")`,
-      `takeProfitPct = input.float(${float(exit.takeProfitPct)}, "Take profit %", minval=0.1, step=0.5, group="Risk management")`,
+      `stopLossPct   = input.float(${float(spec.stop.pct)}, "Stop loss %", minval=0.1, step=0.1, group="Risk management")`,
+      `takeProfitPct = input.float(${float(spec.target?.kind === 'percent' ? spec.target.pct : 0)}, "Take profit %", minval=0.1, step=0.5, group="Risk management")`,
     );
   } else {
     push(
-      `atrLength     = input.int(${exit.atrPeriod}, "ATR length", minval=1, group="Risk management")`,
-      `stopAtrMult   = input.float(${float(exit.stopAtrMult)}, "${trailing ? 'Trailing stop' : 'Stop loss'} (x ATR)", minval=0.1, step=0.1, group="Risk management")`,
+      `atrLength     = input.int(${spec.stop.period}, "ATR length", minval=1, group="Risk management")`,
+      `stopAtrMult   = input.float(${float(spec.stop.mult)}, "${trailing ? 'Trailing stop' : 'Stop loss'} (x ATR)", minval=0.1, step=0.1, group="Risk management")`,
     );
-    if (exit.takeProfitAtrMult !== null) {
+    if (spec.target?.kind === 'atr') {
       push(
-        `targetAtrMult = input.float(${float(exit.takeProfitAtrMult)}, "Take profit (x ATR)", minval=0.1, step=0.1, group="Risk management")`,
+        `targetAtrMult = input.float(${float(spec.target.mult)}, "Take profit (x ATR)", minval=0.1, step=0.1, group="Risk management")`,
       );
     }
     push('atrValue      = ta.atr(atrLength)');

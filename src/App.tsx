@@ -21,7 +21,7 @@ import TelemetryStrip from './components/TelemetryStrip';
 import TopActionBar from './components/TopActionBar';
 import { Panel, StepHeader } from './components/common';
 import { buildDataset } from './data/basket';
-import { loadMarketData } from './data/marketData';
+import { loadMarketData, type LoadedMarketData } from './data/marketData';
 import {
   crossMarketSuggestion,
   DEFAULT_CONFIG,
@@ -36,12 +36,13 @@ import {
 import { resetForecastWorker } from './lib/forecastClient';
 import { fmtDate, fmtInt } from './lib/format';
 import { holdoutWindowFor, priorReveals, recordHoldoutReveal } from './lib/holdoutLog';
+import { savedRuns, saveRun } from './lib/storage';
 import { activePreset } from './lib/presets';
 import { clearRunStorage } from './lib/resetRuns';
 import { budgetStatus, estimateSearchWindow, extendWindowBudget, priorTrials, recordRunTrials, searchWindowFor, windowBudget, type TrialWindow } from './lib/trialLedger';
 import { buildSnapshot, fetchSnapshot, type MarketSnapshot } from './lib/marketSnapshot';
 import { addSavedTickers, loadSavedTickers, removeSavedTicker } from './lib/savedTickers';
-import type { EvaluatorConnect } from './engine/evaluation';
+import { evaluatorBudgetBytes, WorkerPool } from './workers/workerPool';
 import {
   clampRange,
   type BenchmarkResult,
@@ -61,18 +62,28 @@ import {
 
 type Analysis = { report: RobustnessReport; verdict: Verdict | null };
 
-/** Most evaluator workers a run will start (each holds its own copy of the data and an indicator cache). */
-const MAX_EVALUATORS = 6;
+/** One line per symbol on how its candles were loaded (cache hits, new candles, full downloads). */
+function cacheNotes(cache: LoadedMarketData['cache']): string[] {
+  return cache.map(({ symbol, cachedBars, fetchedBars, mode }) =>
+    mode === 'full'
+      ? `${symbol}: downloaded ${fetchedBars.toLocaleString('en-US')} candles (cached for later runs).`
+      : `${symbol}: ${cachedBars.toLocaleString('en-US')} candles from the cache + ${fetchedBars.toLocaleString('en-US')} new.`,
+  );
+}
 
-/**
- * Number of evaluator workers for this device: every core but one (left for the page and the
- * optimiser thread, which only proposes and ranks). With one or two cores the optimiser
- * scores candidates itself – a pool of one would only add messaging overhead.
- */
-function evaluatorPoolSize(): number {
-  const cores = typeof navigator !== 'undefined' && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : 2;
-  const size = Math.min(MAX_EVALUATORS, cores - 1);
-  return size >= 2 ? size : 0;
+/** Save a finished run and its leaderboard snapshot in IndexedDB (exported with a snapshot). */
+function persistRun(context: RunContext, strategies: StrategyResult[], lockedId: string | null): void {
+  saveRun({
+    id: context.runId,
+    savedAt: Date.now(),
+    label: context.label,
+    interval: context.interval,
+    range: context.range,
+    hypothesis: context.hypothesis,
+    tradeMode: context.settings.tradeMode,
+    lockedId,
+    strategies,
+  });
 }
 
 const EMPTY_TELEMETRY: ProgressSnapshot = {
@@ -90,7 +101,7 @@ const EMPTY_TELEMETRY: ProgressSnapshot = {
   robustFound: 0,
   robustTarget: 0,
   cycle: 1,
-  funnel: { scored: 0, trades: 0, validation: 0, folds: 0, dsr: 0, neighboursChecked: 0, neighbours: 0 },
+  funnel: { scored: 0, sample: 0, dsr: 0, stressChecked: 0, stress: 0 },
   itersPerSec: 0,
   elapsedMs: 0,
 };
@@ -134,7 +145,8 @@ export default function App(): JSX.Element {
 
   const workerRef = useRef<Worker | null>(null);
   /** Evaluator workers that score candidate strategies in parallel for the optimiser. */
-  const evaluatorsRef = useRef<Worker[]>([]);
+  /** The run's evaluator worker pool (first evaluation tier on every spare core). */
+  const poolRef = useRef<WorkerPool | null>(null);
   const runIdRef = useRef(0);
   const pendingProgress = useRef<ProgressSnapshot | null>(null);
   const frameRef = useRef<number | null>(null);
@@ -144,8 +156,8 @@ export default function App(): JSX.Element {
   const requestedRef = useRef(new Set<string>());
 
   const disposePool = useCallback(() => {
-    for (const evaluator of evaluatorsRef.current) evaluator.terminate();
-    evaluatorsRef.current = [];
+    poolRef.current?.terminate();
+    poolRef.current = null;
   }, []);
 
   const disposeWorker = useCallback(() => {
@@ -244,6 +256,7 @@ export default function App(): JSX.Element {
           setPendingAnalyses({});
           if (contextRef.current) {
             recordRunTrials(contextRef.current.trialWindow, contextRef.current.runId, snapshot.runTrials, contextRef.current.hypothesis);
+            persistRun(contextRef.current, strategies, null);
             setLedgerVersion((v) => v + 1);
           }
           setStopReason(reason);
@@ -266,7 +279,13 @@ export default function App(): JSX.Element {
             return next;
           });
           // Persist the reveal: every later run whose holdout overlaps this one will be warned.
-          if (contextRef.current) recordHoldoutReveal(contextRef.current.holdoutWindow, locked.id);
+          if (contextRef.current) {
+            recordHoldoutReveal(contextRef.current.holdoutWindow, locked.id);
+            // The saved run keeps the locked strategy (with its revealed holdout) in place of its sealed version.
+            const saved = savedRuns().find((run) => run.id === contextRef.current?.runId);
+            if (saved) saveRun({ ...saved, lockedId: locked.id, strategies: saved.strategies.map((s) => ((s as StrategyResult).id === locked.id ? locked : s)) });
+            setLedgerVersion((v) => v + 1);
+          }
           break;
         }
         case 'analysis':
@@ -332,7 +351,10 @@ export default function App(): JSX.Element {
     try {
       const tradedSymbols = assets.components.map((component) => component.symbol);
       const symbols = [...new Set([...tradedSymbols, ...pool.symbols])];
-      const loaded = await loadMarketData(symbols, config.interval, config.range);
+      // Closed candles come from the IndexedDB cache; only the ones that closed since are downloaded
+      // (the whole range with "Force Refresh Data", which applies to this one run).
+      const loaded = await loadMarketData(symbols, config.interval, config.range, { forceRefresh: config.forceRefreshData });
+      if (config.forceRefreshData) updateConfig({ forceRefreshData: false });
       if (runId !== runIdRef.current) return; // cancelled while downloading
       const dataset = buildDataset(loaded.series, assets.components);
       const settings = settingsFrom(config);
@@ -382,7 +404,7 @@ export default function App(): JSX.Element {
         sources: dataset.sources,
         simulated: loaded.usedFallback,
         fallbackReason: loaded.fallbackReason,
-        notes: loaded.notes,
+        notes: [...loaded.notes, ...cacheNotes(loaded.cache)],
       };
       contextRef.current = runContext;
       setContext(runContext);
@@ -400,26 +422,19 @@ export default function App(): JSX.Element {
         setStatus('error');
         disposeWorker();
       };
-      // Evaluator pool: candidate strategies are scored on several cores. Each evaluator gets its
-      // own copy of the data and talks to the optimiser directly over a MessageChannel.
-      const poolSize = evaluatorPoolSize();
-      const ports: MessagePort[] = [];
-      const budgetBytes = Math.max(64, Math.floor(512 / Math.max(1, poolSize))) * 1024 * 1024;
-      for (let w = 0; w < poolSize; w++) {
-        const evaluator = new Worker(new URL('./workers/evaluator.worker.ts', import.meta.url), { type: 'module' });
-        const channel = new MessageChannel();
-        evaluator.onerror = () => {
-          // A dead evaluator would never answer: tell the optimiser to finish the run single-threaded.
+      // Worker pool: candidate strategies are scored on every spare core. Each evaluator gets its own
+      // copy of the data and talks to the optimiser directly over a MessageChannel.
+      const evaluators = new WorkerPool({
+        createWorker: () => new Worker(new URL('./workers/evaluator.worker.ts', import.meta.url), { type: 'module' }),
+        onFailure: () => {
+          // A dead evaluator would never answer: the optimiser finishes the run single-threaded.
           if (runId !== runIdRef.current) return;
-          disposePool();
           const fallback: WorkerRequest = { type: 'pool-failed' };
           workerRef.current?.postMessage(fallback);
-        };
-        const connect: EvaluatorConnect = { type: 'connect', port: channel.port2, datasets, settings, budgetBytes };
-        evaluator.postMessage(connect, [channel.port2]);
-        evaluatorsRef.current.push(evaluator);
-        ports.push(channel.port1);
-      }
+        },
+      });
+      poolRef.current = evaluators;
+      const ports = evaluators.start({ datasets, settings, budgetBytes: evaluatorBudgetBytes(evaluators.size) });
 
       const request: WorkerRequest = {
         type: 'start',
@@ -441,7 +456,7 @@ export default function App(): JSX.Element {
       setError(cause instanceof Error ? cause.message : 'Could not start the optimisation.');
       setStatus('error');
     }
-  }, [config, clearRunState, disposePool, disposeWorker, handleMessage, saveTickers]);
+  }, [config, clearRunState, disposePool, disposeWorker, handleMessage, saveTickers, updateConfig]);
 
   const stop = useCallback(() => {
     if (status === 'optimizing' && workerRef.current) {
@@ -638,6 +653,7 @@ export default function App(): JSX.Element {
           budget={budget}
           onExtendBudget={extendBudget}
           onReset={resetRuns}
+          onSnapshotImported={() => setLedgerVersion((v) => v + 1)}
           stage={stage}
         />
 

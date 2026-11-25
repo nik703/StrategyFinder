@@ -5,7 +5,8 @@ import { activePreset, PRESETS } from '../src/lib/presets';
 import { DEFAULT_CONFIG } from '../src/lib/config';
 import type { CrossMarketReport, MonteCarloSummary, PerformanceMetrics, StrategyResult } from '../src/types/trading';
 
-const fold = (roi: number, trades = 8): PerformanceMetrics => ({ ...emptyMetrics(), roi, trades, exposure: trades > 0 ? 30 : 0 });
+// A fold's risk-adjusted score follows its return: profitable folds score above zero (gate 1).
+const fold = (roi: number, trades = 8): PerformanceMetrics => ({ ...emptyMetrics(), roi, sortino: roi / 2, trades, exposure: trades > 0 ? 30 : 0 });
 
 const mc = (probProfit: number, drawdownP95: number): MonteCarloSummary => ({
   simulations: 500,
@@ -26,6 +27,7 @@ const strategy = (over: Partial<StrategyResult>): StrategyResult =>
     pointFitness: 2.2,
     neighbourMedian: 1.9,
     neighbourCount: 6,
+    neighbourExpectancy: 12,
     params: 3,
     dsr: 0.97,
     search: { ...emptyMetrics(), trades: 120 },
@@ -39,7 +41,7 @@ const strategy = (over: Partial<StrategyResult>): StrategyResult =>
     assets: [],
     robustness: null,
     verdict: null,
-    robust: { validation: true, folds: true, neighbours: true, significance: true, passed: true },
+    robust: { sample: true, dsr: true, stress: true, passed: true },
     monteCarlo: mc(0.94, 22),
     ...over,
   }) as StrategyResult;
@@ -67,7 +69,8 @@ describe('plain-English diagnostics', () => {
     const weak = strategy({
       dsr: 0.3,
       folds: [fold(3), fold(-2), fold(-1), fold(-4), fold(-1)],
-      robust: { validation: true, folds: false, neighbours: false, significance: false, passed: false },
+      robust: { sample: true, dsr: false, stress: false, passed: false },
+      neighbourExpectancy: -4,
       monteCarlo: mc(0.55, 61),
     });
     const badges = diagnosticBadges({ strategy: weak, report: null, crossMarket: cross(1 / 3), trials: 20000 });
@@ -103,7 +106,7 @@ describe('plain-English diagnostics', () => {
     expect(locked.headline).toMatch(/did not hold up/);
     expect(locked.risks[0]).toContain('Lost money on the holdout');
     // The small-sample warning counts the sample the gates counted: pooled over the assets of a pool.
-    const pooledSample = { trades: 160, validationTrades: 30, holdoutTrades: null, gates: { search: 60, validation: 15, perYear: 15, holdout: 15 }, pooled: true };
+    const pooledSample = { trades: 160, effectiveTrades: 160, validationTrades: 30, holdoutTrades: null, gates: { search: 60, validation: 15, perYear: 15, holdout: 15 }, pooled: true };
     const thinPrimary = strategy({ validation: { ...emptyMetrics(), trades: 4 }, sample: pooledSample });
     expect(strategyVerdict({ strategy: thinPrimary, report: null, crossMarket: null, trials: 5000 }).risks.join(' ')).not.toMatch(/small sample/);
     const thinPool = strategy({ validation: { ...emptyMetrics(), trades: 4 }, sample: { ...pooledSample, validationTrades: 12 } });
@@ -133,7 +136,9 @@ describe('presets', () => {
       expect(config.feePct).toBeGreaterThan(0);
       expect(config.slippagePct).toBeGreaterThan(0);
     }
-    expect(PRESETS.map((p) => p.patch.tradeMode)).toEqual(['long-only', 'asymmetric', 'long-only', 'long-short']);
+    expect(PRESETS.map((p) => p.patch.tradeMode)).toEqual(['long-only', 'asymmetric', 'long-only', 'asymmetric'])
+    // Mirrored L/S is not offered as a quick start: it forces the long rules onto the short side.
+    expect(PRESETS.some((p) => p.patch.tradeMode === 'long-short')).toBe(false);
     // The app opens on the first preset: Crypto Multi-Asset Swing (4h).
     expect(activePreset(DEFAULT_CONFIG)?.id).toBe('crypto-swing-4h');
     expect(DEFAULT_CONFIG).toMatchObject({ assetMode: 'pool', interval: '4h', range: '2y', tradeMode: 'long-only', hypothesis: 'VOL_BREAKOUT' });

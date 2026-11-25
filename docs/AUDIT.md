@@ -420,6 +420,50 @@ be calibrated against the random-walk suite before it ships.
 
 ---
 
+## 2026-11-25 · Architecture upgrade
+
+### Resolved
+- **Double-penalising fitness removed.** The haircut Sharpe, the 70/30 neighbourhood blend and the drawdown
+  guard are gone. Fitness is `1.5 × median-fold risk-adjusted return + 1.0 × expectancy rate`, and every
+  property is judged by exactly one gate: (1) effective sample + median-fold Sortino/Calmar + 35% per-fold
+  drawdown cap, (2) deflated Sharpe ≥ 50%, (3) post-search Monte Carlo + one-step neighbourhood.
+- **Two-tier evaluation.** The evaluators run tier 1 only (single-pass multi-fold scoring). Monte Carlo
+  (200+ replays) and the neighbourhood grid run on the optimiser for each round's top 20 contenders, once
+  per strategy. On the default preset this cut gate-3 work to well under a quarter of the scored candidates.
+- **Correlated pools no longer inflate the sample.** Pooled trade counts are effective independent bets
+  (design effect `1 + Σ overlap·max(0, ρ)` per asset), so four coins that move together do not quadruple
+  the evidence.
+- **One strategy definition.** `strategyAst.ts` compiles a genome into series / condition / exit nodes; the
+  backtester and the Pine exporter both compile from it, and `tests/pine-parity.test.ts` executes the
+  generated Pine against the engine on every candle (signals, stops, targets, trailing, breakeven).
+- **Stateful Next Entry forecast.** The solver carries the position (trailing anchor, breakeven lock, age),
+  squeeze run and time-stop cooldown into the next candle, projects the stop after the next close exactly
+  as the backtester sets it, reports blockers no close can remove, and now flags a stop that is already
+  through the last close (stopped out at the next open) – a case the previous forecast missed.
+- **Execution realism is not optional.** Floors for ATR slippage (0.02×), funding (0.005%/8h) and borrow
+  (0.5%/yr) are enforced by the engine on every run; the UI cannot turn financing off.
+- **Persistence moved to IndexedDB** (candles, ledger, runs) with legacy migration, JSON snapshots that can
+  only add history, and incremental candle downloads (only bars closed since the last cached one).
+- **Worker pool** sized `max(1, min(cores − 1, 8))`; reset terminates every worker and rejects every pending
+  request.
+- Mirrored L/S is no longer offered as a quick-start preset (it remains available in Advanced settings).
+
+### Verified (live, Chromium against the dev server, Binance 4h BTC/ETH/SOL/BNB, 2y, 25,000 evaluations)
+| | evaluators | time to budget | evaluations / s | downloads |
+|---|---|---|---|---|
+| cold cache | 1 | 22.0 s | ≈ 1,130 | 4 full |
+| cold cache | 3 | 12.6 s | ≈ 1,980 | 4 full |
+| cache 10 bars stale | 3 | 13.2 s | ≈ 1,890 | 4 delta (`since` = 10 bars back) |
+
+Reset mid-scan: 4 workers before, 0 after; every IndexedDB store empty; no console errors.
+
+### Still open
+Pooled portfolio-level significance, the effective number of trials and walk-forward re-optimisation (see
+2026-11-19) remain the main levers for statistical power, and still need calibrating against the
+random-walk suite before they ship.
+
+---
+
 ### References
 - Bailey & López de Prado (2014), *The Deflated Sharpe Ratio*. J. Portfolio Mgmt.
 - Bailey, Borwein, López de Prado & Zhu (2014/2017), *The Probability of Backtest Overfitting* and *Pseudo-Mathematics and Financial Charlatanism* (MinBTL).

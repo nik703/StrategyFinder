@@ -12,6 +12,7 @@ import {
   windowsMatch,
   type TrialWindow,
 } from '../src/lib/trialLedger';
+import { initStorage, resetStorageForTests } from '../src/lib/storage';
 import { BUDGET_EXTENSION, WINDOW_TRIAL_BUDGET } from '../src/types/trading';
 
 /** In-memory stand-in for window.localStorage – it survives "page reloads" because the module re-reads it every call. */
@@ -33,7 +34,10 @@ class MemoryStorage {
 
 const storage = new MemoryStorage();
 (globalThis as unknown as { window: { localStorage: MemoryStorage } }).window = { localStorage: storage };
-beforeEach(() => storage.clear());
+beforeEach(() => {
+  storage.clear();
+  resetStorageForTests();
+});
 
 const DAY = 86_400_000;
 const END = Date.UTC(2026, 10, 15);
@@ -103,7 +107,7 @@ describe('trial ledger', () => {
     expect(priorTrials(searchWindowFor(['SPY'], '1d', dailyTimes(1826))).count).toBe(0);
   });
 
-  it('reports the budget level and the luck hurdle, and ignores corrupt storage', () => {
+  it('reports the budget level and the luck hurdle', () => {
     const window = searchWindowFor(['BTC-USD'], '1d', dailyTimes(1826));
     expect(WINDOW_TRIAL_BUDGET).toBe(50_000);
     expect(budgetStatus(window, 0).level).toBe('fresh');
@@ -122,11 +126,21 @@ describe('trial ledger', () => {
     expect(extended).toMatchObject({ level: 'degrading', limit: 60_000, remaining: 10_000, extensions: 1 });
     expect(windowBudget(searchWindowFor(['BTC-USD'], '1d', dailyTimes(730)))).toBe(60_000); // nested window
     expect(windowBudget(searchWindowFor(['SPY'], '1d', dailyTimes(1826)))).toBe(WINDOW_TRIAL_BUDGET); // other data
+  });
+
+  it('migrates the legacy localStorage ledger on first load and drops corrupt entries', async () => {
+    const window = searchWindowFor(['BTC-USD'], '1d', dailyTimes(1826));
+    storage.setItem('strategyfinder.trialLedger.v1', JSON.stringify([{ runId: 'old', ...window, count: 7, mean: 0.1, m2: 1, updatedAt: END }, { runId: 'x', symbols: ['BTC-USD'], start: 1, end: 0, count: 5 }, null]));
     storage.setItem('strategyfinder.budgetExtensions.v1', 'garbage');
+    await initStorage(null);
+    expect(priorTrials(window).count).toBe(7);
     expect(windowBudget(window)).toBe(WINDOW_TRIAL_BUDGET);
+    expect(storage.getItem('strategyfinder.trialLedger.v1')).toBeNull();
+    expect(storage.getItem('strategyfinder.budgetExtensions.v1')).toBeNull();
+    // Corrupt JSON is dropped too.
+    resetStorageForTests();
     storage.setItem('strategyfinder.trialLedger.v1', '{not json');
-    expect(priorTrials(window).count).toBe(0);
-    storage.setItem('strategyfinder.trialLedger.v1', JSON.stringify([{ runId: 'x', symbols: ['BTC-USD'], start: 1, end: 0, count: 5 }, null]));
+    expect((await initStorage(null)).migrated).toBe(0);
     expect(priorTrials(window).count).toBe(0);
   });
 });

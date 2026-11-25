@@ -11,12 +11,11 @@ import {
   FOLDS,
   holdoutMetrics,
   holdoutShortfalls,
-  plateauFitness,
   runBacktest,
   segmentMetrics,
   splitFor,
 } from '../src/engine/backtester';
-import { attachEvaluator } from '../src/engine/evaluation';
+import { attachEvaluator, enforceRealism } from '../src/engine/evaluation';
 import { IndicatorCache } from '../src/engine/indicators';
 import { countParameters, gaussian, isCoherent, MAX_PARAMETERS, mirrorGroup, mulberry32 } from '../src/engine/genome';
 import { deflatedSharpeAgainst } from '../src/lib/stats';
@@ -26,6 +25,7 @@ import {
   DEFAULT_SIZING,
   FITNESS_PATIENCE,
   HYPOTHESIS_IDS,
+  INTERVAL_MS,
   WINDOW_TRIAL_BUDGET,
   type Hypothesis,
   type TrialStats,
@@ -270,15 +270,27 @@ describe('optimizer worker', () => {
     expect(done.bestDsr).toBeCloseTo(Math.max(...final.map((s) => s.dsr)), 9);
     expect(done.hurdleSharpe).toBeGreaterThan(0);
 
-    // Every listed strategy carries its fold breakdown, and is ranked by its own fitness blended
-    // with the median of its one-grid-step neighbours (spikes sink, plateaus hold).
+    // Every listed strategy carries its fold breakdown and is ranked on its own score: the
+    // neighbourhood no longer discounts the fitness, it is judged once, by gate 3. Only the top
+    // contenders go through that second tier (one-step neighbourhood + Monte Carlo).
+    let deep = 0;
     for (const s of final) {
       expect(s.folds).toHaveLength(FOLDS);
-      expect(s.neighbourCount ?? 0).toBeGreaterThan(2);
-      expect(s.pointFitness).toBeDefined();
-      expect(s.fitness).toBeLessThanOrEqual((s.pointFitness as number) + 1e-12);
-      expect(s.fitness).toBeCloseTo(plateauFitness(s.pointFitness as number, [s.neighbourMedian as number]), 9);
+      expect(s.fitness).toBe(s.pointFitness);
+      if ((s.neighbourCount ?? 0) > 0) {
+        deep++;
+        expect(s.neighbourCount).toBeGreaterThan(2);
+        expect(s.neighbourExpectancy).toBeDefined();
+        expect(s.monteCarlo?.simulations).toBeGreaterThanOrEqual(200);
+        expect(typeof s.robust?.stress).toBe('boolean');
+      } else {
+        expect(s.monteCarlo).toBeNull();
+        expect(s.robust?.stress ?? null).toBeNull();
+        expect(s.robust?.passed).toBe(false);
+      }
     }
+    expect(deep).toBeGreaterThanOrEqual(Math.min(final.length, 20) - 5);
+    expect(deep).toBeLessThanOrEqual(final.length);
     // Every listed strategy tests the run's hypothesis, and no two of them share a trade log.
     const btc = dataset('BTC-USD', '1d', '5y');
     const btcSplit = splitFor(btc.data.c.length);
@@ -291,8 +303,6 @@ describe('optimizer worker', () => {
       logs.add(tradeLogHash(btcWs, btcSplit.holdoutStart));
     }
     expect(logs.size).toBe(final.length);
-    // The cap actually bites on part of the board: those strategies were spikes at their exact parameters.
-    expect(final.filter((s) => (s.pointFitness as number) > s.fitness + 1e-9).length).toBeGreaterThan(0);
 
     // Before the lock no strategy gets a verdict, even on request.
     const early = request({ type: 'analyze', strategyId: final[2].id, genome: final[2].genome }) as Of<'analysis'>;
@@ -450,8 +460,9 @@ describe('optimizer worker', () => {
     expect(done.evaluations / done.cycle).toBeGreaterThanOrEqual(FITNESS_PATIENCE * 0.9);
     // The funnel counts every scored candidate per gate.
     expect(done.funnel.scored).toBeGreaterThan(1000);
-    for (const key of ['trades', 'validation', 'folds', 'dsr'] as const) expect(done.funnel[key]).toBeLessThanOrEqual(done.funnel.scored);
-    expect(done.funnel.neighbours).toBeLessThanOrEqual(done.funnel.neighboursChecked);
+    for (const key of ['sample', 'dsr', 'stressChecked'] as const) expect(done.funnel[key]).toBeLessThanOrEqual(done.funnel.scored);
+    expect(done.funnel.stress).toBeLessThanOrEqual(done.funnel.stressChecked);
+    expect(done.funnel.stressChecked).toBeGreaterThan(0);
     expect(done.robustTarget).toBe(0);
   }, 300_000);
 
@@ -512,19 +523,21 @@ describe('optimizer worker', () => {
     const settings = settingsFor('long-short');
     const messages = await runOptimizer([eth], settings, { seed: 99, maxEvaluations: 600 });
     const done = messages[messages.length - 1] as Of<'done'>;
-    // The final figures must be exactly what the search ranked on: a backtest that stops at the holdout boundary.
+    // The final figures must be exactly what the search ranked on: a backtest that stops at the holdout
+    // boundary, with the execution-realism floors the engine always enforces.
+    const realistic = enforceRealism(settings, INTERVAL_MS['4h']);
     const split = splitFor(eth.data.c.length);
     const ind = new IndicatorCache(eth.data);
     const ws = new BacktestWorkspace(eth.data.c.length);
     const ppy = barsPerYear(eth.data.t);
     let straddling: (typeof done.strategies)[number] | null = null;
     for (const final of done.strategies) {
-      const expected = evaluateSearch(ind, final.genome, settings, ws, split, ppy);
+      const expected = evaluateSearch(ind, final.genome, realistic, ws, split, ppy);
       expect(final.search).toEqual(expected.search);
       expect(final.train).toEqual(expected.train);
       expect(final.validation).toEqual(expected.validation);
       expect(final.holdout).toBeNull();
-      runBacktest(ind, final.genome, settings, ws);
+      runBacktest(ind, final.genome, realistic, ws);
       if (straddling === null && ws.inMarket[split.holdoutStart - 1] === 1) straddling = final;
     }
     // Lock a strategy that holds a position across the boundary, so the two backtests can be told apart.
@@ -654,14 +667,18 @@ describe('Monte Carlo stress test and cross-market generalization check', () => 
     const done = messages[messages.length - 1] as Of<'done'>;
     expect(done.type).toBe('done');
     expect(done.strategies.length).toBeGreaterThan(0);
+    let stressed = 0;
     for (const s of done.strategies) {
       // Asymmetric L/S: every strategy carries its own short regime filter.
       expect(s.genome.shortRegime).toBeTruthy();
       expect(s.genome.shortEntry?.conditions[1]).toEqual(s.genome.shortRegime);
-      // Every leaderboard entry carries the headline Monte Carlo numbers (no chart bands).
+      // Every deep-evaluated (top-20, second-tier) entry carries the headline Monte Carlo numbers (no chart bands).
       const mc = s.monteCarlo;
-      expect(mc).toBeTruthy();
-      if (!mc) continue;
+      if (!mc) {
+        expect(s.neighbourCount ?? 0).toBe(0);
+        continue;
+      }
+      stressed++;
       expect(mc.simulations).toBeGreaterThanOrEqual(200);
       expect(mc.probProfit).toBeGreaterThanOrEqual(0);
       expect(mc.probProfit).toBeLessThanOrEqual(1);
@@ -669,8 +686,14 @@ describe('Monte Carlo stress test and cross-market generalization check', () => 
       expect('bands' in mc).toBe(false);
       expect(mc.trades).toBe(s.search.trades);
     }
+    // Monte Carlo runs on each round's top 20 contenders only (two-tier evaluation): a small share of
+    // the scored candidates, never the whole population.
+    expect(stressed).toBeGreaterThan(0);
+    expect(stressed).toBeLessThanOrEqual(done.funnel.stressChecked);
+    expect(done.funnel.stressChecked).toBeLessThan(done.funnel.scored / 4);
 
     const top = done.strategies[0];
+    expect(top.monteCarlo).toBeTruthy();
     // The on-demand analysis carries the full report, with the equity-path bands for the chart.
     const analysis = request({ type: 'analyze', strategyId: top.id, genome: top.genome }) as Of<'analysis'>;
     expect(analysis.type).toBe('analysis');
@@ -694,9 +717,9 @@ describe('Monte Carlo stress test and cross-market generalization check', () => 
       expect(row.bars).toBeLessThanOrEqual(ready.axis.holdoutIndex + 1);
       expect(row.bars).toBeGreaterThan(ready.axis.holdoutIndex - 5);
     }
-    // Frozen rules: exactly a backtest of the same genome over those candles.
+    // Frozen rules: exactly a backtest of the same genome over those candles, with the enforced costs.
     const ws = new BacktestWorkspace(sol.data.c.length);
-    runBacktest(new IndicatorCache(sol.data), top.genome, settings, ws, report.rows[0].bars);
+    runBacktest(new IndicatorCache(sol.data), top.genome, enforceRealism(settings, INTERVAL_MS['1d']), ws, report.rows[0].bars);
     const m = segmentMetrics(ws.equity, 0, report.rows[0].bars, settings.initialCapital, barsPerYear(sol.data.t), ws);
     expect(report.rows[0].roi).toBeCloseTo(m.roi, 9);
     expect(report.rows[0].trades).toBe(m.trades);

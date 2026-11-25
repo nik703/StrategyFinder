@@ -319,6 +319,19 @@ export interface SizingSetting {
 
 export const DEFAULT_SIZING: SizingSetting = { mode: 'risk', riskPct: 2, compounding: false };
 
+/**
+ * Execution-realism floors, enforced by the engine on every search, analysis and forecast (see
+ * `enforceRealism`): no setting can switch them off. Next-bar-open fills and the single-strategy
+ * holdout lock have no setting at all.
+ *
+ *   MIN_SLIPPAGE_ATR_MULT  every fill slips at least this multiple of ATR(14) as a % of price;
+ *   MIN_FUNDING_PCT_8H     Long/Short crypto pays at least this perpetual funding (% per 8 h);
+ *   MIN_BORROW_PCT_YEAR    Long/Short stocks pay at least this borrow fee on shorts (% a year).
+ */
+export const MIN_SLIPPAGE_ATR_MULT = 0.02;
+export const MIN_FUNDING_PCT_8H = 0.005;
+export const MIN_BORROW_PCT_YEAR = 0.5;
+
 export interface BacktestSettings {
   initialCapital: number;
   /** Trading fee charged on every fill, in percent (0.1 = 0.1% per side). */
@@ -525,6 +538,12 @@ export interface TradeGates {
 export interface SampleInfo {
   /** Train + validation trades: the primary asset's, or summed over a pooled universe. */
   trades: number;
+  /**
+   * Effective number of independent bets behind `trades`: equal to it for one asset; in a pooled
+   * basket every asset's trades are discounted by its time overlap with the other assets' trades,
+   * weighted by their positive return correlation (see `effectiveBets`). The trade gates use it.
+   */
+  effectiveTrades: number;
   validationTrades: number;
   /** Holdout trades counted the same way (null while the holdout is sealed). */
   holdoutTrades: number | null;
@@ -544,6 +563,8 @@ export interface StrategyResult {
   neighbourMedian?: number | null;
   /** Number of one-grid-step neighbours that were backtested. */
   neighbourCount?: number;
+  /** Median expectancy per trade of the one-step neighbours (second tier; null until checked). */
+  neighbourExpectancy?: number | null;
   /** Number of tunable numeric parameters. */
   params: number;
   /** Deflated Sharpe Ratio of the validation segment: probability that the Sharpe is real given every trial so far. */
@@ -749,37 +770,38 @@ export interface ProgressSnapshot {
 export type StopReason = 'stopped' | 'target' | 'budget' | 'window-budget' | 'exhausted';
 
 /**
- * The robustness gates a candidate must ALL pass to count towards the run's target. They use the
- * search period only – the holdout stays sealed – and are stricter than "on the leaderboard":
+ * The three orthogonal robustness gates a candidate must ALL pass to count towards the run's
+ * target. They use the search period only – the holdout stays sealed:
  *
- *   validation    validation Sharpe > 0.3 and a positive validation net profit (after all costs);
- *   folds         at least 3 of the 5 sequential folds profitable, none beyond the fold drawdown cap;
- *   neighbours    the one-grid-step parameter neighbours keep a positive median expectancy per trade;
- *   significance  the timeframe-scaled minimum-trade gates, and a deflated Sharpe of at least 50%:
- *                 the validation Sharpe beats the best a random walk is expected to reach after this
- *                 many trials.
+ *   sample  (gate 1) the timeframe-scaled minimum-trade gates on the EFFECTIVE number of independent
+ *           bets (correlated, overlapping trades across a basket's assets count once), a positive
+ *           median-fold risk-adjusted return (½ Sortino + ½ Calmar over the judged folds) and no fold
+ *           beyond the 35% drawdown cap;
+ *   dsr     (gate 2) a deflated Sharpe of at least 50%: the validation Sharpe beats the best a
+ *           random walk is expected to reach after every trial made on this data window;
+ *   stress  (gate 3, post-search, top contenders only) the Monte Carlo execution stress test holds
+ *           (P(profit) ≥ 80%, 95th-percentile drawdown ≤ 50%) AND the one-grid-step parameter
+ *           neighbours keep a positive median expectancy per trade. Null until the strategy has been
+ *           through the second evaluation tier.
  */
 export interface RobustChecks {
-  validation: boolean;
-  folds: boolean;
-  neighbours: boolean;
-  significance: boolean;
+  sample: boolean;
+  dsr: boolean;
+  stress: boolean | null;
   passed: boolean;
 }
 
-/** Candidates (fully scored trials) clearing each gate on its own, over the run so far. */
+/** Candidates clearing each gate, over the run so far. */
 export interface GateFunnel {
   /** Fully scored trials. */
   scored: number;
-  /** Cleared the minimum-trade gates. */
-  trades: number;
-  validation: number;
-  folds: number;
-  /** Deflated Sharpe ≥ 50%. */
+  /** Gate 1: effective sample, median-fold return and the fold drawdown cap. */
+  sample: number;
+  /** Gate 2: deflated Sharpe ≥ 50%. */
   dsr: number;
-  /** Neighbourhoods checked, and how many held up. */
-  neighboursChecked: number;
-  neighbours: number;
+  /** Gate 3: contenders put through Monte Carlo + neighbourhood (second tier), and how many held up. */
+  stressChecked: number;
+  stress: number;
 }
 
 export type WorkerResponse =

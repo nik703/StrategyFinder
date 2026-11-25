@@ -4,7 +4,7 @@
  * watch out for. Pure functions of the strategy and its reports – no UI.
  */
 
-import { judgedFolds, foldsNeeded } from '../engine/backtester';
+import { judgedFolds, foldsNeeded, passesFoldGate } from '../engine/backtester';
 import type { CrossMarketReport, MonteCarloSummary, RobustnessReport, StrategyResult } from '../types/trading';
 
 export type BadgeStatus = 'pass' | 'warn' | 'fail' | 'pending';
@@ -76,7 +76,7 @@ function foldBadge(s: StrategyResult): DiagnosticBadge {
   const needed = foldsNeeded(judged.length);
   const flat = folds.length - judged.length;
   // The run's own fold gate when it was checked (it also caps each slice's drawdown), else the count.
-  const passes = s.robust ? s.robust.folds : profitable >= needed;
+  const passes = passesFoldGate(folds);
   const status: BadgeStatus = passes ? 'pass' : profitable >= needed - 1 ? 'warn' : 'fail';
   return {
     key: 'folds',
@@ -87,7 +87,7 @@ function foldBadge(s: StrategyResult): DiagnosticBadge {
     tooltip:
       `The search period is cut into ${folds.length} equal time slices. It made money in ${profitable} of the ${judged.length} it traded` +
       (flat > 0 ? ` (${flat} flat ${flat === 1 ? 'slice' : 'slices'} with no position are not held against it)` : '') +
-      `; ${needed} are needed, with no slice losing more than 35% at its worst point.`,
+      `. The median slice must earn a positive risk-adjusted return (½ Sortino + ½ Calmar) – about ${needed} winning slices – with no slice losing more than 35% at its worst point.`,
   };
 }
 
@@ -128,7 +128,7 @@ function neighbourBadge(s: StrategyResult): DiagnosticBadge {
       tooltip: 'Every parameter nudged one step up and down: a real edge sits on a plateau where nearby settings also work.',
     };
   }
-  const holds = s.robust?.neighbours === true;
+  const holds = (s.neighbourExpectancy ?? 0) > 0;
   const point = s.pointFitness ?? s.fitness;
   const median = s.neighbourMedian ?? null;
   const spike = median !== null && point - median > 1.5;

@@ -30,9 +30,9 @@ const ROWS: Row[] = [
   { label: 'Beats luck (DSR)', title: 'Deflated Sharpe: chance the validation result is real after every strategy tried', value: (s) => fmtPct(s.dsr * 100, false, 0), score: (s) => s.dsr },
   {
     label: 'Robustness checks',
-    title: 'Validation, fold consistency, neighbour stability and significance gates passed',
-    value: (s) => (s.robust ? `${[s.robust.validation, s.robust.folds, s.robust.neighbours, s.robust.significance].filter(Boolean).length} / 4` : '–'),
-    score: (s) => (s.robust ? [s.robust.validation, s.robust.folds, s.robust.neighbours, s.robust.significance].filter(Boolean).length : 0),
+    title: 'Gates passed: 1 effective sample + median-fold return + fold drawdown cap · 2 deflated Sharpe · 3 Monte Carlo stress + neighbour stability',
+    value: (s) => (s.robust ? `${[s.robust.sample, s.robust.dsr, s.robust.stress === true].filter(Boolean).length} / 3` : '–'),
+    score: (s) => (s.robust ? [s.robust.sample, s.robust.dsr, s.robust.stress === true].filter(Boolean).length : 0),
   },
   {
     label: 'Stress test: P(profit)',

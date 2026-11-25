@@ -23,11 +23,26 @@ The app is one guided page in four steps:
    heatmap, a cross-market check on unseen markets, the one-shot locked holdout reveal and the 1-click
    Pine Script v5 export.
 
-**Reset Runs & Clear Cache** stops any scan, terminates every worker and deletes every cached strategy, the
-leaderboard, the elite kept across restarts, the trial and restart counters and the holdout reveal log
-(memory and `localStorage`), restoring a clean 0-trial slate. It asks for confirmation first, because
+**Reset Runs & Clear Cache** stops any scan, terminates every pooled worker, drops every pending evaluation
+request and deletes every cached strategy, the leaderboard, the elite kept across restarts, the trial and
+restart counters, the holdout reveal log, the saved runs and the candle cache (memory and IndexedDB),
+restoring a clean 0-trial slate. It asks for confirmation first, because
 clearing the history also resets multiple-testing tracking: earlier trials stop raising the luck hurdle and
 holdouts already seen look untouched again. Settings and saved tickers are kept.
+
+**Export / Import Snapshot** (top action bar) saves the multiple-testing ledger (trial counts, budget
+extensions, holdout reveals) and the saved runs with their final leaderboards as one `.json` file, and merges
+such a file into another browser. An import can only add history: a trial count is never lowered and a
+recorded reveal is never removed, so a snapshot cannot be used to wipe the luck hurdle.
+
+### Persistence
+
+Everything the app remembers lives in one IndexedDB database (`strategyfinder`) with three stores:
+`candles` (the incremental candle cache, one record per exchange, symbol and timeframe), `ledger` (trial
+counts, budget extensions and holdout reveals) and `runs` (saved runs and leaderboard snapshots). The
+legacy `localStorage` keys of earlier versions are migrated on first load and removed. Only closed candles
+are cached; a later run downloads just the candles that closed since the last stored one (*Force Refresh
+Data* in Advanced settings downloads the whole range again).
 
 > Research tool only. Backtests are hypothetical and fitted to past data. Nothing here is financial advice.
 
@@ -47,7 +62,7 @@ Other commands:
 | Command | What it does |
 | --- | --- |
 | `npm run dev` | Vite only, on <http://localhost:5173>. A small dev middleware serves the same `market-data` function, so live data works here too. |
-| `npm test` | Unit and integration tests (indicators, backtester, genome, direction modes, exits, Monte Carlo, diagnostics, Pine export, function, optimiser worker). |
+| `npm test` | Unit and integration tests (indicators, backtester, genome, direction modes, exits, Monte Carlo, diagnostics, Pine export and AST parity, function, optimiser worker, worker pool, IndexedDB storage and snapshots, candle cache, stateful Next Entry solver). |
 | `npm run build` | Type-check, then build to `dist/`. |
 | `npm run preview` | Serve the production build locally. |
 
@@ -115,11 +130,15 @@ dividends Buy & Hold earns and ex-dividend gaps are not mistaken for price moves
 
 - Signals are evaluated on the close of candle `t` and filled at the open of candle `t+1`.
 - Every fill pays the fee (default 0.1% per side) and **volatility-scaled slippage**: the larger of a fixed
-  floor (default 0.05%) and a multiple of ATR(14) as a % of price (default 0.03 ×), read on the last closed
-  candle. Volatile candles and volatile assets cost more to trade.
-- **Long/Short runs pay financing by default.** Crypto is shorted as a perpetual: every open position pays
-  funding (default 0.01% per 8h). Stock and ETF shorts pay a borrow fee (default 2% a year). Long-Only runs
-  are treated as spot positions and pay no financing. This applies to both Asymmetric and Mirrored L/S.
+  floor (default 0.05%) and a multiple of ATR(14) as a % of price (default 0.03 ×, never below 0.02 ×),
+  read on the last closed candle. Volatile candles and volatile assets cost more to trade.
+- **Long/Short runs always pay financing.** Crypto is shorted as a perpetual: every open position pays
+  funding (default 0.01% per 8h, never below 0.005%). Stock and ETF shorts pay a borrow fee (default 2% a
+  year, never below 0.5%). Long-Only runs are treated as spot positions and pay no financing. This applies
+  to both Asymmetric and Mirrored L/S.
+- **Execution realism cannot be switched off.** Next-bar fills, volatility slippage, financing and the
+  holdout lock are hard-coded; the settings only let you make costs higher, and the engine enforces the
+  floors above on every run (`enforceRealism`).
 - **Sizing is a run setting, not something the optimiser tunes.** Default: risk 2% of the starting capital at
   the stop, no compounding, exposure capped at 1× equity. Options: compounding, or 100% of equity.
 - Stops and targets are simulated intrabar from the entry candle. A gap through a level fills at the open.
@@ -142,7 +161,7 @@ Data is split chronologically: **Train 60% / Validation 20% / Holdout 20%**.
   *Lock & reveal holdout*. Only that strategy's holdout is simulated and shown, once per run; every other
   strategy stays sealed, so the holdout can never be used to pick a winner (there is no holdout column to
   sort on).
-- A holdout is only unseen once. Every reveal is recorded in `localStorage` with its symbols and holdout
+- A holdout is only unseen once. Every reveal is recorded in IndexedDB with its symbols and holdout
   **date window**. A later run whose holdout overlaps an earlier reveal on any shared symbol is warned, and
   none of its strategies can be rated Robust. A new end date, or another range or timeframe over the same
   dates, does not reset the log.
@@ -228,7 +247,7 @@ members, or injects a fresh random genome.
 - **Evaluations per run:** 25,000 by default, at most 50,000 (the safety ceiling of one run).
 - **Cumulative trial budget per data window:** **50,000** evaluations across every run and session whose
   search period overlaps (a shared symbol, and at least half of the shorter window in common). The trials
-  are kept in `localStorage`, so reloading the page, a new end date, another range or another timeframe over
+  are kept in IndexedDB, so reloading the page, a new end date, another range or another timeframe over
   the same dates never resets them. They also seed the deflated-Sharpe hurdle, so every new
   run on the same data is judged against everything tried on it before. Once the budget is spent, search on
   that window pauses: **Extend Budget (+10,000 trials)** lets you continue knowingly. Extensions are
@@ -236,14 +255,15 @@ members, or injects a fresh random genome.
   degraded.
 - **Scan until robust.** A run keeps scanning until it has found **N robust strategies** ("Stop after N
   robust": 1, 3 – the default – 5, or *Run Full Budget*), or its budget is spent. A strategy is robust when
-  it passes **all** of these gates on the search period (the holdout stays sealed):
-  1. **Validation:** validation Sharpe above 0.3 and a positive validation net profit after fees and
-     volatility slippage;
-  2. **Folds:** at least 3 of the 5 sequential folds profitable (flat folds set aside exactly as the fitness
-     does, see below), none beyond the 35% fold drawdown cap;
-  3. **Neighbourhood:** the one-grid-step parameter neighbours keep a positive median expectancy per trade;
-  4. **Significance:** the timeframe-scaled minimum-trade gates, and a deflated Sharpe of at least 50% – the
-     validation Sharpe beats the best a random walk is expected to reach after that many trials.
+  it passes **three orthogonal gates** on the search period (the holdout stays sealed). Each property is
+  judged exactly once – nothing is also folded into the fitness as a penalty:
+  1. **Sample and consistency:** the timeframe-scaled minimum-trade gates on the **effective sample size**
+     (correlated assets of a pool count as fewer independent bets, see *Asset pool*), a positive
+     **median-fold** risk-adjusted return (½ Sortino + ½ Calmar), and no fold beyond the 35% drawdown cap;
+  2. **Significance:** a deflated Sharpe of at least 50% – the validation Sharpe beats the best a random walk
+     is expected to reach after that many trials;
+  3. **Stress and stability** (post-search, second evaluation tier): the Monte Carlo execution stress test
+     passes and the one-grid-step parameter neighbours keep a positive median expectancy per trade.
   Robust strategies stay listed even when the fitness ranking would push them off the leaderboard, and are
   re-checked whenever the luck hurdle rises (a strategy can drop out). The target only ends a run after at
   least 1,000 evaluations. Robust here is a search-period verdict: the holdout of the one strategy you lock
@@ -256,8 +276,8 @@ members, or injects a fresh random genome.
   a long scan escapes the local optimum it stalled on instead of looping on minor tweaks. The leaderboard
   and the robust archive survive every restart.
 - The live scan row shows robust strategies found / target, evaluations / budget with the population cycle,
-  and how many scored candidates cleared each gate (minimum trades, validation Sharpe, 3 of 5 folds, DSR,
-  stable neighbours), so you can see why candidates are being filtered.
+  and how many scored candidates cleared each gate (gate 1, gate 2, and of those put through the second
+  tier, how many survived gate 3), so you can see why candidates are being filtered.
 
 The top action bar shows a **trial-budget meter** for the selected data window: trials used (all runs),
 its level (fresh / significance degrading from 50% / nearly spent from 90% / spent) and, in its tooltip,
@@ -266,9 +286,13 @@ the Sharpe the luckiest of that many skill-less strategies is expected to reach.
 move it most.
 
 **Asset pool** (the default preset's BTC, ETH, SOL, BNB; asset mode in Advanced settings): every asset is traded
-separately with the same genome, and the **minimum-trade gates apply to the trades pooled over the
-assets** – one strategy must work across the pool rather than fit one asset's price path, and four assets
-supply the sample a single daily chart cannot. Fitness is still the median per-asset score; the reported
+separately with the same genome, and the **minimum-trade gates apply to the effective number of
+independent bets pooled over the assets** – one strategy must work across the pool rather than fit one
+asset's price path. Correlated coins trading at the same time are not independent evidence: each asset's
+trades are divided by its design effect `1 + Σ overlap(a,b) · max(0, ρ(a,b))` over the other assets (ρ the
+correlation of their bar returns, overlap the share of its in-market bars the other asset is also in the
+market), so four highly correlated coins that are always in the market together count as little more than
+one. Fitness is still the median per-asset score; the reported
 deflated Sharpe is the median over the assets (pooling raises the sample for the gates, not the statistic),
 and the holdout trade count of a locked strategy is pooled too.
 
@@ -284,8 +308,10 @@ punished for doing its job – and the fold *gate* of the robust scan uses exact
 + 1.5 × median-fold risk-adjusted return   (median over the judged folds of ½ Sortino/1.5 + ½ Calmar)
 + 1.0 × expectancy × trade frequency       (R-expectancy of the search period × trades a year, in units of
                                             10 R a year, clamped to [−1.5, 3])
-− 4.0 × search-period drawdown beyond 25%  (a smooth guard against blow-ups the median cannot see)
 ```
+
+Nothing else is stacked on top: drawdown is judged once (gate 1's per-fold cap), significance once (gate 2)
+and parameter stability once (gate 3). There is no haircut Sharpe and no neighbourhood discount.
 
 then the **median over the assets** (one asset, or every asset of a pool), after the **hard sample-size
 gates**, which are **calibrated to the timeframe and the length of the data**: 15 trades per year of data
@@ -293,7 +319,7 @@ on daily candles, rising slowly with the number of candles per day (≈ 26 on 4h
 times the years of the search period and of the validation segment, with floors of 30 and 10 trades. On 5
 years of daily data that is 60 train + validation and 15 validation trades; the holdout gate of a Robust
 verdict is computed the same way (16). A strategy below any gate is disqualified outright. The counts are
-the primary asset's, or pooled over an asset pool. Finally the **parameter-neighbourhood** blend below.
+the primary asset's, or the effective bets pooled over an asset pool.
 
 The **deflated Sharpe ratio is a gate, not a score term**: it decides whether a strategy counts as robust
 (≥ 50%) and whether a locked strategy can be rated Robust (≥ 95%), but it never moves the fitness. The
@@ -301,23 +327,24 @@ fitness therefore stays fixed for the whole run, and the search does not hill-cl
 it is later judged on. Raw return over Buy & Hold does not count anywhere: it is a bet on the market's
 direction, not evidence of an edge. Complexity is capped by the genome (5 numbers), not penalised.
 
-**Plateaus, not spikes.** A strategy that could enter the leaderboard also has every one-grid-step
-parameter neighbour backtested (each tunable number moved one step down and one step up, everything else
-unchanged). When its neighbours are worse it is ranked by **70% of its own fitness + 30% of their median**
-(a disqualified neighbour counts as at most 3 below the strategy); a plateau keeps its score, a spike loses
-30% of its lead – enough to rank plateaus first without discarding a promising new rule combination the
-moment one neighbour slips under a trade gate. The blend never raises a score, so it never lets a strategy
-jump the leaderboard. The same one-step neighbourhood is the robustness gate's neighbourhood, and the
-workbench's stability heatmap reads it per parameter: one definition of "nearby settings" throughout.
+**Plateaus, not spikes – judged once, after the search.** Evaluation runs in two tiers. Inside the search
+loop every candidate gets the fast single-pass multi-fold score (tier 1). After every round, the top 20
+contenders (gates 1 and 2 first, then by fitness) go through tier 2 once: every one-grid-step parameter
+neighbour is backtested (each tunable number moved one step down and one step up, everything else
+unchanged) and the trades are replayed 200+ times in the Monte Carlo stress test. Those two results are gate
+3; they never change the fitness. The same one-step neighbourhood drives the workbench's stability heatmap:
+one definition of "nearby settings" throughout.
 
 The **Deflated Sharpe Ratio** (Bailey & López de Prado) is the probability that a Sharpe ratio is real given
 the number of strategies tried so far, the spread of their Sharpe ratios, the sample length, and the
 skewness and kurtosis of returns. The hurdle rises with every trial, so every listed strategy's deflated
 Sharpe – and with it its robust status – is re-checked as the run goes on and can fall over time.
 
-**Speed.** Candidate strategies are scored on several CPU cores: the app starts one evaluator
-worker per core (minus one, up to 6) and the optimiser sends them rounds of 100 candidates each over
-direct MessageChannels. Results are applied in proposal order, so a seeded run gives the same answer
+**Speed.** Candidate strategies are scored on several CPU cores: a `WorkerPool` starts
+`max(1, min(cores − 1, 8))` evaluator workers and the optimiser's `BatchDispatcher` sends each round of
+candidates to all of them at once, one contiguous chunk per worker, over direct MessageChannels. On the
+default preset (4h, BTC/ETH/SOL/BNB, 25,000 evaluations) a 4-core machine finishes in about 13 s with three
+evaluators versus about 22 s with one. Results are applied in proposal order, so a seeded run gives the same answer
 whatever the pool size. With one or two cores, or if an evaluator fails to load, the optimiser scores
 candidates itself. Within each evaluation, the expensive parts are kept small: only the bars inside
 trades are visited when computing metrics, the second condition of an entry is only checked where the
@@ -423,8 +450,10 @@ the strategy, not whether price will get there.
 - **Pine export is a faithful translation, not a guarantee of identical numbers.** It supports all three
   direction modes, every building block, the trailing ATR stop and the breakeven lock, and sets
   `use_bar_magnifier=false` so it compiles on every TradingView plan; Premium users can switch it to `true`
-  to settle candles that touch both stop and target with lower-timeframe data. The code is generated and
-  syntax-tested here but was not run on TradingView.
+  to settle candles that touch both stop and target with lower-timeframe data. The code is generated from
+  the same strategy AST the engine runs, and the parity tests execute it with a Pine-subset interpreter
+  against the engine bar by bar (signals, stops, targets, trailing moves, breakeven locks); it was not run
+  on TradingView itself.
 - **Paper trade before going live.** The test window ends at the latest candle, so only new data is unseen.
 
 ## Project layout
@@ -437,9 +466,11 @@ src/engine/indicators.ts          Indicator library and memoising cache
 src/engine/backtester.ts          Execution model, metrics, split, benchmark, fitness
 src/engine/genome.ts              Market hypotheses, grids, random generation, mutation, repair
 src/engine/describe.ts            Plain-English rules and badges
-src/engine/pine.ts                Pine Script v5 exporter
+src/engine/strategyAst.ts         Strategy AST: the one compiled form both the engine and the Pine exporter use
+src/engine/pine.ts                Pine Script v5 exporter (compiles from the AST)
 src/engine/monteCarlo.ts          Monte Carlo execution stress test
-src/engine/nextEntrySolver.ts     Next Entry Forecast: trigger prices and readiness
+src/engine/nextEntrySolver.ts     Next Entry Forecast: trigger prices, readiness, carried state, non-price blockers
+src/workers/workerPool.ts         WorkerPool (main thread) and BatchDispatcher (optimiser): sizing, dispatch, shutdown
 src/workers/optimizer.worker.ts   Optimisation loop (Web Worker)
 src/workers/evaluator.worker.ts   Evaluator pool member: scores candidate strategies
 src/engine/evaluation.ts          Shared scoring code and the evaluator protocol
@@ -447,9 +478,10 @@ src/lib/stats.ts                  Deflated Sharpe Ratio, expected maximum Sharpe
 src/lib/holdoutLog.ts             Holdout reveal log (symbols + date window, overlap matching)
 src/lib/trialLedger.ts            Cumulative trial budget per data window (overlap matching)
 src/lib/resetRuns.ts              "Reset Runs & Clear Cache": wipes the ledger, holdout log and run caches
+src/lib/storage.ts                IndexedDB stores (candles, ledger, runs), legacy migration, snapshots
 src/lib/diagnostics.ts            Plain-English check badges and the Strategy verdict
 src/lib/presets.ts                One-click quick-start presets
-src/data/                         Data loader, offline generator, basket builder
+src/data/                         Data loader, incremental candle cache, offline generator, basket builder
 src/components/                   TopActionBar, ControlBar + PresetCards (1), TelemetryStrip (2), Leaderboard + ComparePanel (3),
                                   StrategyWorkbench (4, tabbed) with NextEntryForecast, MonteCarloChart, StabilityHeatmap
 src/components/ui/                shadcn/ui primitives (generated by the shadcn CLI – see CLAUDE.md)
